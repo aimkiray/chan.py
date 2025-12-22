@@ -36,17 +36,19 @@ class CBi_meta:
 
 class CSeg_meta:
     def __init__(self, seg: CSeg):
-        if isinstance(seg.start_bi, CBi):
+        # Use class name check to avoid Streamlit reloading issues with isinstance
+        if type(seg.start_bi).__name__ == 'CBi':
             self.begin_x = seg.start_bi.get_begin_klu().idx
             self.begin_y = seg.start_bi.get_begin_val()
             self.end_x = seg.end_bi.get_end_klu().idx
             self.end_y = seg.end_bi.get_end_val()
-        else:
-            assert isinstance(seg.start_bi, CSeg)
+        elif type(seg.start_bi).__name__ == 'CSeg':
             self.begin_x = seg.start_bi.start_bi.get_begin_klu().idx
             self.begin_y = seg.start_bi.start_bi.get_begin_val()
             self.end_x = seg.end_bi.end_bi.get_end_klu().idx
             self.end_y = seg.end_bi.end_bi.get_end_val()
+        else:
+            raise Exception(f"Unknown start_bi type: {type(seg.start_bi)} {seg.start_bi}")
         self.dir = seg.dir
         self.is_sure = seg.is_sure
         self.idx = seg.idx

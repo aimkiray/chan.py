@@ -6,6 +6,7 @@ from Common.func_util import kltype_lt_day, str2float
 from KLine.KLine_Unit import CKLine_Unit
 
 from .CommonStockAPI import CCommonStockApi
+from .SqliteCache import DBManager, StockKLine
 
 
 def create_item_dict(data, column_name):
@@ -68,19 +69,104 @@ class CBaoStock(CCommonStockApi):
             fields = "time,open,high,low,close"
         else:
             fields = "date,open,high,low,close,volume,amount,turn"
+        
         autype_dict = {AUTYPE.QFQ: "2", AUTYPE.HFQ: "1", AUTYPE.NONE: "3"}
-        rs = bs.query_history_k_data_plus(
-            code=self.code,
-            fields=fields,
-            start_date=self.begin_date,
-            end_date=self.end_date,
-            frequency=self.__convert_type(),
-            adjustflag=autype_dict[self.autype],
+        adjust_flag = autype_dict[self.autype]
+        frequency = self.__convert_type()
+        
+        # --- Cache Logic ---
+        db_mgr = DBManager()
+        try:
+            # 1. Yield from DB
+            db_data = db_mgr.get_data(self.code, frequency, adjust_flag, start_date=self.begin_date, end_date=self.end_date)
+            last_db_date = None
+            
+            for item in db_data:
+                yield CKLine_Unit(self._db_item_to_dict(item))
+                last_db_date = item.date
+                
+            # 2. Check if we need to fetch from Baostock
+            if self.end_date and last_db_date and last_db_date >= self.end_date:
+                return
+
+            bs_start_date = self.begin_date
+            if last_db_date:
+                # Baostock start_date format: YYYY-MM-DD
+                if len(last_db_date) > 10:
+                    bs_start_date = f"{last_db_date[:4]}-{last_db_date[4:6]}-{last_db_date[6:8]}"
+                else:
+                    bs_start_date = last_db_date
+
+            rs = bs.query_history_k_data_plus(
+                code=self.code,
+                fields=fields,
+                start_date=bs_start_date,
+                end_date=self.end_date,
+                frequency=frequency,
+                adjustflag=adjust_flag,
+            )
+            if rs.error_code != '0':
+                raise Exception(rs.error_msg)
+                
+            new_data_list = []
+            field_list = GetColumnNameFromFieldList(fields)
+            
+            while rs.error_code == '0' and rs.next():
+                row_data = rs.get_row_data()
+                row_date = row_data[0] # date or time is always first
+                
+                # Skip if already in DB
+                if last_db_date and row_date <= last_db_date:
+                    continue
+                    
+                # Create DB object
+                kline_obj = self._create_db_obj(row_data, fields, self.code, frequency, adjust_flag)
+                new_data_list.append(kline_obj)
+                
+                yield CKLine_Unit(create_item_dict(row_data, field_list))
+                
+            # Save new data
+            if new_data_list:
+                db_mgr.save_data(new_data_list)
+        finally:
+            db_mgr.close()
+
+    def _db_item_to_dict(self, item):
+        d = {
+            DATA_FIELD.FIELD_TIME: parse_time_column(item.date),
+            DATA_FIELD.FIELD_OPEN: item.open,
+            DATA_FIELD.FIELD_HIGH: item.high,
+            DATA_FIELD.FIELD_LOW: item.low,
+            DATA_FIELD.FIELD_CLOSE: item.close,
+        }
+        if item.volume is not None: d[DATA_FIELD.FIELD_VOLUME] = item.volume
+        if item.amount is not None: d[DATA_FIELD.FIELD_TURNOVER] = item.amount
+        if item.turn is not None: d[DATA_FIELD.FIELD_TURNRATE] = item.turn
+        return d
+
+    def _create_db_obj(self, row_data, fields_str, code, frequency, adjust_flag):
+        field_names = fields_str.split(',')
+        data_map = dict(zip(field_names, row_data))
+        
+        obj = StockKLine(
+            code=code,
+            date=data_map.get('date', data_map.get('time')),
+            frequency=frequency,
+            adjust_flag=adjust_flag,
+            open=str2float(data_map['open']),
+            high=str2float(data_map['high']),
+            low=str2float(data_map['low']),
+            close=str2float(data_map['close']),
         )
-        if rs.error_code != '0':
-            raise Exception(rs.error_msg)
-        while rs.error_code == '0' and rs.next():
-            yield CKLine_Unit(create_item_dict(rs.get_row_data(), GetColumnNameFromFieldList(fields)))
+        
+        if 'volume' in data_map and data_map['volume']:
+            obj.volume = str2float(data_map['volume'])
+        if 'amount' in data_map and data_map['amount']:
+            obj.amount = str2float(data_map['amount'])
+        if 'turn' in data_map and data_map['turn']:
+            obj.turn = str2float(data_map['turn'])
+            
+        return obj
 
     def SetBasciInfo(self):
         rs = bs.query_stock_basic(code=self.code)

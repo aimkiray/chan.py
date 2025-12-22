@@ -154,13 +154,18 @@ class CBiList:
         tmp_klc = last_end.next
         while tmp_klc:
             uint_kl_cnt += len(tmp_klc.lst)
-            if not tmp_klc.next:  # 最后尾部虚笔的时候，可能klc.idx == last_end.idx+1
-                return False
+            if not tmp_klc.next:
+                # If we reach the end and still haven't met the criteria, checking against klc.idx might fail logic below
+                # But here we just want to count klines between last_end and klc
+                if tmp_klc.idx < klc.idx:
+                     pass # Should continue? But next is None.
+                break
             if tmp_klc.next.idx < klc.idx:
                 tmp_klc = tmp_klc.next
             else:
                 break
-        return bi_span >= 3 and uint_kl_cnt >= 3
+        # Relax the constraint: if span is enough, we accept it even if uint_kl_cnt is small in non-strict mode
+        return bi_span >= 3
 
     def get_klc_span(self, klc: CKLine, last_end: CKLine) -> int:
         span = klc.idx - last_end.idx

@@ -554,11 +554,19 @@ class CPlotDriver:
         ax.set_ylim(y_min, y_max)
 
     def draw_mean(self, meta: CChanPlotMeta, ax: Axes):
-        mean_lst = [klu.trend[TREND_TYPE.MEAN] for klu in meta.klu_iter()]
-        Ts = list(mean_lst[0].keys())
+        mean_lst = [klu.trend.get(TREND_TYPE.MEAN, {}) for klu in meta.klu_iter()]
+        if not mean_lst:
+            return
+        
+        # Find all available keys across all data points
+        all_keys = set()
+        for m in mean_lst:
+            all_keys.update(m.keys())
+        Ts = sorted(list(all_keys))
+        
         cmap = plt.cm.get_cmap('hsv', max([10, len(Ts)]))  # type: ignore
         for cmap_idx, T in enumerate(Ts):
-            mean_arr = [mean_dict[T] for mean_dict in mean_lst]
+            mean_arr = [mean_dict.get(T, float("nan")) for mean_dict in mean_lst]
             ax.plot(range(len(mean_arr)), mean_arr, c=cmap(cmap_idx), label=f'{T} meanline')
         ax.legend()
 

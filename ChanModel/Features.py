@@ -8,6 +8,12 @@ class CFeatures:
     def items(self):
         yield from self.__features.items()
 
+    def keys(self):
+        return self.__features.keys()
+
+    def get(self, k, default=None):
+        return self.__features.get(k, default)
+
     def __getitem__(self, k):
         return self.__features[k]
 
