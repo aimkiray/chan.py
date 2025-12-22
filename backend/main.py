@@ -1,6 +1,11 @@
 import sys
 import os
-from fastapi import FastAPI, HTTPException
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -8,9 +13,10 @@ from typing import Optional
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backend.chan_service import get_chan_data, get_or_train_model, predict_bsp, stragety_feature, get_stock_name
+from backend.chan_service import get_chan_data, get_or_train_model, predict_bsp, stragety_feature, get_stock_name, download_stock_history
 from backend.serialization import serialize_chan_data
 from Plot.PlotMeta import CChanPlotMeta
+from Common.CEnum import KL_TYPE, DATA_SRC
 
 app = FastAPI()
 
@@ -27,11 +33,34 @@ class AnalyzeRequest(BaseModel):
     code: str
     trigger_step: bool = True
     bi_strict: bool = True
+    frequency: str = "1d"
+    data_src: str = "baostock"
 
 @app.post("/api/analyze")
 async def analyze_stock(req: AnalyzeRequest):
     try:
-        chan, bsp_dict, last_snapshot, config = get_chan_data(req.code, req.trigger_step, req.bi_strict)
+        freq_map = {
+            "1d": KL_TYPE.K_DAY,
+            "30m": KL_TYPE.K_30M,
+            "5m": KL_TYPE.K_5M,
+            "15m": KL_TYPE.K_15M,
+            "60m": KL_TYPE.K_60M,
+            "1m": KL_TYPE.K_1M,
+            "1s": KL_TYPE.K_1S,
+        }
+        level = freq_map.get(req.frequency, KL_TYPE.K_DAY)
+        
+        src_map = {
+            "baostock": DATA_SRC.BAO_STOCK,
+            "akshare": DATA_SRC.AK_SHARE,
+            "mock": DATA_SRC.MOCK,
+            "ccxt": DATA_SRC.CCXT,
+            "csv": DATA_SRC.CSV,
+            "jqdata": DATA_SRC.JQ_DATA,
+        }
+        data_src = src_map.get(req.data_src, DATA_SRC.BAO_STOCK)
+
+        chan, bsp_dict, last_snapshot, config = get_chan_data(req.code, req.trigger_step, req.bi_strict, level, data_src)
         
         if not chan or not last_snapshot:
             raise HTTPException(status_code=404, detail=f"Data not found for {req.code}")
@@ -110,6 +139,18 @@ async def analyze_stock(req: AnalyzeRequest):
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+@app.get("/api/download/{code}")
+async def download_data(code: str, frequency: str = "1d"):
+    try:
+        csv_content = download_stock_history(code, frequency)
+        return Response(
+            content=csv_content,
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={code}_{frequency}.csv"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

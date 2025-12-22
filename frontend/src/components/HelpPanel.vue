@@ -1,6 +1,13 @@
+<script setup>
+import { MemoryBook } from '@pictogrammers/memory'
+</script>
+
 <template>
   <div class="help-content">
-    <h2 class="help-title">📚 缠论量化分析 - 使用指南</h2>
+    <h2 class="help-title flex items-center gap-2">
+      <svg width="24" height="24" viewBox="0 0 24 24" class="text-blue-600"><path :d="MemoryBook" /></svg>
+      缠论量化分析 - 使用指南
+    </h2>
     
     <div class="markdown-body">
       <h3>1. 核心概念详解</h3>

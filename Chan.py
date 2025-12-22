@@ -179,6 +179,15 @@ class CChan:
         elif self.data_src == DATA_SRC.CSV:
             from DataAPI.csvAPI import CSV_API
             _dict[DATA_SRC.CSV] = CSV_API
+        elif self.data_src == DATA_SRC.AK_SHARE:
+            from DataAPI.AkShareAPI import CAkShare
+            _dict[DATA_SRC.AK_SHARE] = CAkShare
+        elif self.data_src == DATA_SRC.MOCK:
+            from DataAPI.MockStockAPI import CMockStock
+            _dict[DATA_SRC.MOCK] = CMockStock
+        elif self.data_src == DATA_SRC.JQ_DATA:
+            from DataAPI.JQDataAPI import CJQData
+            _dict[DATA_SRC.JQ_DATA] = CJQData
         if self.data_src in _dict:
             return _dict[self.data_src]
         assert isinstance(self.data_src, str)

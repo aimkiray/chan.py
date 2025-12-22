@@ -86,8 +86,22 @@ class CBaoStock(CCommonStockApi):
                 last_db_date = item.date
                 
             # 2. Check if we need to fetch from Baostock
+            import datetime
+            # Use Beijing Time (UTC+8) for today calculation to avoid timezone issues
+            today = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%Y-%m-%d')
+            
             if self.end_date and last_db_date and last_db_date >= self.end_date:
                 return
+            
+            # Optimization: If we already have data up to today, and since Baostock updates daily data EOD, we can skip
+            # ONLY for daily/weekly/monthly data. Minute data updates intraday.
+            if frequency in ['d', 'w', 'm']:
+                last_db_date_str = last_db_date
+                if last_db_date and len(last_db_date) > 10 and '-' not in last_db_date:
+                    last_db_date_str = f"{last_db_date[:4]}-{last_db_date[4:6]}-{last_db_date[6:8]}"
+                
+                if last_db_date_str and last_db_date_str >= today:
+                    return
 
             bs_start_date = self.begin_date
             if last_db_date:
@@ -196,5 +210,6 @@ class CBaoStock(CCommonStockApi):
             KL_TYPE.K_15M: '15',
             KL_TYPE.K_30M: '30',
             KL_TYPE.K_60M: '60',
+            KL_TYPE.K_1M: '1',  # Attempt to support 1 minute
         }
         return _dict[self.k_type]

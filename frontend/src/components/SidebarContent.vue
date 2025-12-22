@@ -1,12 +1,15 @@
 <template>
   <div class="flex flex-col h-full">
     <div class="flex-1">
-      <h3 class="text-sm font-semibold text-gray-500 uppercase mb-6">⚙️ 参数设置</h3>
+      <h3 class="text-sm font-semibold text-gray-500 uppercase mb-6 flex items-center gap-2">
+        <svg width="18" height="18" viewBox="0 0 24 24"><path :d="MemoryFlask" /></svg>
+        参数设置
+      </h3>
       
       <div class="mb-6">
         <label class="block text-sm font-medium text-gray-700 mb-2">股票代码</label>
-        <el-input v-model="proxyCode" placeholder="sz.002701" clearable />
-        <small class="block mt-1 text-xs text-gray-500">支持 A 股 (如 sz.002701, sh.600000)</small>
+        <el-input v-model="proxyCode" placeholder="如 002701 或 600000" clearable />
+        <small class="block mt-1 text-xs text-gray-500">支持自动识别沪深 (如 002701, 600000)</small>
       </div>
       
       <div class="mb-4">
@@ -21,6 +24,10 @@
       
       <el-button type="primary" class="w-full" :loading="loading" @click="$emit('analyze')">
         {{ loading ? '正在分析...' : '开始分析' }}
+      </el-button>
+      
+      <el-button class="w-full mt-2 !ml-0" :loading="downloading" @click="$emit('download')">
+        {{ downloading ? '下载中...' : '下载历史数据' }}
       </el-button>
     </div>
     
@@ -38,16 +45,18 @@
 
 <script setup>
 import { computed } from 'vue'
+import { MemoryFlask } from '@pictogrammers/memory'
 
 const props = defineProps({
   code: String,
   triggerStep: Boolean,
   biStrict: Boolean,
   loading: Boolean,
+  downloading: Boolean,
   lang: String
 })
 
-const emit = defineEmits(['update:code', 'update:triggerStep', 'update:biStrict', 'update:lang', 'analyze'])
+const emit = defineEmits(['update:code', 'update:triggerStep', 'update:biStrict', 'update:lang', 'analyze', 'download'])
 
 const proxyCode = computed({
   get: () => props.code,

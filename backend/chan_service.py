@@ -28,10 +28,25 @@ def stragety_feature(last_klu):
         "volume": float(last_klu.qfq_volume) if hasattr(last_klu, 'qfq_volume') else 0.0
     }
 
+def normalize_code(code):
+    code = code.strip().lower()
+    if code.startswith("sh.") or code.startswith("sz."):
+        return code
+    if code.startswith("sh") and len(code) == 8 and code[2:].isdigit():
+        return f"sh.{code[2:]}"
+    if code.startswith("sz") and len(code) == 8 and code[2:].isdigit():
+        return f"sz.{code[2:]}"
+    if code.startswith("6"):
+        return f"sh.{code}"
+    if code.startswith("0") or code.startswith("3"):
+        return f"sz.{code}"
+    return code
+
 def get_stock_name(code):
     """
     Get stock name from Baostock
     """
+    code = normalize_code(code)
     try:
         # Ensure login
         bs.login()
@@ -45,11 +60,27 @@ def get_stock_name(code):
         print(f"Error fetching stock name: {e}")
     return code
 
-def get_chan_data(code, trigger_step=True, bi_strict=True):
-    begin_time = "2020-01-01"
+def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, data_src_type=DATA_SRC.BAO_STOCK):
+    code = normalize_code(code)
+    
+    # Adjust begin_time based on frequency to avoid fetching too much data
+    import datetime
+    
+    # Special handling for JQData restriction (2024-09-13 onwards)
+    if data_src_type == DATA_SRC.JQ_DATA:
+         begin_time = "2024-09-13"
+    elif level == KL_TYPE.K_DAY:
+        begin_time = "2020-01-01"
+    elif level == KL_TYPE.K_60M or level == KL_TYPE.K_30M:
+        begin_time = (datetime.datetime.now() - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
+    elif level == KL_TYPE.K_1S:
+        begin_time = None # Mock/1s specific
+    else: # 5m, 15m, 1m
+        begin_time = (datetime.datetime.now() - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
+        
     end_time = None
-    data_src = DATA_SRC.BAO_STOCK
-    lv_list = [KL_TYPE.K_DAY]
+    data_src = data_src_type
+    lv_list = [level]
 
     config = CChanConfig({
         "trigger_step": trigger_step, 
@@ -85,8 +116,11 @@ def get_chan_data(code, trigger_step=True, bi_strict=True):
     bsp_dict: Dict[int, T_SAMPLE_INFO] = {} 
     last_snapshot = None
     
+    print(f"Start processing {code} from {begin_time}...")
     # Iterate through steps to collect training samples
     for i, chan_snapshot in enumerate(chan.step_load()):
+        if i % 100 == 0:
+            print(f"Processing step {i}...")
         last_snapshot = chan_snapshot
         
         last_klu = chan_snapshot[0][-1][-1]
@@ -181,7 +215,7 @@ def get_or_train_model(_bsp_dict, _chan):
         return None, feature_meta
         
     # Train XGBoost
-    model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, use_label_encoder=False, eval_metric='logloss')
+    model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, eval_metric='logloss')
     model.fit(X_train, y_train)
     
     return model, feature_meta
@@ -195,3 +229,45 @@ def predict_bsp(model, bsp, feature_meta):
     probs = model.predict_proba([feat_vec])
     # probs is [[prob_0, prob_1]]
     return probs[0][1]
+
+def download_stock_history(code, frequency='1d'):
+    import csv
+    import io
+    import datetime
+
+    code = normalize_code(code)
+    bs.login()
+    
+    freq_map = {
+        "1d": "d",
+        "5m": "5",
+        "15m": "15",
+        "30m": "30",
+        "60m": "60",
+        "1m": "1",
+    }
+    bs_freq = freq_map.get(frequency, "d")
+    
+    # Fields: standard OHLCV + others
+    fields = "date,time,code,open,high,low,close,volume,amount,adjustflag,turn,pctChg"
+    
+    rs = bs.query_history_k_data_plus(
+        code=code,
+        fields=fields,
+        start_date='1990-01-01',
+        end_date=datetime.datetime.now().strftime("%Y-%m-%d"),
+        frequency=bs_freq,
+        adjustflag="2" # QFQ
+    )
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Write header
+    writer.writerow(fields.split(','))
+    
+    while (rs.error_code == '0') & rs.next():
+        writer.writerow(rs.get_row_data())
+        
+    bs.logout()
+    return output.getvalue()
