@@ -1,6 +1,7 @@
 import jqdatasdk as jq
 import pandas as pd
 import os
+import datetime
 from Common.CEnum import AUTYPE, DATA_FIELD, KL_TYPE
 from Common.CTime import CTime
 from Common.func_util import str2float, kltype_lt_day
@@ -27,7 +28,7 @@ def parse_time_column(inp):
         year = int(inp[:4])
         month = int(inp[5:7])
         day = int(inp[8:10])
-        return CTime(year, month, day, 0, 0)
+        return CTime(year, month, day, 0, 0, auto=False)
     else:
         # Try to parse pandas timestamp
         try:
@@ -68,7 +69,13 @@ class CJQData(CCommonStockApi):
     def get_kl_data(self):
         # JQData code format: 000001.XSHE, 600000.XSHG
         symbol = self.code
-        if symbol.endswith(".sz"):
+        
+        # Handle sz./sh. prefix (from normalize_code)
+        if symbol.startswith("sz."):
+            symbol = symbol[3:] + ".XSHE"
+        elif symbol.startswith("sh."):
+            symbol = symbol[3:] + ".XSHG"
+        elif symbol.endswith(".sz"):
             symbol = symbol.replace(".sz", ".XSHE")
         elif symbol.endswith(".sh"):
             symbol = symbol.replace(".sh", ".XSHG")
@@ -87,23 +94,26 @@ class CJQData(CCommonStockApi):
         # money is turnover
         
         # Hardcode date range limit for demo/restricted account
-        # User reported limit: 2024-09-13 to 2025-09-20
-        # We enforce start_date to be at least 2024-09-13 and end_date at most 2025-09-20
+        # User reported limit: 2024-09-14 to 2025-09-21
+        # We enforce start_date to be at least 2024-09-14 and end_date at most 2025-09-21
         
-        start_date = self.begin_date if self.begin_date else "2024-09-13"
+        start_date = self.begin_date if self.begin_date else "2024-09-14"
+        
         # Ensure we compare dates properly (handle potential time strings)
         start_comp = str(start_date)[:10]
-        if start_comp < "2024-09-13":
-             print(f"Warning: JQData start_date {start_date} is before allowed limit 2024-09-13. Adjusting.")
-             start_date = "2024-09-13"
+        if start_comp < "2024-09-14":
+             print(f"Warning: JQData start_date {start_date} is before allowed limit 2024-09-14. Adjusting.")
+             start_date = "2024-09-14"
              
-        end_date = self.end_date if self.end_date else "2025-09-20"
+        end_date = self.end_date if self.end_date else "2025-09-21"
         end_comp = str(end_date)[:10]
-        # 2025-09-20 is the limit. It is a Saturday, so it covers up to 2025-09-19 (Friday) close.
-        if end_comp > "2025-09-20": 
-             print(f"Warning: JQData end_date {end_date} is after allowed limit 2025-09-20. Adjusting to 2025-09-20.")
-             end_date = "2025-09-20"
+        # 2025-09-21 is the limit.
+        if end_comp > "2025-09-21": 
+             print(f"Warning: JQData end_date {end_date} is after allowed limit 2025-09-21. Adjusting to 2025-09-21.")
+             end_date = "2025-09-21"
         
+        print(f"JQData Request: {symbol}, start={start_date}, end={end_date}, freq={unit}")
+
         try:
             df = jq.get_price(symbol, start_date=start_date, end_date=end_date, frequency=unit, fields=['open', 'close', 'high', 'low', 'volume', 'money'], skip_paused=True, fq=fq)
             
@@ -125,10 +135,26 @@ class CJQData(CCommonStockApi):
             # Map JQ columns
             # df columns: index/time, open, close, high, low, volume, money
             
+            last_date = None
             for _, row in df.iterrows():
                 # row[0] is time
+                row_time = row.iloc[0]
+                # Ensure row_time is comparable for last_date logic
+                if isinstance(row_time, pd.Timestamp):
+                     current_dt = row_time.to_pydatetime()
+                else:
+                     # try parse
+                     try:
+                         current_dt = pd.to_datetime(row_time).to_pydatetime()
+                     except:
+                         current_dt = None
+                         
+                if current_dt:
+                    if last_date is None or current_dt > last_date:
+                        last_date = current_dt
+
                 data = [
-                    str(row.iloc[0]), # Time
+                    str(row_time), # Time
                     str(row['open']),
                     str(row['high']),
                     str(row['low']),
@@ -137,6 +163,55 @@ class CJQData(CCommonStockApi):
                     str(row['money'])
                 ]
                 yield CKLine_Unit(create_item_dict(data, columns))
+
+            # Check for Real-time tick (Call Auction or Trading Session)
+            # Logic: If today is a trading day and we haven't yielded today's data (or it's incomplete), fetch tick.
+            # JQData's get_price might include today's data if end_date covers it.
+            # But just in case, or for call auction, we check.
+            
+            now = datetime.datetime.now()
+            is_trading_time = (now.weekday() < 5) and (
+                (now.hour == 9 and now.minute >= 15) or 
+                (now.hour > 9 and now.hour < 15) or 
+                (now.hour == 15 and now.minute <= 30)
+            )
+            
+            # If we are in trading time, OR if it's past trading time but today's data is missing from history
+            # For simplicity, if it's a weekday and we don't have today's data in last_date, try to fetch tick.
+            
+            should_fetch_tick = False
+            if now.weekday() < 5:
+                if last_date is None:
+                    should_fetch_tick = True
+                else:
+                    # Check if last_date is today
+                    if last_date.date() < now.date():
+                        should_fetch_tick = True
+            
+            if should_fetch_tick and self.k_type == KL_TYPE.K_DAY:
+                try:
+                    tick = jq.get_current_tick(symbol)
+                    if isinstance(tick, list) and len(tick) > 0:
+                        tick = tick[0]
+                    
+                    if hasattr(tick, 'current') and tick.current > 0:
+                         tick_time = tick.datetime
+                         # Double check time to avoid dup (though should be covered by last_date check)
+                         tick_dt = datetime.datetime.strptime(str(tick_time)[:19], "%Y-%m-%d %H:%M:%S")
+                         
+                         if last_date is None or tick_dt.date() > last_date.date():
+                             data = [
+                                str(tick_time),
+                                str(tick.current),
+                                str(tick.high if tick.high > 0 else tick.current),
+                                str(tick.low if tick.low > 0 and tick.low < float('inf') else tick.current),
+                                str(tick.current),
+                                str(tick.volume),
+                                str(tick.money)
+                             ]
+                             yield CKLine_Unit(create_item_dict(data, columns))
+                except Exception as ex:
+                    print(f"Real-time Tick Error: {ex}")
                 
         except Exception as e:
             print(f"JQData Error: {e}")

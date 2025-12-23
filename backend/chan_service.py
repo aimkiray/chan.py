@@ -2,6 +2,11 @@ import sys
 import os
 from typing import Dict, TypedDict
 import xgboost as xgb
+import lightgbm as lgb
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
 import baostock as bs
 
 # Add parent directory to path to allow importing from root
@@ -60,7 +65,103 @@ def get_stock_name(code):
         print(f"Error fetching stock name: {e}")
     return code
 
-def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, data_src_type=DATA_SRC.BAO_STOCK):
+from DataAPI.CommonStockAPI import CCommonStockApi
+
+class PreloadedStockAPI(CCommonStockApi):
+    def __init__(self, code, k_type=None, begin_date=None, end_date=None, autype=None, data_list=None):
+        self.data_list = data_list or []
+        super().__init__(code, k_type, begin_date, end_date, autype)
+
+    def get_kl_data(self):
+        yield from self.data_list
+    
+    @classmethod
+    def do_init(cls):
+        pass
+    
+    @classmethod
+    def do_close(cls):
+        pass
+
+class CChanCustom(CChan):
+    def __init__(self, code, begin_time=None, end_time=None, data_src=None, lv_list=None, config=None, autype=None, preloaded_data=None):
+        self.preloaded_data = preloaded_data
+        super().__init__(code, begin_time, end_time, data_src, lv_list, config, autype)
+    
+    def GetStockAPI(self):
+        if self.preloaded_data is not None:
+            # We need to return a class that accepts arguments but uses our preloaded data
+            # Since CChan instantiates the class, we can't easily pass the instance.
+            # But we can monkey-patch the __init__ of our custom class to use the preloaded data?
+            # Or better, just return a factory class.
+            
+            # CChan calls: stockapi_cls(code=..., ...)
+            # So we define a class that ignores args and uses self.preloaded_data
+            
+            data = self.preloaded_data
+            class CustomAPI(PreloadedStockAPI):
+                def __init__(self, code, k_type=None, begin_date=None, end_date=None, autype=None):
+                    super().__init__(code, k_type, begin_date, end_date, autype, data_list=data)
+            
+            return CustomAPI
+            
+        return super().GetStockAPI()
+
+def fetch_stock_data(code, level, begin_time, end_time, data_src_type, autype=AUTYPE.QFQ):
+    """
+    Helper to fetch raw K-line data without calculating Chan elements.
+    Useful for checking data freshness for caching.
+    """
+    code = normalize_code(code)
+    
+    # Create a temporary CChan instance just to resolve the StockAPI class
+    # This is a bit hacky but avoids duplicating the StockAPI resolution logic
+    temp_chan = CChan(
+        code=code,
+        begin_time=begin_time,
+        end_time=end_time,
+        data_src=data_src_type,
+        lv_list=[level],
+        config=CChanConfig(),
+        autype=autype
+    )
+    
+    StockAPI = temp_chan.GetStockAPI()
+    StockAPI.do_init()
+    try:
+        stock_api = StockAPI(code=code, k_type=level, begin_date=begin_time, end_date=end_time, autype=autype)
+        data_list = list(stock_api.get_kl_data())
+        return data_list
+    finally:
+        StockAPI.do_close()
+
+def get_latest_data_time(code, level, data_src_type):
+    """
+    Optimized function to get ONLY the latest data time without fetching full history.
+    """
+    import datetime
+    code = normalize_code(code)
+    
+    # Define a short lookback period
+    if level == KL_TYPE.K_DAY:
+        days = 30
+    else:
+        days = 5
+        
+    begin_time = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+    end_time = None
+    
+    # Reuse fetch_stock_data but with short range
+    try:
+        data_list = fetch_stock_data(code, level, begin_time, end_time, data_src_type)
+        if data_list:
+            return str(data_list[-1].time)
+    except Exception as e:
+        print(f"Error fetching latest time: {e}")
+    return None
+
+
+def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, data_src_type=DATA_SRC.BAO_STOCK, preloaded_data=None):
     code = normalize_code(code)
     
     # Adjust begin_time based on frequency to avoid fetching too much data
@@ -68,7 +169,10 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
     
     # Special handling for JQData restriction (2024-09-13 onwards)
     if data_src_type == DATA_SRC.JQ_DATA:
-         begin_time = "2024-09-13"
+         # Trial account restriction: ~3 months data.
+         # Error says: 2024-09-14 to 2025-09-21.
+         # We use a safe margin.
+         begin_time = "2024-10-01"
     elif level == KL_TYPE.K_DAY:
         begin_time = "2020-01-01"
     elif level == KL_TYPE.K_60M or level == KL_TYPE.K_30M:
@@ -98,17 +202,29 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
         "zs_algo": "normal",
         "mean_metrics": [5, 20],
     })
-
+    
     try:
-        chan = CChan(
-            code=code,
-            begin_time=begin_time,
-            end_time=end_time,
-            data_src=data_src,
-            lv_list=lv_list,
-            config=config,
-            autype=AUTYPE.QFQ,
-        )
+        if preloaded_data:
+            chan = CChanCustom(
+                code=code,
+                begin_time=begin_time,
+                end_time=end_time,
+                data_src=data_src,
+                lv_list=lv_list,
+                config=config,
+                autype=AUTYPE.QFQ,
+                preloaded_data=preloaded_data
+            )
+        else:
+            chan = CChan(
+                code=code,
+                begin_time=begin_time,
+                end_time=end_time,
+                data_src=data_src,
+                lv_list=lv_list,
+                config=config,
+                autype=AUTYPE.QFQ,
+            )
     except Exception as e:
         print(f"Error loading CChan: {e}")
         return None, None, None, None
@@ -152,33 +268,27 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
              
     return chan, bsp_dict, last_snapshot, config
 
-def get_or_train_model(_bsp_dict, _chan):
+class SingleClassModel:
+    def __init__(self, label):
+        self.label = label
+    
+    def predict_proba(self, X):
+        # Return probability 1.0 for the class 'label', 0.0 for others
+        # Format: [[prob_0, prob_1]]
+        if self.label == 1:
+            return [[0.0, 1.0]] * len(X)
+        else:
+            return [[1.0, 0.0]] * len(X)
+
+def get_or_train_model(_bsp_dict, _chan, model_type="xgboost"):
     # Prepare data for XGBoost
     X_train = []
     y_train = []
-    
-    # Labeling logic: 
-    # If a buy point is followed by a rise, it's valid (1).
-    # If a sell point is followed by a drop, it's valid (1).
-    # We use a simple heuristic: profit > threshold within N bars?
-    # Or just use the standard Chan logic if available.
-    
-    # For now, let's assume we label based on future performance.
-    # Since we are in simulation, we can peek future? No, step_load simulates real-time.
-    # But for training, we need historical labels.
-    
-    # Wait, the original code used 'is_stock=True' which usually fetches all data.
-    # Here we collected _bsp_dict during step_load.
-    
-    # Let's simplify: We return a dummy model or load a pre-trained one.
-    # Or train on the fly with what we have.
     
     if not _bsp_dict:
         return None, None
 
     # Extract features
-    # We need to know the feature names.
-    # Collect all possible keys from all samples to handle different BSP types
     all_keys = set()
     for info in _bsp_dict.values():
         for k in info['feature'].keys():
@@ -187,7 +297,6 @@ def get_or_train_model(_bsp_dict, _chan):
     
     for idx, info in _bsp_dict.items():
         # Labeling
-        # Check profit in next 5 bars
         lookahead = 5
         cur_klu = info['bsp_obj'].klu
         future_klu = cur_klu
@@ -210,25 +319,90 @@ def get_or_train_model(_bsp_dict, _chan):
         X_train.append(feat_vec)
         y_train.append(label)
         
-    if not X_train or len(set(y_train)) < 2:
-        print(f"Skipping training: Not enough data or classes. Classes: {set(y_train)}")
+    print(f"Training data size: {len(X_train)}")
+    print(f"Class distribution: {set(y_train)}")
+    
+    if not X_train:
+        print("Skipping training: No data.")
         return None, feature_meta
         
-    # Train XGBoost
-    model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, eval_metric='logloss')
-    model.fit(X_train, y_train)
+    if len(set(y_train)) < 2:
+        print(f"Skipping training: Single class detected. Classes: {set(y_train)}")
+        # Return a dummy model that always predicts this class
+        return SingleClassModel(list(set(y_train))[0]), feature_meta
+        
+    # Train Model based on type
+    model = None
+    print(f"Training model: {model_type}")
+    
+    try:
+        if model_type == "xgboost":
+            model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, eval_metric='logloss')
+            model.fit(X_train, y_train)
+        elif model_type == "lightgbm":
+            model = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, verbosity=-1)
+            model.fit(X_train, y_train)
+        elif model_type == "mlp":
+            # MLP requires scaling and handling of missing values
+            # Increase max_iter and use adaptive learning rate to help convergence
+            model = Pipeline([
+                ('imputer', SimpleImputer(missing_values=-9999999, strategy='mean')),
+                ('scaler', StandardScaler()),
+                ('mlp', MLPClassifier(
+                    hidden_layer_sizes=(100, 50), 
+                    max_iter=2000, 
+                    learning_rate='adaptive',
+                    early_stopping=True,
+                    random_state=42
+                ))
+            ])
+            model.fit(X_train, y_train)
+        else:
+            print(f"Unknown model type: {model_type}, falling back to XGBoost")
+            model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, eval_metric='logloss')
+            model.fit(X_train, y_train)
+    except Exception as e:
+        print(f"Model training failed: {e}")
+        return None, feature_meta
     
     return model, feature_meta
 
 def predict_bsp(model, bsp, feature_meta):
     if not model or not bsp:
+        print("Prediction skipped: Model or BSP is None")
         return 0.0
         
     feat_vec = [bsp.features.get(k, -9999999) for k in feature_meta]
     # Predict prob
-    probs = model.predict_proba([feat_vec])
-    # probs is [[prob_0, prob_1]]
-    return probs[0][1]
+    try:
+        probs = model.predict_proba([feat_vec])
+        # probs is [[prob_0, prob_1]]
+        # If model only has one class, probs might be [[1.0]] (not standard sklearn behavior but possible)
+        # Sklearn classifiers usually return probability for all classes in model.classes_
+        
+        print(f"Model raw probabilities: {probs}")
+
+        # Check shape
+        if len(probs[0]) >= 2:
+            return probs[0][1]
+        elif len(probs[0]) == 1:
+            # If only one probability returned, check model.classes_
+            # But standard sklearn predict_proba returns columns for all classes.
+            # If we trained with 2 classes, it returns 2 columns.
+            
+            # If using SingleClassModel, it handles it correctly.
+            # If sklearn model somehow has 1 class (should be caught by get_or_train_model check), handle gracefully.
+            val = probs[0][0]
+            # If the only class is 1, return val. If 0, return 1-val? No, predict_proba usually corresponds to classes_.
+            # Since we can't easily access classes_ from Pipeline easily without digging, let's assume get_or_train_model handles single class.
+            return val 
+            
+        return 0.0
+    except Exception as e:
+        print(f"Prediction failed with exception: {e}")
+        import traceback
+        traceback.print_exc()
+        return 0.0
 
 def download_stock_history(code, frequency='1d'):
     import csv

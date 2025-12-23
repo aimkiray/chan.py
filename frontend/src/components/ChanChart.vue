@@ -3,18 +3,18 @@
     <div class="chart-container" ref="chartDom"></div>
     <el-popover placement="bottom-end" :width="320" trigger="hover">
       <template #reference>
-        <div class="absolute top-[10px] right-[10px] z-10 cursor-help opacity-60 hover:opacity-100 transition-opacity" title="图例说明">
+        <div class="absolute top-[10px] right-[10px] z-10 cursor-help opacity-60 hover:opacity-100 transition-opacity" :title="t('chart.legend')">
             <svg width="24" height="24" viewBox="0 0 24 24" class="text-gray-500"><path :d="MemoryAlertCircle" /></svg>
         </div>
       </template>
       <div class="text-sm">
-        <h4 class="font-bold mb-2 text-gray-800 border-b pb-1">图例说明</h4>
+        <h4 class="font-bold mb-2 text-gray-800 border-b pb-1">{{ t('chart.legend') }}</h4>
         <div class="space-y-2">
-            <div><span class="font-semibold text-gray-700">K-Line (K线):</span> <span class="text-gray-600">反映股价走势的基础图表，包含开盘、收盘、最高、最低价。<br/><span class="text-xs text-gray-400">红色=上涨，绿色=下跌。</span></span></div>
-            <div><span class="font-semibold text-gray-700">Bi (笔):</span> <span class="text-gray-600">连接相邻的顶分型和底分型。<br/><span class="text-xs text-gray-400">黑色实线=已确认，虚线=未完成。</span></span></div>
-            <div><span class="font-semibold text-gray-700">Seg (线段):</span> <span class="text-gray-600">更高级别的走势结构。<br/><span class="text-xs text-green-600">由绿色线表示。</span></span></div>
-            <div><span class="font-semibold text-gray-700">Center (中枢):</span> <span class="text-gray-600">价格密集成交区。<br/><span class="text-xs text-orange-500">由橙色矩形框表示。</span></span></div>
-            <div><span class="font-semibold text-gray-700">MA (均线):</span> <span class="text-gray-600">移动平均线 (如 MA5=5日均线)。</span></div>
+            <div><span class="font-semibold text-gray-700">{{ t('chart.kline') }}</span> <span class="text-gray-600" v-html="t('chart.klineDesc')"></span></div>
+            <div><span class="font-semibold text-gray-700">{{ t('chart.bi') }}</span> <span class="text-gray-600" v-html="t('chart.biDesc')"></span></div>
+            <div><span class="font-semibold text-gray-700">{{ t('chart.seg') }}</span> <span class="text-gray-600" v-html="t('chart.segDesc')"></span></div>
+            <div><span class="font-semibold text-gray-700">{{ t('chart.center') }}</span> <span class="text-gray-600" v-html="t('chart.centerDesc')"></span></div>
+            <div><span class="font-semibold text-gray-700">{{ t('chart.ma') }}</span> <span class="text-gray-600">{{ t('chart.maDesc') }}</span></div>
         </div>
       </div>
     </el-popover>
@@ -25,9 +25,12 @@
 import { ref, onMounted, onUnmounted, watch } from 'vue'
 import * as echarts from 'echarts'
 import { MemoryAlertCircle } from '@pictogrammers/memory'
+import { useI18n } from '../composables/useI18n'
 
+const { t, currentLang } = useI18n()
 const chartDom = ref(null)
 let myChart = null
+let lastData = null
 
 const props = defineProps({
   loading: Boolean
@@ -38,6 +41,10 @@ watch(() => props.loading, (val) => {
     if (val) myChart.showLoading()
     else myChart.hideLoading()
   }
+})
+
+watch(currentLang, () => {
+  if (lastData) renderChart(lastData)
 })
 
 onMounted(() => {
@@ -261,14 +268,17 @@ const renderChart = (data) => {
           tooltip: {
             show: true,
             formatter: function (name) {
+                if (typeof name !== 'string') return name
                 const descriptions = {
-                    'K-Line': '<b>K线 (K-Line)</b><br/>反映股价走势的基础图表，包含开盘、收盘、最高、最低价。',
-                    'Bi': '<b>笔 (Bi)</b><br/>缠论中的基础走势组件，连接相邻的顶分型和底分型。<br/>黑色实线表示已确认的笔，虚线表示未完成。',
-                    'Seg': '<b>线段 (Segment)</b><br/>比“笔”更高一级的走势结构，由连续的三笔（或更多）构成。<br/>绿色线表示。',
-                    'Center': '<b>中枢 (Center/Pivot)</b><br/>价格密集成交区，至少被三笔（或线段）重叠的部分。<br/>橙色矩形框表示。'
+                    'K-Line': t('chart.tooltip.kline'),
+                    'Bi': t('chart.tooltip.bi'),
+                    'Seg': t('chart.tooltip.seg'),
+                    'Center': t('chart.tooltip.center')
                 }
                 if (descriptions[name]) return descriptions[name]
-                if (name.startsWith('MA')) return `<b>移动平均线 (${name})</b><br/>过去 ${name.substring(2)} 个周期的收盘价平均值。`
+                if (name.startsWith('MA')) {
+                   return t('chart.tooltip.ma').replace('{name}', name).replace('{n}', name.substring(2))
+                }
                 return name
             }
           }

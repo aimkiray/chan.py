@@ -1,5 +1,6 @@
 import akshare as ak
 import pandas as pd
+import datetime
 from Common.CEnum import AUTYPE, DATA_FIELD, KL_TYPE
 from Common.CTime import CTime
 from Common.func_util import str2float, kltype_lt_day
@@ -25,7 +26,7 @@ def parse_time_column(inp):
         year = int(inp[:4])
         month = int(inp[5:7])
         day = int(inp[8:10])
-        return CTime(year, month, day, 0, 0)
+        return CTime(year, month, day, 0, 0, auto=False)
     else:
         raise Exception(f"unknown time column from akshare:{inp}")
 
@@ -90,10 +91,77 @@ class CAkShare(CCommonStockApi):
             if not kltype_lt_day(self.k_type):
                 columns.append(DATA_FIELD.FIELD_TURNRATE)
                 
+            last_date = None
             for _, row in df.iterrows():
                 data = [str(row[c]) for c in columns]
+                # Try to capture last date
+                # data[0] is time
+                try:
+                    dt_str = str(data[0])
+                    if len(dt_str) >= 10:
+                        current_dt = datetime.datetime.strptime(dt_str[:10], "%Y-%m-%d")
+                        if last_date is None or current_dt > last_date:
+                            last_date = current_dt
+                except:
+                    pass
+                    
                 yield CKLine_Unit(create_item_dict(data, columns))
                 
+            # Check for Real-time tick (Call Auction or Trading Session or missing today)
+            now = datetime.datetime.now()
+            should_fetch_tick = False
+            
+            if now.weekday() < 5:
+                if last_date is None:
+                    should_fetch_tick = True
+                else:
+                     # Check if last_date is today
+                    if last_date.date() < now.date():
+                        should_fetch_tick = True
+            
+            if should_fetch_tick and self.k_type == KL_TYPE.K_DAY:
+                try:
+                    # Use stock_zh_a_spot_em for real-time data
+                    # Note: This fetches all stocks, which might be slow but reliable
+                    spot_df = ak.stock_zh_a_spot_em()
+                    # Filter by code
+                    # AkShare code in spot is 6 digits
+                    spot_row = spot_df[spot_df['代码'] == symbol]
+                    
+                    if not spot_row.empty:
+                        # Columns: 序号, 代码, 名称, 最新价, 涨跌幅, 涨跌额, 成交量, 成交额, 振幅, 最高, 最低, 今开, 昨收, 量比, 换手率, 市盈率-动态, 市净率
+                        # Map to our columns
+                        # Time is not in spot_df, use now
+                        row_data = spot_row.iloc[0]
+                        current_price = row_data['最新价']
+                        
+                        if current_price and str(current_price) != 'nan':
+                            tick_time = now.strftime("%Y-%m-%d %H:%M:%S")
+                            
+                            # Double check time to avoid dup
+                            tick_dt = datetime.datetime.strptime(tick_time, "%Y-%m-%d %H:%M:%S")
+                            
+                            if last_date is None or tick_dt.date() > last_date.date():
+                                data = [
+                                    tick_time,
+                                    str(row_data['今开']), # Open
+                                    str(row_data['最高']), # High
+                                    str(row_data['最低']), # Low
+                                    str(current_price),  # Close
+                                    str(row_data['成交量']), # Volume
+                                    str(row_data['成交额'])  # Turnover
+                                ]
+                                
+                                # If values are nan/None, use current_price
+                                for i in range(1, 5):
+                                    if data[i] == 'nan' or data[i] == 'None':
+                                        data[i] = str(current_price)
+                                        
+                                yield CKLine_Unit(create_item_dict(data, columns))
+                             
+                except Exception as ex:
+                    print(f"AkShare Real-time Tick Error: {ex}")
+
         except Exception as e:
             print(f"AkShare Error: {e}")
             raise e
