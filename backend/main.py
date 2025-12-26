@@ -47,8 +47,15 @@ class AnalyzeRequest(BaseModel):
     data_length_years: Optional[float] = None
 
 @app.get("/api/history")
-async def get_history(code: Optional[str] = None):
-    return storage.get_history(code)
+async def get_history(code: Optional[str] = None, page: int = 1, page_size: int = 10):
+    return storage.get_history(code, page, page_size)
+
+@app.delete("/api/history/{result_id}")
+async def delete_history_item(result_id: int):
+    success = storage.delete_result(result_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Result not found or failed to delete")
+    return {"status": "success"}
 
 @app.get("/api/history/{result_id}")
 async def get_history_detail(result_id: int):
@@ -59,7 +66,7 @@ async def get_history_detail(result_id: int):
 
 @app.post("/api/analyze")
 async def analyze_stock(req: AnalyzeRequest):
-    print(f"Received analyze request: code={req.code}, freq={req.frequency}, model={req.model}, force_refresh={req.force_refresh}")
+    print(f"Received analyze request: code={req.code}, freq={req.frequency}, model={req.model}, force_refresh={req.force_refresh}, data_length_years={req.data_length_years}")
     try:
         req.code = normalize_code(req.code)
         
@@ -84,13 +91,46 @@ async def analyze_stock(req: AnalyzeRequest):
         }
         data_src = src_map.get(req.data_src, DATA_SRC.BAO_STOCK)
 
-        # 1. Check if we have a valid cache by comparing latest time
+        # 1. Calculate Time Range First
+        import datetime
+        days = 365 # Default safe fallback
+        
+        if req.data_length_years is not None:
+            days = int(365 * req.data_length_years)
+        elif req.data_length_mode == "max":
+             # Max Ranges: 1m: 1 year, 5m: 2 years, 15m: 5 years, 30m+: 10 years
+            if level == KL_TYPE.K_1M:
+                days = 365 # 1 year
+            elif level == KL_TYPE.K_5M:
+                days = 365 * 2 # 2 years
+            elif level == KL_TYPE.K_15M:
+                days = 365 * 5 # 5 years
+            elif level in [KL_TYPE.K_30M, KL_TYPE.K_60M, KL_TYPE.K_DAY, KL_TYPE.K_WEEK, KL_TYPE.K_MON]:
+                 days = 365 * 10 # 10 years
+        else:
+            # Default Ranges: 1m: 0.5yr, 5m: 1.5yr, 15m: 2.5yr, 30m+: 5yr
+            if level == KL_TYPE.K_1M:
+                days = 180 # 0.5 year
+            elif level == KL_TYPE.K_5M:
+                days = 540 # 1.5 years
+            elif level == KL_TYPE.K_15M:
+                days = 900 # 2.5 years
+            elif level in [KL_TYPE.K_30M, KL_TYPE.K_60M, KL_TYPE.K_DAY, KL_TYPE.K_WEEK, KL_TYPE.K_MON]:
+                days = 1800 # 5 years
+
+        # Ensure minimal days
+        days = max(days, 30)
+        
+        begin_time = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+
+        # 2. Check Cache with latest data time
         # This avoids fetching full data if cache is valid
         latest_data_time = None
         kl_list = None
         
         try:
             # Only fetch the latest time (lightweight)
+            # Use short lookback for efficiency
             latest_data_time = get_latest_data_time(req.code, level, data_src)
         except Exception as e:
              print(f"Error fetching latest time: {e}")
@@ -100,51 +140,33 @@ async def analyze_stock(req: AnalyzeRequest):
             "bi_strict": req.bi_strict,
             "model": req.model,
             "data_src": req.data_src,
-            "do_predict": req.do_predict
+            "do_predict": req.do_predict,
+            "data_length_mode": req.data_length_mode,
+            "data_length_years": req.data_length_years
         }
 
         if latest_data_time and not req.force_refresh:
-            # 2. Check Cache
-            cached_result = storage.get_latest_result(req.code, req.frequency, params, latest_data_time)
+            # Check Cache
+            # 1. Try to find a result with prediction (do_predict=True) first, even if not requested
+            # This allows displaying cached AI results automatically without re-running
+            if not req.do_predict:
+                better_params = params.copy()
+                better_params['do_predict'] = True
+                better_result = storage.get_latest_result(req.code, req.frequency, better_params, latest_data_time, begin_time)
+                if better_result:
+                    print(f"Cache hit (upgraded with prediction) for {req.code} {req.frequency} {latest_data_time}")
+                    return json.loads(better_result.result_json)
+
+            # 2. Normal cache check
+            cached_result = storage.get_latest_result(req.code, req.frequency, params, latest_data_time, begin_time)
             
             if cached_result:
-                print(f"Cache hit for {req.code} {req.frequency} {latest_data_time}")
+                print(f"Cache hit for {req.code} {req.frequency} {latest_data_time} begin={begin_time}")
                 return json.loads(cached_result.result_json)
         
         # 3. Cache Miss or No Time info -> Fetch Full Data
         try:
-            # Replicating logic from get_chan_data but with data_length_mode support:
-            import datetime
-            days = 365 # Default safe fallback
-            
-            if req.data_length_years is not None:
-                days = int(365 * req.data_length_years)
-            elif req.data_length_mode == "max":
-                 # Max Ranges: 1m: 1 year, 5m: 2 years, 15m: 5 years, 30m+: 10 years
-                if level == KL_TYPE.K_1M:
-                    days = 365 # 1 year
-                elif level == KL_TYPE.K_5M:
-                    days = 365 * 2 # 2 years
-                elif level == KL_TYPE.K_15M:
-                    days = 365 * 5 # 5 years
-                elif level in [KL_TYPE.K_30M, KL_TYPE.K_60M, KL_TYPE.K_DAY, KL_TYPE.K_WEEK, KL_TYPE.K_MON]:
-                     days = 365 * 10 # 10 years
-            else:
-                # Default Ranges: 1m: 0.5yr, 5m: 1.5yr, 15m: 2.5yr, 30m+: 5yr
-                if level == KL_TYPE.K_1M:
-                    days = 180 # 0.5 year
-                elif level == KL_TYPE.K_5M:
-                    days = 540 # 1.5 years
-                elif level == KL_TYPE.K_15M:
-                    days = 900 # 2.5 years
-                elif level in [KL_TYPE.K_30M, KL_TYPE.K_60M, KL_TYPE.K_DAY, KL_TYPE.K_WEEK, KL_TYPE.K_MON]:
-                    days = 1800 # 5 years
-
-            # Ensure minimal days
-            days = max(days, 30)
-            
-            begin_time = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
-            
+            # Use the pre-calculated begin_time
             kl_list = fetch_stock_data(req.code, level, begin_time, None, data_src)
         except Exception as e:
             print(f"Fetch data error: {e}")
@@ -251,20 +273,26 @@ async def analyze_stock(req: AnalyzeRequest):
             if accuracy_info:
                 storage_signal_info['accuracy'] = f"{accuracy_info['accuracy']:.2f}"
                 
-            storage.save_result(
-                code=req.code,
-                freq=req.frequency,
-                params=params,
-                data_latest_time=latest_data_time,
-                result_dict=result_data,
-                model=req.model,
-                signal_info=storage_signal_info
-            )
+            # Only save if it's an AI analysis (do_predict=True)
+            if req.do_predict:
+                storage.save_result(
+                    code=req.code,
+                    freq=req.frequency,
+                    params=params,
+                    data_latest_time=latest_data_time,
+                    result_dict=result_data,
+                    model=req.model,
+                    signal_info=storage_signal_info,
+                    begin_time=begin_time,
+                    end_time=None # End time is implicitly 'now' or latest_data_time
+                )
         except Exception as e:
             print(f"Failed to save cache: {e}")
             
         return result_data
         
+    except HTTPException as e:
+        raise e
     except Exception as e:
         import traceback
         traceback.print_exc()

@@ -21,7 +21,7 @@ def serialize_chan_data(meta: CChanPlotMeta, lv: KL_TYPE) -> Dict[str, Any]:
         date_str = klu.time.to_str()
         dates.append(date_str)
         # open, close, low, high
-        klines.append([klu.open, klu.close, klu.low, klu.high])
+        klines.append([float(klu.open), float(klu.close), float(klu.low), float(klu.high)])
         volumes.append(float(klu.qfq_volume) if hasattr(klu, 'qfq_volume') else 0.0)
         
     # Bi

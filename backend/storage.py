@@ -20,6 +20,10 @@ class AnalysisResult(Base):
     # Time of the latest K-line used in this analysis (to detect data updates)
     data_latest_time = Column(String(30))
     
+    # Data Range
+    begin_time = Column(String(30))
+    end_time = Column(String(30))
+
     # When this analysis was run
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     
@@ -45,7 +49,7 @@ class StorageManager:
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine)
 
-    def save_result(self, code, freq, params, data_latest_time, result_dict, model, signal_info):
+    def save_result(self, code, freq, params, data_latest_time, result_dict, model, signal_info, begin_time=None, end_time=None):
         session = self.Session()
         try:
             params_json = json.dumps(params, sort_keys=True)
@@ -67,7 +71,9 @@ class StorageManager:
                 model=model,
                 signal_type=signal_info.get('type') if signal_info else None,
                 is_buy=1 if signal_info and signal_info.get('is_buy') else 0,
-                accuracy=signal_info.get('accuracy') if signal_info else None
+                accuracy=signal_info.get('accuracy') if signal_info else None,
+                begin_time=begin_time,
+                end_time=end_time
             )
             session.add(result)
             session.commit()
@@ -78,7 +84,7 @@ class StorageManager:
         finally:
             session.close()
 
-    def get_latest_result(self, code, freq, params, data_latest_time):
+    def get_latest_result(self, code, freq, params, data_latest_time, begin_time=None):
         session = self.Session()
         try:
             params_json = json.dumps(params, sort_keys=True)
@@ -94,19 +100,32 @@ class StorageManager:
                 AnalysisResult.frequency == freq,
                 AnalysisResult.params_hash == params_hash,
                 AnalysisResult.data_latest_time == data_latest_time
-            ).order_by(AnalysisResult.created_at.desc())
+            )
+            
+            if begin_time:
+                q = q.filter(AnalysisResult.begin_time == begin_time)
+                
+            q = q.order_by(AnalysisResult.created_at.desc())
             
             return q.first()
         finally:
             session.close()
 
-    def get_history(self, code=None, limit=50):
+    def get_history(self, code=None, page=1, page_size=10):
         session = self.Session()
         try:
             q = session.query(AnalysisResult)
+            
+            # Filter: Only show records with AI analysis (indicated by accuracy not being None)
+            q = q.filter(AnalysisResult.accuracy != None)
+            
             if code:
                 q = q.filter(AnalysisResult.code == code)
-            q = q.order_by(AnalysisResult.created_at.desc()).limit(limit)
+            
+            total = q.count()
+            
+            q = q.order_by(AnalysisResult.created_at.desc())
+            q = q.offset((page - 1) * page_size).limit(page_size)
             
             results = []
             for r in q.all():
@@ -122,7 +141,23 @@ class StorageManager:
                     "data_latest_time": r.data_latest_time,
                     # We don't send full result_json in list to save bandwidth
                 })
-            return results
+            return {"items": results, "total": total, "page": page, "page_size": page_size}
+        finally:
+            session.close()
+
+    def delete_result(self, result_id):
+        session = self.Session()
+        try:
+            q = session.query(AnalysisResult).filter(AnalysisResult.id == result_id)
+            if q.first():
+                q.delete()
+                session.commit()
+                return True
+            return False
+        except Exception as e:
+            print(f"Failed to delete result: {e}")
+            session.rollback()
+            return False
         finally:
             session.close()
 

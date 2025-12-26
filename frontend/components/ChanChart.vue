@@ -1,23 +1,25 @@
 <template>
   <div class="relative w-full h-full">
     <div class="chart-container" ref="chartDom"></div>
-    <el-popover placement="bottom-end" :width="320" trigger="hover">
-      <template #reference>
-        <div class="absolute top-[10px] right-[10px] z-10 cursor-help opacity-60 hover:opacity-100 transition-opacity" :title="t('chart.legend')">
-            <svg width="24" height="24" viewBox="0 0 24 24" class="text-gray-500"><path :d="MemoryAlertCircle" /></svg>
+    <UPopover mode="hover" :popper="{ placement: 'bottom-end' }">
+      <div class="absolute top-[10px] right-[10px] z-10 cursor-help opacity-60 hover:opacity-100 transition-opacity" :title="t('chart.legend')">
+          <svg width="24" height="24" viewBox="0 0 24 24" class="text-gray-500"><path :d="MemoryAlertCircle" /></svg>
+      </div>
+
+      <template #panel>
+        <div class="text-sm p-4 w-80">
+          <h4 class="font-bold mb-2 text-gray-800 border-b pb-1 dark:text-gray-200 dark:border-gray-700">{{ t('chart.legend') }}</h4>
+          <div class="space-y-2">
+              <div><span class="font-semibold text-gray-700 dark:text-gray-300">{{ t('chart.kline') }}</span> <span class="text-gray-600 dark:text-gray-400" v-html="t('chart.klineDesc')"></span></div>
+              <div><span class="font-semibold text-gray-700 dark:text-gray-300">{{ t('chart.bi') }}</span> <span class="text-gray-600 dark:text-gray-400" v-html="t('chart.biDesc')"></span></div>
+              <div><span class="font-semibold text-gray-700 dark:text-gray-300">{{ t('chart.seg') }}</span> <span class="text-gray-600 dark:text-gray-400" v-html="t('chart.segDesc')"></span></div>
+              <div><span class="font-semibold text-gray-700 dark:text-gray-300">{{ t('chart.center') }}</span> <span class="text-gray-600 dark:text-gray-400" v-html="t('chart.centerDesc')"></span></div>
+              <div><span class="font-semibold text-gray-700 dark:text-gray-300">{{ t('chart.buy') }}</span> <span class="text-gray-600 dark:text-gray-400" v-html="t('chart.buyDesc')"></span></div>
+              <div><span class="font-semibold text-gray-700 dark:text-gray-300">{{ t('chart.sell') }}</span> <span class="text-gray-600 dark:text-gray-400" v-html="t('chart.sellDesc')"></span></div>
+          </div>
         </div>
       </template>
-      <div class="text-sm">
-        <h4 class="font-bold mb-2 text-gray-800 border-b pb-1">{{ t('chart.legend') }}</h4>
-        <div class="space-y-2">
-            <div><span class="font-semibold text-gray-700">{{ t('chart.kline') }}</span> <span class="text-gray-600" v-html="t('chart.klineDesc')"></span></div>
-            <div><span class="font-semibold text-gray-700">{{ t('chart.bi') }}</span> <span class="text-gray-600" v-html="t('chart.biDesc')"></span></div>
-            <div><span class="font-semibold text-gray-700">{{ t('chart.seg') }}</span> <span class="text-gray-600" v-html="t('chart.segDesc')"></span></div>
-            <div><span class="font-semibold text-gray-700">{{ t('chart.center') }}</span> <span class="text-gray-600" v-html="t('chart.centerDesc')"></span></div>
-            <div><span class="font-semibold text-gray-700">{{ t('chart.ma') }}</span> <span class="text-gray-600">{{ t('chart.maDesc') }}</span></div>
-        </div>
-      </div>
-    </el-popover>
+    </UPopover>
   </div>
 </template>
 
@@ -48,44 +50,66 @@ watch(currentLang, () => {
 })
 
 onMounted(() => {
-  if (chartDom.value) {
-    const resizeObserver = new ResizeObserver(entries => {
-      for (let entry of entries) {
-        if (entry.contentRect.width > 0 && entry.contentRect.height > 0) {
-          if (!myChart) {
-            myChart = echarts.init(chartDom.value)
-          } else {
-            myChart.resize()
+    console.log('ChanChart mounted')
+    if (chartDom.value) {
+      const resizeObserver = new ResizeObserver(entries => {
+        for (let entry of entries) {
+          console.log('ResizeObserver:', entry.contentRect.width, entry.contentRect.height)
+          if (entry.contentRect.width > 0 && entry.contentRect.height > 0) {
+            if (!myChart) {
+              console.log('Initializing chart from ResizeObserver')
+              myChart = echarts.init(chartDom.value)
+              if (lastData) {
+                  console.log('Rendering pending data from ResizeObserver')
+                  renderChart(lastData)
+              }
+            } else {
+              myChart.resize()
+            }
           }
         }
-      }
-    })
-    resizeObserver.observe(chartDom.value)
-  }
-})
-
-onUnmounted(() => {
-  // window.removeEventListener('resize', resizeChart) // No longer needed with ResizeObserver
-  if (myChart) myChart.dispose()
-})
-
-const resizeChart = () => {
-  if (myChart) myChart.resize()
-}
-
-const renderChart = (data) => {
-  if (!myChart) {
-      // Try init again if dimensions are ready
-      if (chartDom.value && chartDom.value.clientWidth > 0) {
-          myChart = echarts.init(chartDom.value)
-      } else {
-          return // Still not ready
-      }
+      })
+      resizeObserver.observe(chartDom.value)
+    }
+  })
+  
+  onUnmounted(() => {
+    // window.removeEventListener('resize', resizeChart) // No longer needed with ResizeObserver
+    if (myChart) myChart.dispose()
+  })
+  
+  const resizeChart = () => {
+    if (myChart) myChart.resize()
   }
   
-  const dates = data.dates
+  const renderChart = (data) => {
+    console.log('renderChart called', data)
+    lastData = data
+    
+    if (!myChart) {
+        // Try init again if dimensions are ready
+        if (chartDom.value && chartDom.value.clientWidth > 0) {
+            console.log('Initializing chart from renderChart', chartDom.value.clientWidth, chartDom.value.clientHeight)
+            myChart = echarts.init(chartDom.value)
+        } else {
+            console.warn('Chart container not ready or has 0 dimensions')
+            return // Still not ready
+        }
+    } else {
+        console.log('Chart already initialized')
+    }
+    
+    const dates = data.dates
   const klines = data.klines // [open, close, low, high]
   const volumes = data.volumes
+
+  // Calculate start percentage for dataZoom to show max 300 bars
+  const totalBars = dates.length
+  const maxBars = 200
+  let startPercent = 0
+  if (totalBars > maxBars) {
+      startPercent = (1 - maxBars / totalBars) * 100
+  }
   
   // 1. Bi Series Data
   // Convert Bi list to [[index, value], [index, value], ...]
@@ -97,14 +121,15 @@ const renderChart = (data) => {
   // Note: Backend returns start/end for each Bi.
   // We can just take all start points + last end point.
   // Or just iterate and build the path.
+  // Since we are iterating, we can just push start and end.
+  // But consecutive Bi share points, so we might have duplicates.
+  // ECharts handles it fine.
   const biData = []
   if (data.bi && data.bi.length > 0) {
       data.bi.forEach(b => {
           biData.push([b.start_coord[0], b.start_coord[1]])
           biData.push([b.end_coord[0], b.end_coord[1]])
       })
-      // Remove duplicates if any (end of prev == start of next usually)
-      // Actually ECharts handles it fine.
   }
   
   // 2. Seg Series Data
@@ -117,25 +142,17 @@ const renderChart = (data) => {
   }
   
   // 3. ZS (Centers) - Use graphic rects
-  const graphicElements = []
-  if (data.zs) {
-      data.zs.forEach(z => {
-          // Convert index to pixel coordinate is hard in 'graphic' without 'convertToPixel'.
-          // Better use 'custom' series or 'markArea'.
-          // 'markArea' is easiest but limited styling.
-          // Let's use 'custom' series for ZS.
-      })
-  }
-  
   // Alternative for ZS: Custom Series
   const renderZSItem = (params, api) => {
       const start = api.coord([api.value(0), api.value(1)]) // x_start, y_low
       const end = api.coord([api.value(2), api.value(3)])   // x_end, y_high
       const width = end[0] - start[0]
-      const height = end[1] - start[1] // y_high - y_low (but screen coords y is inverted)
-      
-      // ECharts Y axis: value increases upwards, but pixel y increases downwards.
-      // api.coord returns pixel coords.
+      // y_high - y_low (but screen coords y is inverted)
+      // so height should be start[1] - end[1] if start is low (bigger y) and end is high (smaller y)
+      // wait, api.coord maps data space to pixel space.
+      // y axis: 0 at top, H at bottom.
+      // value y: low < high.
+      // pixel y: low > high.
       
       return {
           type: 'rect',
@@ -143,7 +160,7 @@ const renderChart = (data) => {
               x: start[0],
               y: end[1], // top-left y (which is the high value's pixel y)
               width: width,
-              height: start[1] - end[1] // low_y_pixel - high_y_pixel (since low y value gives higher pixel val)
+              height: start[1] - end[1] // low_y_pixel - high_y_pixel
           },
           style: {
               fill: 'rgba(255, 165, 0, 0.2)',
@@ -203,7 +220,7 @@ const renderChart = (data) => {
               width: 1,
               type: 'solid'
           },
-          connectNulls: true // Important if we used nulls, but we use points
+          connectNulls: true 
       },
       {
           name: 'Seg',
@@ -260,11 +277,11 @@ const renderChart = (data) => {
       },
       legend: {
           data: ['K-Line', 'Bi', 'Seg', 'Center', ...Object.keys(data.means || {}).map(k => `MA${k}`)],
-          bottom: 0,
+          bottom: 20,
           left: 'center',
           padding: 5,
           itemGap: 10,
-          type: 'scroll', // Allow scrolling if too many items
+          type: 'scroll', 
           tooltip: {
             show: true,
             formatter: function (name) {
@@ -284,24 +301,27 @@ const renderChart = (data) => {
           }
       },
       grid: {
-        left: '2%',
-        right: '2%',
-        bottom: '80px',
-        top: '5%',
-        containLabel: true
+        left: 50,
+        right: 50,
+        bottom: 120,
+        top: 30,
+        containLabel: false
     },
       xAxis: {
           type: 'category',
           data: dates,
           scale: true,
           boundaryGap: false,
-          axisLine: { onZero: false },
+          axisLine: { onZero: false, lineStyle: { color: '#888' } },
+          axisLabel: { color: '#666' },
           splitLine: { show: false },
           min: 'dataMin',
           max: 'dataMax'
       },
       yAxis: {
           scale: true,
+          axisLine: { lineStyle: { color: '#888' } },
+          axisLabel: { color: '#666' },
           splitArea: {
               show: true
           }
@@ -309,25 +329,32 @@ const renderChart = (data) => {
       dataZoom: [
           {
               type: 'inside',
-              start: 80,
+              start: startPercent,
               end: 100
           },
           {
               show: true,
               type: 'slider',
-              bottom: '40px',
+              bottom: 60,
               height: 20,
-              start: 80,
+              left: 'center',
+              width: '80%',
+              start: startPercent,
               end: 100
           }
       ],
-      series: series
+      series: series,
+      animation: false,
+      backgroundColor: 'transparent'
   }
 
   myChart.setOption(option, true)
+  lastData = data
 }
 
-defineExpose({ renderChart })
+defineExpose({
+  updateChart: renderChart
+})
 </script>
 
 <style scoped>

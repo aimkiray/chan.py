@@ -1,7 +1,7 @@
 export const translations = {
   zh: {
     app: {
-      title: "缠论量化分析",
+      title: "MLCHAN",
       about: "关于本应用",
       aboutContent: "本应用结合 <strong>缠论 (Chan Theory)</strong> 与 <strong>XGBoost</strong> 等多种机器学习模型来分析股票走势。",
       aboutChan: "<strong>缠论</strong>: 识别走势结构（笔、线段、中枢）及买卖点。",
@@ -15,11 +15,11 @@ export const translations = {
       periodSelect: "周期选择:",
       dataSrc: "数据源:",
       refresh: "刷新数据",
-      predict: "AI 分析",
+      predict: "开始分析",
       dataLength: "数据范围 (年):",
       modelSelect: "模型选择:",
       intradayChart: "分时走势",
-      waitingForData: "请点击上方“刷新分析”或侧边栏“开始分析”以查看数据",
+      waitingForData: "请点击上方“刷新数据”或侧边栏“开始分析”以查看数据",
       pleasePredict: "P.S. 请点击开始预测获取模型推荐信号。",
       dataSrcOptions: {
         baostock: "BaoStock",
@@ -30,7 +30,13 @@ export const translations = {
         xgboost: "XGBoost",
         lightgbm: "LightGBM",
         mlp: "MLP"
-      }
+      },
+      delete: "删除",
+      confirmDelete: "确定要删除这条记录吗？",
+      stockNotFound: "股票代码不存在或无数据",
+      error: "错误",
+      downloadSuccess: "下载成功",
+      downloadError: "下载失败"
     },
     sidebar: {
       params: "参数设置",
@@ -55,6 +61,8 @@ export const translations = {
       signalDate: "信号日期",
       timeDiff: "距今",
       timeDiffDays: "距今 (天)",
+      days: "天",
+      barsAgo: "根K线前",
       score: "信号有效性评分",
       highScore: "信号有效性较高",
       lowScore: "信号可能较弱",
@@ -110,7 +118,8 @@ export const translations = {
       signal: "信号",
       accuracy: "准确率",
       action: "操作",
-      viewChart: "查看图表"
+      viewChart: "查看图表",
+      download: "下载历史"
     },
     chart: {
       legend: "图例",
@@ -194,7 +203,7 @@ export const translations = {
   },
   en: {
     app: {
-      title: "Chan Quant Analysis",
+      title: "MLCHAN",
       about: "About",
       aboutContent: "This app combines <strong>Chan Theory</strong> and <strong>Machine Learning (XGBoost)</strong> to analyze stock trends.",
       aboutChan: "<strong>Chan Theory</strong>: Identifies trend structures (Bi, Segments, Pivots) and buy/sell points.",
@@ -222,7 +231,13 @@ export const translations = {
         xgboost: "XGBoost",
         lightgbm: "LightGBM",
         mlp: "MLP"
-      }
+      },
+      delete: "Delete",
+      confirmDelete: "Are you sure you want to delete this record?",
+      stockNotFound: "Stock code not found or no data",
+      error: "Error",
+      downloadSuccess: "Download Successful",
+      downloadError: "Download Failed"
     },
     sidebar: {
       params: "Settings",
@@ -247,6 +262,8 @@ export const translations = {
       signalDate: "Signal Date",
       timeDiff: "Time Ago",
       timeDiffDays: "Days Ago",
+      days: "Days",
+      barsAgo: "bars ago",
       score: "Signal Score",
       highScore: "High Confidence",
       lowScore: "Low Confidence",
@@ -302,7 +319,8 @@ export const translations = {
       signal: "Signal",
       accuracy: "Accuracy",
       action: "Action",
-      viewChart: "View Chart"
+      viewChart: "View Chart",
+      download: "Download History"
     },
     chart: {
       legend: "Legend",
