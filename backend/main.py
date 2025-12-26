@@ -8,6 +8,8 @@ load_dotenv()
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
 
@@ -37,10 +39,12 @@ class AnalyzeRequest(BaseModel):
     trigger_step: bool = True
     bi_strict: bool = True
     frequency: str = "1d"
-    data_src: str = "baostock"
+    data_src: str = "clickhouse"
     model: str = "xgboost"
     do_predict: bool = False
     force_refresh: bool = False
+    data_length_mode: str = "default" # "default" or "max"
+    data_length_years: Optional[float] = None
 
 @app.get("/api/history")
 async def get_history(code: Optional[str] = None):
@@ -66,7 +70,6 @@ async def analyze_stock(req: AnalyzeRequest):
             "15m": KL_TYPE.K_15M,
             "60m": KL_TYPE.K_60M,
             "1m": KL_TYPE.K_1M,
-            "1s": KL_TYPE.K_1S,
             "1w": KL_TYPE.K_WEEK,
             "1mo": KL_TYPE.K_MON,
         }
@@ -75,10 +78,9 @@ async def analyze_stock(req: AnalyzeRequest):
         src_map = {
             "baostock": DATA_SRC.BAO_STOCK,
             "akshare": DATA_SRC.AK_SHARE,
-            "mock": DATA_SRC.MOCK,
             "ccxt": DATA_SRC.CCXT,
             "csv": DATA_SRC.CSV,
-            "jqdata": DATA_SRC.JQ_DATA,
+            "clickhouse": DATA_SRC.CLICK_HOUSE,
         }
         data_src = src_map.get(req.data_src, DATA_SRC.BAO_STOCK)
 
@@ -111,20 +113,37 @@ async def analyze_stock(req: AnalyzeRequest):
         
         # 3. Cache Miss or No Time info -> Fetch Full Data
         try:
-            # Replicating logic from get_chan_data:
+            # Replicating logic from get_chan_data but with data_length_mode support:
             import datetime
-            if data_src == DATA_SRC.JQ_DATA:
-                 begin_time = "2024-10-01"
-            elif level == KL_TYPE.K_DAY:
-                begin_time = "2020-01-01"
-            elif level == KL_TYPE.K_WEEK or level == KL_TYPE.K_MON:
-                begin_time = "2015-01-01"
-            elif level == KL_TYPE.K_60M or level == KL_TYPE.K_30M:
-                begin_time = (datetime.datetime.now() - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
-            elif level == KL_TYPE.K_1S:
-                begin_time = None 
-            else: 
-                begin_time = (datetime.datetime.now() - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
+            days = 365 # Default safe fallback
+            
+            if req.data_length_years is not None:
+                days = int(365 * req.data_length_years)
+            elif req.data_length_mode == "max":
+                 # Max Ranges: 1m: 1 year, 5m: 2 years, 15m: 5 years, 30m+: 10 years
+                if level == KL_TYPE.K_1M:
+                    days = 365 # 1 year
+                elif level == KL_TYPE.K_5M:
+                    days = 365 * 2 # 2 years
+                elif level == KL_TYPE.K_15M:
+                    days = 365 * 5 # 5 years
+                elif level in [KL_TYPE.K_30M, KL_TYPE.K_60M, KL_TYPE.K_DAY, KL_TYPE.K_WEEK, KL_TYPE.K_MON]:
+                     days = 365 * 10 # 10 years
+            else:
+                # Default Ranges: 1m: 0.5yr, 5m: 1.5yr, 15m: 2.5yr, 30m+: 5yr
+                if level == KL_TYPE.K_1M:
+                    days = 180 # 0.5 year
+                elif level == KL_TYPE.K_5M:
+                    days = 540 # 1.5 years
+                elif level == KL_TYPE.K_15M:
+                    days = 900 # 2.5 years
+                elif level in [KL_TYPE.K_30M, KL_TYPE.K_60M, KL_TYPE.K_DAY, KL_TYPE.K_WEEK, KL_TYPE.K_MON]:
+                    days = 1800 # 5 years
+
+            # Ensure minimal days
+            days = max(days, 30)
+            
+            begin_time = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
             
             kl_list = fetch_stock_data(req.code, level, begin_time, None, data_src)
         except Exception as e:
@@ -137,7 +156,16 @@ async def analyze_stock(req: AnalyzeRequest):
         latest_data_time = str(kl_list[-1].time)
         
         # 4. Run Analysis with preloaded data
-        chan, bsp_dict, last_snapshot, config = get_chan_data(req.code, req.trigger_step, req.bi_strict, level, data_src, preloaded_data=kl_list)
+        chan, bsp_dict, last_snapshot, config = get_chan_data(
+            req.code, 
+            req.trigger_step, 
+            req.bi_strict, 
+            level, 
+            data_src, 
+            preloaded_data=kl_list, 
+            do_predict=req.do_predict,
+            begin_time=begin_time
+        )
         
         if not chan or not last_snapshot:
             raise HTTPException(status_code=404, detail=f"Data not found for {req.code}")
@@ -158,7 +186,7 @@ async def analyze_stock(req: AnalyzeRequest):
         data['latest_date'] = last_klu.time.to_str()
         
         # Get Stock Name
-        stock_name = get_stock_name(req.code)
+        stock_name = get_stock_name(req.code, data_src)
         
         # Prediction Logic (simplified for API)
         # We can run the training here and return the prediction for the latest BSP
@@ -202,12 +230,16 @@ async def analyze_stock(req: AnalyzeRequest):
                     "accuracy": valid_count / total_count if total_count > 0 else 0
                 }
         
+        # Check for data warnings from Chan instance
+        data_warnings = getattr(chan, 'data_warnings', [])
+
         result_data = {
             "status": "success",
             "data": data,
             "signal": latest_signal,
             "accuracy": accuracy_info,
-            "stock_name": stock_name
+            "stock_name": stock_name,
+            "data_warnings": data_warnings
         }
         
         # Save to Storage
@@ -254,6 +286,31 @@ async def download_data(code: str, frequency: str = "1d"):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# Mount static files if "static" directory exists (For Production/Deployment)
+static_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
+if os.path.exists(static_dir):
+    app.mount("/assets", StaticFiles(directory=os.path.join(static_dir, "assets")), name="assets")
+    
+    @app.get("/")
+    async def read_index():
+        return FileResponse(os.path.join(static_dir, "index.html"))
+        
+    @app.get("/{catchall:path}")
+    async def read_catchall(catchall: str):
+        # Check if file exists in static
+        file_path = os.path.join(static_dir, catchall)
+        if os.path.exists(file_path) and os.path.isfile(file_path):
+            return FileResponse(file_path)
+        # Otherwise return index.html for SPA routing
+        return FileResponse(os.path.join(static_dir, "index.html"))
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='MLChan Backend Server')
+    parser.add_argument('--port', type=int, default=8001, help='Port to run the server on')
+    args = parser.parse_args()
+    
+    # Use specified port or default 8001
+    uvicorn.run(app, host="0.0.0.0", port=args.port)

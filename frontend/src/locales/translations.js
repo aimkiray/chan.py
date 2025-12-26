@@ -14,8 +14,9 @@ export const translations = {
       guide: "使用指南",
       periodSelect: "周期选择:",
       dataSrc: "数据源:",
-      refresh: "刷新分析",
-      predict: "开始预测",
+      refresh: "刷新数据",
+      predict: "AI 分析",
+      dataLength: "数据范围 (年):",
       modelSelect: "模型选择:",
       intradayChart: "分时走势",
       waitingForData: "请点击上方“刷新分析”或侧边栏“开始分析”以查看数据",
@@ -23,8 +24,7 @@ export const translations = {
       dataSrcOptions: {
         baostock: "BaoStock",
         akshare: "AkShare",
-        jqdata: "JQData",
-        mock: "Mock (1s测试)"
+        clickhouse: "ClickHouse"
       },
       modelOptions: {
         xgboost: "XGBoost",
@@ -207,8 +207,8 @@ export const translations = {
       guide: "Guide",
       periodSelect: "Period:",
       dataSrc: "Source:",
-      refresh: "Refresh",
-      predict: "Predict",
+      refresh: "Refresh Data",
+      predict: "AI Analysis",
       modelSelect: "Model:",
       intradayChart: "Intraday Chart",
       waitingForData: "Please click 'Refresh' or 'Start Analysis' to view data.",
@@ -216,8 +216,7 @@ export const translations = {
       dataSrcOptions: {
         baostock: "BaoStock",
         akshare: "AkShare",
-        jqdata: "JQData",
-        mock: "Mock (1s Test)"
+        clickhouse: "ClickHouse (Local)"
       },
       modelOptions: {
         xgboost: "XGBoost",

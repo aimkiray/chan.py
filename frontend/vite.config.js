@@ -10,7 +10,7 @@ export default defineConfig({
     allowedHosts: ["akari.debuff.top"],
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: 'http://localhost:8001',
         changeOrigin: true
       }
     }
@@ -21,7 +21,7 @@ export default defineConfig({
     allowedHosts: ["akari.debuff.top"],
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: 'http://localhost:8001',
         changeOrigin: true
       }
     }

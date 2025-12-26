@@ -45,16 +45,45 @@ def normalize_code(code):
         return f"sh.{code}"
     if code.startswith("0") or code.startswith("3"):
         return f"sz.{code}"
+    if code.startswith("5"):
+        return f"sh.{code}"
+    if code.startswith("1"):
+        return f"sz.{code}"
     return code
 
-def get_stock_name(code):
+def get_stock_name(code, data_src_type=DATA_SRC.BAO_STOCK):
     """
-    Get stock name from Baostock
+    Get stock name from Data Source
     """
     code = normalize_code(code)
     try:
-        # Ensure login
-        bs.login()
+        if data_src_type == DATA_SRC.CLICK_HOUSE:
+            from DataAPI.ClickHouseAPI import CClickHouseAPI
+            # Use ClickHouse to get basic info
+            # We use K_DAY as a placeholder since SetBasciInfo doesn't depend on k_type
+            api = CClickHouseAPI(code, k_type=KL_TYPE.K_DAY, begin_date=None, end_date=None, autype=AUTYPE.QFQ)
+            api.SetBasciInfo()
+            if api.name:
+                return api.name
+            else:
+                return code
+                
+        # Fallback to Baostock if not ClickHouse
+        # Suppress login success message
+        import io
+        import sys
+        
+        # Check if already logged in (CBaoStock maintains state but we can't easily check bs internal state without calling login)
+        # But bs.login() is idempotent.
+        
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            bs.login()
+        except:
+            pass
+        finally:
+            sys.stdout = old_stdout
         
         rs = bs.query_stock_basic(code=code)
         if rs.error_code == '0' and rs.next():
@@ -116,13 +145,14 @@ def fetch_stock_data(code, level, begin_time, end_time, data_src_type, autype=AU
     
     # Create a temporary CChan instance just to resolve the StockAPI class
     # This is a bit hacky but avoids duplicating the StockAPI resolution logic
+    # Set trigger_step=True to avoid loading data in __init__
     temp_chan = CChan(
         code=code,
         begin_time=begin_time,
         end_time=end_time,
         data_src=data_src_type,
         lv_list=[level],
-        config=CChanConfig(),
+        config=CChanConfig({"trigger_step": True}),
         autype=autype
     )
     
@@ -146,7 +176,9 @@ def get_latest_data_time(code, level, data_src_type):
     if level == KL_TYPE.K_DAY:
         days = 30
     else:
-        days = 5
+        days = 60 # Increased from 5 to 60 to handle stale data better
+        if data_src_type == DATA_SRC.CLICK_HOUSE:
+            days = 365 # Even longer for ClickHouse which is fast
         
     begin_time = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
     end_time = None
@@ -161,30 +193,31 @@ def get_latest_data_time(code, level, data_src_type):
     return None
 
 
-def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, data_src_type=DATA_SRC.BAO_STOCK, preloaded_data=None):
+def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, data_src_type=DATA_SRC.BAO_STOCK, preloaded_data=None, do_predict=False, begin_time=None):
     code = normalize_code(code)
     
     # Adjust begin_time based on frequency to avoid fetching too much data
     import datetime
     
-    # Special handling for JQData restriction (2024-09-13 onwards)
-    if data_src_type == DATA_SRC.JQ_DATA:
-         # Trial account restriction: ~3 months data.
-         # Error says: 2024-09-14 to 2025-09-21.
-         # We use a safe margin.
-         begin_time = "2024-10-01"
-    elif level == KL_TYPE.K_DAY:
-        begin_time = "2020-01-01"
-    elif level == KL_TYPE.K_60M or level == KL_TYPE.K_30M:
-        begin_time = (datetime.datetime.now() - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
-    elif level == KL_TYPE.K_1S:
-        begin_time = None # Mock/1s specific
-    else: # 5m, 15m, 1m
-        begin_time = (datetime.datetime.now() - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
+    if begin_time is None:
+        # Special handling for JQData restriction (2024-09-13 onwards)
+        if level == KL_TYPE.K_DAY:
+            begin_time = "2020-01-01"
+        elif level == KL_TYPE.K_60M or level == KL_TYPE.K_30M:
+            begin_time = (datetime.datetime.now() - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
+        else: # 5m, 15m, 1m
+            # Increase lookback to 365 days for minute data to handle stale data
+            begin_time = (datetime.datetime.now() - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
         
     end_time = None
     data_src = data_src_type
     lv_list = [level]
+
+    # If not predicting (training), we can disable trigger_step to speed up loading
+    # unless trigger_step is explicitly required for some other reason.
+    # But usually trigger_step is only for simulating history for BSP collection.
+    if not do_predict:
+        trigger_step = False
 
     config = CChanConfig({
         "trigger_step": trigger_step, 
@@ -232,39 +265,48 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
     bsp_dict: Dict[int, T_SAMPLE_INFO] = {} 
     last_snapshot = None
     
-    print(f"Start processing {code} from {begin_time}...")
-    # Iterate through steps to collect training samples
-    for i, chan_snapshot in enumerate(chan.step_load()):
-        if i % 100 == 0:
-            print(f"Processing step {i}...")
-        last_snapshot = chan_snapshot
-        
-        last_klu = chan_snapshot[0][-1][-1]
-        bsp_list = chan_snapshot.get_latest_bsp()
-        
-        if not bsp_list:
-            continue
+    if trigger_step:
+        print(f"Start processing {code} from {begin_time}...")
+        # Iterate through steps to collect training samples
+        for i, chan_snapshot in enumerate(chan.step_load()):
+            if i % 100 == 0:
+                print(f"Processing step {i}...")
+            last_snapshot = chan_snapshot
             
-        last_bsp = bsp_list[0]
-        cur_lv_chan = chan_snapshot[0]
-        
-        # Record BSP when it appears
-        if last_bsp.klu.idx not in bsp_dict and cur_lv_chan[-2].idx == last_bsp.klu.klc.idx:
-            bsp_dict[last_bsp.klu.idx] = {
-                "feature": last_bsp.features,
-                "is_buy": last_bsp.is_buy,
-                "open_time": last_klu.time,
-                "bsp_obj": last_bsp
-            }
-            # Add custom strategy features
-            bsp_dict[last_bsp.klu.idx]['feature'].add_feat(stragety_feature(last_klu))
+            last_klu = chan_snapshot[0][-1][-1]
+            bsp_list = chan_snapshot.get_latest_bsp()
+            
+            if not bsp_list:
+                continue
+                
+            last_bsp = bsp_list[0]
+            cur_lv_chan = chan_snapshot[0]
+            
+            # Record BSP when it appears
+            if last_bsp.klu.idx not in bsp_dict and cur_lv_chan[-2].idx == last_bsp.klu.klc.idx:
+                bsp_dict[last_bsp.klu.idx] = {
+                    "feature": last_bsp.features,
+                    "is_buy": last_bsp.is_buy,
+                    "open_time": last_klu.time,
+                    "bsp_obj": last_bsp
+                }
+                # Add custom strategy features
+                bsp_dict[last_bsp.klu.idx]['feature'].add_feat(stragety_feature(last_klu))
 
-    # Re-calculate to ensure latest state is fully updated for plotting
-    if last_snapshot:
-        for lv in last_snapshot.lv_list:
-             # Disable step calculation mode to force full update including virtual Bi
-             last_snapshot.kl_datas[lv].step_calculation = False
-             last_snapshot.kl_datas[lv].cal_seg_and_zs()
+        # Re-calculate to ensure latest state is fully updated for plotting
+        if last_snapshot:
+            for lv in last_snapshot.lv_list:
+                 # Disable step calculation mode to force full update including virtual Bi
+                 last_snapshot.kl_datas[lv].step_calculation = False
+                 last_snapshot.kl_datas[lv].cal_seg_and_zs()
+    else:
+        # If not trigger_step, CChan has already processed everything in init
+        # We just return the final state
+        last_snapshot = chan
+        # bsp_dict is empty because we didn't step through history to collect them
+        # This is fine if do_predict is False
+             
+    return chan, bsp_dict, last_snapshot, config
              
     return chan, bsp_dict, last_snapshot, config
 

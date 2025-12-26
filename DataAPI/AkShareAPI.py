@@ -38,6 +38,10 @@ class CAkShare(CCommonStockApi):
         # AkShare uses 6-digit code. Need to strip sh/sz prefix if present
         symbol = self.code.split('.')[-1]
         
+        # Simple heuristic to detect ETF (Start with 51, 52, 56, 58 for SH, 15 for SZ)
+        # This is not perfect but covers most ETFs.
+        is_etf = symbol.startswith(('51', '52', '56', '58', '15'))
+        
         period = self.__convert_type()
         adjust = "qfq" if self.autype == AUTYPE.QFQ else "hfq" if self.autype == AUTYPE.HFQ else ""
         
@@ -48,7 +52,11 @@ class CAkShare(CCommonStockApi):
             if kltype_lt_day(self.k_type):
                 # Minute data
                 # period: '1', '5', '15', '30', '60'
-                df = ak.stock_zh_a_hist_min_em(symbol=symbol, start_date=start_date, end_date=end_date, period=period, adjust=adjust)
+                if is_etf:
+                     df = ak.fund_etf_hist_min_em(symbol=symbol, period=period, adjust=adjust)
+                else:
+                     df = ak.stock_zh_a_hist_min_em(symbol=symbol, start_date=start_date, end_date=end_date, period=period, adjust=adjust)
+                
                 # Columns: 时间, 开盘, 收盘, 最高, 最低, 成交量, 成交额, ...
                 # Standardize to: time, open, close, high, low, volume, amount
                 rename_map = {
@@ -65,7 +73,12 @@ class CAkShare(CCommonStockApi):
                 # period: 'daily', 'weekly', 'monthly'
                 p_map = {'d': 'daily', 'w': 'weekly', 'm': 'monthly'}
                 p = p_map.get(period, 'daily')
-                df = ak.stock_zh_a_hist(symbol=symbol, period=p, start_date=start_date, end_date=end_date, adjust=adjust)
+                
+                if is_etf:
+                    df = ak.fund_etf_hist_em(symbol=symbol, period=p, start_date=start_date, end_date=end_date, adjust=adjust)
+                else:
+                    df = ak.stock_zh_a_hist(symbol=symbol, period=p, start_date=start_date, end_date=end_date, adjust=adjust)
+                
                 rename_map = {
                     "日期": DATA_FIELD.FIELD_TIME,
                     "开盘": DATA_FIELD.FIELD_OPEN,
@@ -78,6 +91,23 @@ class CAkShare(CCommonStockApi):
                 }
             
             df = df.rename(columns=rename_map)
+            
+            # Check for data truncation (common issue with AkShare minute data)
+            if not df.empty and self.begin_date:
+                try:
+                    first_date_val = df.iloc[0][DATA_FIELD.FIELD_TIME]
+                    first_date_str = str(first_date_val)
+                    if len(first_date_str) >= 10:
+                        req_start = datetime.datetime.strptime(self.begin_date, "%Y-%m-%d")
+                        actual_start = datetime.datetime.strptime(first_date_str[:10], "%Y-%m-%d")
+                        
+                        if (actual_start - req_start).days > 5:
+                            msg = f"AkShare data truncated for {self.code}. Requested from {self.begin_date}, got from {first_date_str[:10]}. This is likely an API limitation. Consider using BaoStock for longer history."
+                            print(f"[WARNING] {msg}")
+                            self.warnings.append(msg)
+                except Exception as e:
+                    # Ignore date parsing errors
+                    pass
             
             columns = [
                 DATA_FIELD.FIELD_TIME,

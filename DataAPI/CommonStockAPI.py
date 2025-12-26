@@ -13,6 +13,7 @@ class CCommonStockApi:
         self.begin_date = begin_date
         self.end_date = end_date
         self.autype = autype
+        self.warnings = []  # List to store warnings during data fetching
         self.SetBasciInfo()
 
     @abc.abstractmethod

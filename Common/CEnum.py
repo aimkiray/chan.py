@@ -7,12 +7,10 @@ class DATA_SRC(Enum):
     CCXT = auto()
     CSV = auto()
     AK_SHARE = auto()
-    MOCK = auto()
-    JQ_DATA = auto()
+    CLICK_HOUSE = auto()
 
 
 class KL_TYPE(Enum):
-    K_1S = 1
     K_3S = 2
     K_5S = 3
     K_10S = 4

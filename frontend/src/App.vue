@@ -1,8 +1,42 @@
 <template>
   <el-container class="lg:h-screen min-h-screen bg-white flex flex-col">
-    <el-header class="border-b border-gray-200 flex items-center px-4 h-16 gap-3">
-      <h1 class="text-xl font-bold text-gray-800 m-0 truncate flex items-center gap-2">
-        <svg width="24" height="24" viewBox="0 0 24 24" class="text-blue-600"><path :d="MemoryDiamond" /></svg>
+    <!-- Desktop Header (Combined Title + Tabs) -->
+    <div class="hidden lg:flex items-center h-10 border-b border-gray-200 bg-gray-50 flex-shrink-0 z-10 relative">
+       <!-- Logo & Title -->
+       <div class="flex items-center gap-2 font-bold text-gray-800 text-base select-none pl-4 border-r border-gray-200 box-border flex-shrink-0 h-full" style="width: 260px">
+          <svg width="22" height="22" viewBox="0 0 24 24" class="text-blue-600"><path :d="MemoryDiamond" /></svg>
+          <span>{{ t('app.title') }}</span>
+       </div>
+       
+       <!-- Custom Tabs -->
+       <div class="flex items-end self-stretch gap-1">
+          <button 
+             v-for="tab in tabs" 
+             :key="tab.name" 
+             @click="activeTab = tab.name"
+             class="px-4 h-full flex items-center gap-2 text-sm transition-colors border-t border-l border-r border-transparent rounded-t relative top-[1px] outline-none select-none"
+             :class="activeTab === tab.name ? 'bg-white text-blue-600 border-gray-200 font-medium' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100/50'"
+          >
+             <svg width="16" height="16" viewBox="0 0 24 24"><path :d="tab.icon" /></svg>
+             {{ tab.label }}
+          </button>
+       </div>
+       
+       <div class="flex-1"></div>
+       
+       <!-- Lang Switch -->
+       <div class="pr-4">
+         <el-select v-model="lang" size="small" class="w-24">
+           <el-option label="中文" value="zh" />
+           <el-option label="English" value="en" />
+         </el-select>
+       </div>
+    </div>
+
+    <!-- Mobile Header (Title Only - Keep Status Quo) -->
+    <el-header class="lg:hidden border-b border-gray-200 flex items-center px-4 h-12 gap-3 bg-white">
+      <h1 class="text-base font-bold text-gray-800 m-0 truncate flex items-center gap-2">
+        <svg width="20" height="20" viewBox="0 0 24 24" class="text-blue-600"><path :d="MemoryDiamond" /></svg>
         <span>{{ t('app.title') }}</span>
       </h1>
       <el-select v-model="lang" size="small" class="ml-auto w-24">
@@ -11,9 +45,9 @@
       </el-select>
     </el-header>
     
-    <el-container class="lg:overflow-hidden lg:h-[calc(100vh-64px)] flex-1 flex flex-col lg:flex-row">
+    <el-container class="lg:overflow-hidden lg:h-[calc(100vh-40px)] flex-1 flex flex-col lg:flex-row">
       <!-- Sidebar (Left) - Hidden on Mobile -->
-      <el-aside v-show="showDesktopSidebar" width="320px" class="hidden lg:flex bg-gray-50 border-r border-gray-200 flex-col p-5 overflow-y-auto transition-all">
+      <el-aside v-show="showDesktopSidebar" width="260px" class="hidden lg:flex bg-gray-50 border-r border-gray-200 flex-col p-5 overflow-y-auto transition-all">
         <SidebarContent 
           v-model:code="code"
           v-model:triggerStep="triggerStep"
@@ -55,17 +89,28 @@
           />
         </div>
 
-        <el-tabs v-model="activeTab" class="flex-1 flex flex-col border-none lg:overflow-hidden" type="border-card" v-loading="loading && mobileSidebarCollapsed" element-loading-text="正在分析..." element-loading-background="rgba(255, 255, 255, 0.7)">
-          <el-tab-pane name="analysis" class="lg:h-full lg:overflow-hidden flex flex-col">
-             <template #label>
-               <span class="flex items-center gap-2">
-                 <svg width="16" height="16" viewBox="0 0 24 24"><path :d="MemoryChartBar" /></svg>
-                 {{ t('app.stockAnalysis') }}
-               </span>
-             </template>
+        <!-- Mobile Tabs (Visible only on mobile) -->
+        <div class="lg:hidden flex border-b border-gray-200 bg-gray-50 overflow-x-auto shrink-0">
+           <button 
+              v-for="tab in tabs" 
+              :key="tab.name" 
+              @click="activeTab = tab.name"
+              class="flex-1 py-3 flex justify-center items-center gap-2 text-sm transition-colors border-b-2"
+              :class="activeTab === tab.name ? 'bg-white text-blue-600 border-blue-600 font-medium' : 'text-gray-600 border-transparent hover:bg-gray-100'"
+           >
+              <svg width="18" height="18" viewBox="0 0 24 24"><path :d="tab.icon" /></svg>
+              <span>{{ tab.label }}</span>
+           </button>
+        </div>
+
+        <!-- Content Area -->
+        <div class="flex-1 overflow-hidden relative" v-loading="loading && mobileSidebarCollapsed" element-loading-text="正在分析..." element-loading-background="rgba(255, 255, 255, 0.7)">
+          
+          <!-- Analysis Tab -->
+          <div v-show="activeTab === 'analysis'" class="h-full w-full flex flex-col lg:overflow-hidden">
              <!-- Tab Content Container with flex-1 to fill space -->
-             <div class="lg:h-full lg:overflow-y-auto p-2 box-border">
-                <div v-if="hasRunAnalysis" class="flex gap-2 flex-col lg:flex-row lg:h-full lg:overflow-hidden">
+             <div class="lg:h-full lg:overflow-y-auto p-2 box-border flex flex-col flex-1">
+                <div v-if="hasRunAnalysis" class="flex gap-2 flex-col lg:flex-row lg:h-full lg:overflow-hidden flex-1">
                   <!-- Chart Column (75%) -->
                   <div class="flex-none lg:flex-[3] flex flex-col min-w-0 h-[500px] lg:h-full lg:overflow-hidden">
                     <el-card class="flex-1 flex flex-col h-full box-border !border-none !shadow-none" shadow="never" :body-style="{ height: '100%', padding: '0', display: 'flex', flexDirection: 'column', overflow: 'hidden' }">
@@ -112,22 +157,16 @@
                   </div>
                 </div>
              </div>
-          </el-tab-pane>
+          </div>
           
-          <el-tab-pane name="intraday" class="lg:h-full lg:overflow-hidden flex flex-col">
-             <template #label>
-               <span class="flex items-center gap-2">
-                 <svg width="16" height="16" viewBox="0 0 24 24"><path :d="MemoryClock" /></svg>
-                 {{ t('app.intradayAnalysis') }}
-               </span>
-             </template>
-             <div class="lg:h-full lg:overflow-y-auto p-2 box-border flex flex-col">
+          <!-- Intraday Tab -->
+          <div v-show="activeTab === 'intraday'" class="h-full w-full flex flex-col lg:overflow-hidden relative pb-16 lg:pb-0">
+             <div class="lg:h-full lg:overflow-y-auto p-2 box-border flex flex-col flex-1">
                 <!-- Frequency Selector -->
                <div class="mb-2 flex flex-col gap-2 bg-gray-50 p-2 rounded border border-gray-100 flex-shrink-0">
                   <div class="flex items-center gap-4">
                      <span class="text-sm font-bold text-gray-700">{{ t('app.periodSelect') }}</span>
                      <el-radio-group v-model="intradayFreq" size="small" @change="handleFreqChange">
-                         <el-radio-button value="1s" :disabled="['baostock', 'akshare'].includes(dataSrc)">{{ t('periods.1s') }}</el-radio-button>
                          <el-radio-button value="1m" :disabled="['baostock', 'akshare'].includes(dataSrc)">{{ t('periods.1m') }}</el-radio-button>
                          <el-radio-button value="5m">{{ t('periods.5m') }}</el-radio-button>
                          <el-radio-button value="15m">{{ t('periods.15m') }}</el-radio-button>
@@ -142,14 +181,34 @@
                   <div class="flex items-center gap-4">
                      <span class="text-sm font-bold text-gray-700">{{ t('app.dataSrc') }}</span>
                      <el-radio-group v-model="dataSrc" size="small" @change="handleDataSrcChange">
+                         <el-radio-button value="clickhouse">{{ t('app.dataSrcOptions.clickhouse') }}</el-radio-button>
                          <el-radio-button value="baostock">{{ t('app.dataSrcOptions.baostock') }}</el-radio-button>
                          <el-radio-button value="akshare">{{ t('app.dataSrcOptions.akshare') }}</el-radio-button>
-                         <el-radio-button value="jqdata">{{ t('app.dataSrcOptions.jqdata') }}</el-radio-button>
-                         <el-radio-button value="mock">{{ t('app.dataSrcOptions.mock') }}</el-radio-button>
                      </el-radio-group>
+                  </div>
+
+                  <div class="flex items-center gap-4">
+                     <span class="text-sm font-bold text-gray-700">{{ t('app.dataLength') }}</span>
+                     <div class="w-96 px-2 flex items-center gap-2">
+                        <el-slider 
+                           class="custom-slider flex-1"
+                           v-model="dataLengthYears" 
+                           :min="dataLengthMin" 
+                           :max="dataLengthMax" 
+                           :step="dataLengthStep" 
+                           show-input
+                           :show-input-controls="false"
+                           size="small"
+                           @change="analyze(false)"
+                        />
+                        <span class="text-xs text-gray-400 whitespace-nowrap">(Max: {{ dataLengthMax }}y)</span>
+                     </div>
                      <div class="flex-1"></div>
-                     <el-button type="primary" size="small" :loading="loading" @click="analyze(false)">{{ t('app.refresh') }}</el-button>
-                     <el-button type="success" size="small" :loading="loading" @click="analyze(true)" :disabled="!hasRunIntraday">{{ t('app.predict') }}</el-button>
+                     <!-- Desktop Buttons -->
+                     <div class="hidden lg:flex gap-2">
+                       <el-button type="primary" size="small" :loading="loading" @click="analyze(false)">{{ t('app.refresh') }}</el-button>
+                       <el-button type="success" size="small" :loading="loading" @click="analyze(true)" :disabled="!hasRunIntraday">{{ t('app.predict') }}</el-button>
+                     </div>
                   </div>
 
                   <div class="flex items-center gap-4">
@@ -160,10 +219,16 @@
                          <el-radio-button value="mlp">{{ t('app.modelOptions.mlp') }}</el-radio-button>
                      </el-radio-group>
                   </div>
+
+                  <!-- Mobile Buttons (Placed below model selection) -->
+                  <div class="lg:hidden flex gap-2 w-full mt-2">
+                      <el-button type="primary" class="flex-1" :loading="loading" @click="analyze(false)">{{ t('app.refresh') }}</el-button>
+                      <el-button type="success" class="flex-1" :loading="loading" @click="analyze(true)" :disabled="!hasRunIntraday">{{ t('app.predict') }}</el-button>
+                  </div>
                </div>
                
                <!-- Chart & Info -->
-                <div v-if="hasRunIntraday" class="flex gap-2 flex-col lg:flex-row lg:flex-1 lg:overflow-hidden">
+                <div v-if="hasRunIntraday" class="flex gap-2 flex-col lg:flex-row lg:flex-1 lg:overflow-hidden flex-1">
                   <!-- Chart Column (75%) -->
                   <div class="flex-none lg:flex-[3] flex flex-col min-w-0 h-[500px] lg:h-full lg:overflow-hidden">
                     <el-card class="flex-1 flex flex-col h-full box-border !border-none !shadow-none" shadow="never" :body-style="{ height: '100%', padding: '0', display: 'flex', flexDirection: 'column', overflow: 'hidden' }">
@@ -197,32 +262,22 @@
                     {{ t('app.waitingForData') }}
                 </div>
              </div>
-          </el-tab-pane>
+          </div>
           
-          <el-tab-pane name="history" class="lg:h-full lg:overflow-hidden flex flex-col">
-             <template #label>
-               <span class="flex items-center gap-2">
-                 <svg width="16" height="16" viewBox="0 0 24 24"><path :d="MemoryBook" /></svg>
-                 {{ t('app.history') }}
-               </span>
-             </template>
-             <div class="lg:h-full lg:overflow-hidden p-2 box-border bg-white">
+          <!-- History Tab -->
+          <div v-show="activeTab === 'history'" class="h-full w-full flex flex-col lg:overflow-hidden">
+             <div class="lg:h-full lg:overflow-hidden p-2 box-border bg-white flex-1">
                 <HistoryPanel @view="handleViewHistory" />
              </div>
-          </el-tab-pane>
+          </div>
           
-          <el-tab-pane name="help" class="lg:h-full lg:overflow-y-auto">
-             <template #label>
-               <span class="flex items-center gap-2">
-                 <svg width="16" height="16" viewBox="0 0 24 24"><path :d="MemoryJournal" /></svg>
-                 {{ t('app.guide') }}
-               </span>
-             </template>
+          <!-- Help Tab -->
+          <div v-show="activeTab === 'help'" class="h-full w-full overflow-y-auto">
              <div class="p-5">
                <HelpPanel />
              </div>
-          </el-tab-pane>
-        </el-tabs>
+          </div>
+        </div>
       </el-main>
     </el-container>
   </el-container>
@@ -231,7 +286,7 @@
 <script setup>
 import { ref, watch, onMounted } from 'vue'
 import axios from 'axios'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElNotification } from 'element-plus'
 import ChanChart from './components/ChanChart.vue'
 import AnalysisPanel from './components/AnalysisPanel.vue'
 import HelpPanel from './components/HelpPanel.vue'
@@ -242,6 +297,13 @@ import { useI18n } from './composables/useI18n'
 
 const { currentLang: lang, t } = useI18n()
 
+const tabs = [
+  { name: 'analysis', label: t('app.stockAnalysis'), icon: MemoryChartBar },
+  { name: 'intraday', label: t('app.intradayAnalysis'), icon: MemoryClock },
+  { name: 'history', label: t('app.history'), icon: MemoryBook },
+  { name: 'help', label: t('app.guide'), icon: MemoryJournal }
+]
+
 const code = ref('002701')
 const mobileSidebarCollapsed = ref(false)
 const showDesktopSidebar = ref(true)
@@ -251,8 +313,9 @@ const loading = ref(false)
 const activeTab = ref('analysis')
 const hasRunAnalysis = ref(false)
 const hasRunIntraday = ref(false)
-const intradayFreq = ref('5m')
-const dataSrc = ref('baostock')
+const intradayFreq = ref('30m')
+const dataSrc = ref('clickhouse')
+const dataLengthYears = ref(0.5)
 const model = ref('xgboost')
 const downloading = ref(false)
 
@@ -268,6 +331,39 @@ const intradayAccuracy = ref(null)
 const intradayLatestClose = ref('--')
 const intradayLatestDate = ref('--')
 const intradayChartRef = ref(null)
+
+const dataLengthMin = ref(0.5)
+const dataLengthMax = ref(10)
+const dataLengthStep = ref(0.5)
+
+// Update slider constraints based on frequency
+watch(intradayFreq, (newFreq) => {
+  if (newFreq === '1m') {
+    dataLengthMin.value = 0.1
+    dataLengthMax.value = 1
+    dataLengthStep.value = 0.1
+    if (dataLengthYears.value > 1) dataLengthYears.value = 1
+    if (dataLengthYears.value < 0.1) dataLengthYears.value = 0.1
+  } else if (newFreq === '5m') {
+    dataLengthMin.value = 0.1
+    dataLengthMax.value = 2
+    dataLengthStep.value = 0.2
+    if (dataLengthYears.value > 2) dataLengthYears.value = 2
+    if (dataLengthYears.value < 0.1) dataLengthYears.value = 0.1
+  } else if (['15m', '30m', '60m'].includes(newFreq)) {
+    dataLengthMin.value = 0.5
+    dataLengthMax.value = 5
+    dataLengthStep.value = 0.5
+    if (dataLengthYears.value > 5) dataLengthYears.value = 5
+    if (dataLengthYears.value < 0.5) dataLengthYears.value = 0.5
+  } else {
+    // 1d, 1w, 1mo
+    dataLengthMin.value = 0.5
+    dataLengthMax.value = 10
+    dataLengthStep.value = 0.5
+    // Default max is 10, no need to clamp strictly unless over 10
+  }
+}, { immediate: true })
 
 // Restore settings from localStorage
 onMounted(() => {
@@ -300,6 +396,11 @@ onMounted(() => {
   if (savedDataSrc) {
     dataSrc.value = savedDataSrc
   }
+
+  const savedDataLengthYears = localStorage.getItem('lastDataLengthYears')
+  if (savedDataLengthYears) {
+    dataLengthYears.value = parseFloat(savedDataLengthYears)
+  }
 })
 
 // Watch changes and save to localStorage
@@ -325,6 +426,10 @@ watch(intradayFreq, (newVal) => {
 
 watch(dataSrc, (newVal) => {
   if (newVal) localStorage.setItem('lastDataSrc', newVal)
+})
+
+watch(dataLengthYears, (newVal) => {
+  if (newVal) localStorage.setItem('lastDataLengthYears', newVal.toString())
 })
 
 const handleViewHistory = async (row) => {
@@ -431,10 +536,11 @@ const analyze = async (doPredict = false) => {
       trigger_step: triggerStep.value,
       bi_strict: biStrict.value,
       frequency: isIntraday ? intradayFreq.value : '1d',
-      data_src: isIntraday ? dataSrc.value : 'baostock',
+      data_src: isIntraday ? dataSrc.value : 'clickhouse',
       model: isIntraday ? model.value : 'xgboost',
       do_predict: doPredict,
-      force_refresh: true
+      force_refresh: true,
+      data_length_years: isIntraday ? dataLengthYears.value : 6
     }
     
     const response = await axios.post('/api/analyze', reqData)
@@ -442,6 +548,18 @@ const analyze = async (doPredict = false) => {
     if (response.data.status === 'success') {
       const data = response.data.data
       
+      // Check for data warnings
+      if (response.data.data_warnings && response.data.data_warnings.length > 0) {
+        response.data.data_warnings.forEach(warning => {
+          ElNotification({
+            title: '数据源警告',
+            message: warning,
+            type: 'warning',
+            duration: 6000
+          })
+        })
+      }
+
       if (isIntraday) {
           if (doPredict) {
               intradaySignal.value = response.data.signal
@@ -508,5 +626,12 @@ const analyze = async (doPredict = false) => {
 .el-tabs--border-card > .el-tabs__header {
   background-color: #f9fafb;
   border-bottom: 1px solid #e5e7eb;
+}
+
+.custom-slider .el-slider__input {
+  width: 70px !important;
+}
+.custom-slider .el-slider__runway {
+  margin-right: 80px !important;
 }
 </style>

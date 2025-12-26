@@ -95,7 +95,67 @@ class CChan:
 
     def get_load_stock_iter(self, stockapi_cls, lv):
         stockapi_instance = stockapi_cls(code=self.code, k_type=lv, begin_date=self.begin_time, end_date=self.end_time, autype=self.autype)
-        return self.load_stock_data(stockapi_instance, lv)
+        
+        # We need to capture warnings after iteration. 
+        # Since this is a generator, we wrap it.
+        def wrapped_iter():
+            first_item = True
+            for klu in self.load_stock_data(stockapi_instance, lv):
+                if first_item:
+                    first_item = False
+                    # Check for data gap (Requested vs Actual)
+                    try:
+                        if self.begin_time:
+                            # Try to parse self.begin_time
+                            begin_dt = None
+                            # Clean up string first (remove potential quotes)
+                            begin_str = str(self.begin_time).strip("'\"")
+                            
+                            # Common formats
+                            formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y%m%d", "%Y/%m/%d"]
+                            # Try to handle formats with microseconds if present
+                            if "." in begin_str and "-" in begin_str:
+                                formats.insert(0, "%Y-%m-%d %H:%M:%S.%f")
+                                
+                            for fmt in formats:
+                                try:
+                                    begin_dt = datetime.datetime.strptime(begin_str, fmt)
+                                    break
+                                except ValueError:
+                                    continue
+                            
+                            if begin_dt:
+                                # klu.time is CTime, convert to datetime
+                                klu_dt = datetime.datetime(klu.time.year, klu.time.month, klu.time.day)
+                                
+                                # Calculate gap in days
+                                delta_days = (klu_dt - begin_dt).days
+                                
+                                # Debug print
+                                print(f"[DEBUG] Check Gap: Raw={self.begin_time} Parsed={begin_dt}, Actual={klu_dt}, Gap={delta_days} days")
+
+                                # If gap is significant (e.g., > 10 days), add warning
+                                # 10 days allows for long holidays (e.g. CNY)
+                                if delta_days > 10:
+                                    msg = f"Data Range Warning: Requested start {begin_str[:10]}, but actual data starts from {klu.time}. (Gap: {delta_days} days). This may be due to data source limitations."
+                                    if not hasattr(self, 'data_warnings'):
+                                        self.data_warnings = []
+                                    # Avoid duplicate warnings if possible
+                                    if not any(msg in w for w in self.data_warnings):
+                                        self.data_warnings.append(msg)
+                    except Exception as e:
+                        # Don't fail the analysis just because check failed
+                        print(f"[Warning Check Error] {e}")
+
+                yield klu
+            
+            # Check for warnings after data is exhausted
+            if hasattr(stockapi_instance, 'warnings') and stockapi_instance.warnings:
+                if not hasattr(self, 'data_warnings'):
+                    self.data_warnings = []
+                self.data_warnings.extend(stockapi_instance.warnings)
+            
+        return wrapped_iter()
 
     def add_lv_iter(self, lv_idx, iter):
         if isinstance(lv_idx, int):
@@ -182,12 +242,9 @@ class CChan:
         elif self.data_src == DATA_SRC.AK_SHARE:
             from DataAPI.AkShareAPI import CAkShare
             _dict[DATA_SRC.AK_SHARE] = CAkShare
-        elif self.data_src == DATA_SRC.MOCK:
-            from DataAPI.MockStockAPI import CMockStock
-            _dict[DATA_SRC.MOCK] = CMockStock
-        elif self.data_src == DATA_SRC.JQ_DATA:
-            from DataAPI.JQDataAPI import CJQData
-            _dict[DATA_SRC.JQ_DATA] = CJQData
+        elif self.data_src == DATA_SRC.CLICK_HOUSE:
+            from DataAPI.ClickHouseAPI import CClickHouseAPI
+            _dict[DATA_SRC.CLICK_HOUSE] = CClickHouseAPI
         if self.data_src in _dict:
             return _dict[self.data_src]
         assert isinstance(self.data_src, str)
