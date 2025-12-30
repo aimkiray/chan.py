@@ -30,4 +30,5 @@ frontend/dist/
 frontend/.nuxt/
 frontend/.cache/
 frontend/.output/
+backend/model_cache/
 mlchan_deploy/

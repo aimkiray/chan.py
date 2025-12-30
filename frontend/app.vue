@@ -45,10 +45,25 @@
           v-model:code="code"
           v-model:triggerStep="triggerStep"
           v-model:biStrict="biStrict"
+          v-model:blend="dailyBlendModels"
+          v-model:dataSrc="dataSrc"
+          v-model:model="model"
+          v-model:intradayFreq="intradayFreq"
+          v-model:dataLengthYears="dataLengthYears"
+          v-model:pretrainedChoice="intradayPretrainedChoice"
+          v-model:intradayBlend="intradayBlendModels"
+          :activeTab="activeTab"
           :loading="loading"
+          :dataLengthMin="dataLengthMin"
+          :dataLengthMax="dataLengthMax"
+          :dataLengthStep="dataLengthStep"
+          :pretrainedOptions="intradayPretrainedOptions"
+          :pretrainedLoading="intradayPretrainedLoading"
           mode="desktop"
           @analyze="analyze(true)"
-          @toggle="showDesktopSidebar = false"
+          @refresh="analyze(false, false, false)"
+          @toggle="handleManualClose"
+          @refreshPretrained="fetchIntradayPretrainedModels"
         />
       </div>
 
@@ -58,7 +73,7 @@
         <div 
            v-if="!showDesktopSidebar"
            class="hidden lg:flex absolute left-0 top-1/2 -translate-y-1/2 z-50 bg-white dark:bg-gray-800 border border-l-0 border-gray-200 dark:border-gray-700 rounded-r shadow-md cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700 items-center justify-center w-6 h-12 transition-colors"
-           @click="showDesktopSidebar = true"
+           @click="handleManualOpen"
            :title="t('sidebar.expandSidebar')"
         >
             <svg width="16" height="16" viewBox="0 0 24 24" class="text-gray-500 dark:text-gray-400"><path :d="MemoryChevronRight" /></svg>
@@ -73,11 +88,26 @@
             v-model:code="code"
             v-model:triggerStep="triggerStep"
             v-model:biStrict="biStrict"
+            v-model:blend="dailyBlendModels"
+            v-model:dataSrc="dataSrc"
+            v-model:model="model"
+            v-model:intradayFreq="intradayFreq"
+            v-model:dataLengthYears="dataLengthYears"
+            v-model:pretrainedChoice="intradayPretrainedChoice"
+            v-model:intradayBlend="intradayBlendModels"
+            :activeTab="activeTab"
             :loading="loading"
+            :dataLengthMin="dataLengthMin"
+            :dataLengthMax="dataLengthMax"
+            :dataLengthStep="dataLengthStep"
+            :pretrainedOptions="intradayPretrainedOptions"
+            :pretrainedLoading="intradayPretrainedLoading"
             :collapsed="mobileSidebarCollapsed"
             mode="mobile"
             @analyze="analyze(true); mobileSidebarCollapsed = true"
+            @refresh="analyze(false, false, false); mobileSidebarCollapsed = true"
             @toggle="mobileSidebarCollapsed = !mobileSidebarCollapsed"
+            @refreshPretrained="fetchIntradayPretrainedModels"
           />
         </div>
 
@@ -110,8 +140,8 @@
              <!-- Tab Content Container with flex-1 to fill space -->
              <div class="lg:h-full lg:overflow-y-auto p-2 box-border flex flex-col flex-1">
                 <div v-if="hasRunAnalysis" class="flex gap-2 flex-col lg:flex-row lg:h-full lg:overflow-hidden flex-1">
-                  <!-- Chart Column (75%) -->
-                  <div class="flex-none lg:flex-[3] flex flex-col min-w-0 h-[500px] lg:h-full lg:overflow-hidden min-h-[400px]">
+                  <!-- Chart Column (66%) -->
+                  <div class="flex-none lg:flex-[2] flex flex-col min-w-0 h-[500px] lg:h-full lg:overflow-hidden min-h-[400px]">
                     <UCard :ui="{ body: { padding: 'p-0 sm:p-0', base: 'flex-1 h-full min-h-0' }, header: { padding: 'p-3 sm:p-3' } }" class="flex-1 flex flex-col h-full box-border shadow-none border border-gray-200 dark:border-gray-800">
                       <template #header>
                         <div class="flex justify-between items-center">
@@ -120,12 +150,12 @@
                         </div>
                       </template>
                       <div class="flex-1 relative min-h-0 overflow-hidden h-full">
-                         <ChanChart ref="chartRef" />
+                         <ChanChart ref="chartRef" :loading="loading" />
                       </div>
                     </UCard>
                   </div>
                   
-                  <!-- Info Column (25%) -->
+                  <!-- Info Column (33%) -->
                   <div class="flex-none lg:flex-1 min-w-0 lg:min-w-[300px] h-auto lg:h-full flex-shrink-0">
                     <UCard :ui="{ body: { padding: 'p-0 sm:p-0' } }" class="h-full shadow-none border border-gray-200 dark:border-gray-800 overflow-y-auto">
                       <div class="h-full">
@@ -135,6 +165,7 @@
                           :signal="signal"
                           :accuracy="accuracy"
                           frequency="1d"
+                          :showCalibrationBins="false"
                           :loading="loading"
                         />
                       </div>
@@ -164,90 +195,12 @@
           <!-- Intraday Tab -->
           <div v-show="activeTab === 'intraday'" class="h-full w-full flex flex-col lg:overflow-hidden relative pb-16 lg:pb-0">
              <div class="lg:h-full lg:overflow-y-auto p-2 box-border flex flex-col flex-1">
-                <!-- Frequency Selector -->
-               <div class="mb-2 flex flex-col gap-2 bg-gray-50 dark:bg-gray-900 p-2 rounded border border-gray-100 dark:border-gray-800 flex-shrink-0">
-                  <div class="flex flex-col gap-2 lg:flex-row lg:items-center lg:gap-4">
-                    <div class="flex items-center gap-2 flex-wrap">
-                      <span class="text-sm font-bold text-gray-700 dark:text-gray-300">{{ t('app.dataSrc') }}</span>
-                      <div class="flex gap-1">
-                        <UButton
-                          v-for="src in ['clickhouse', 'baostock', 'akshare']"
-                          :key="src"
-                          :label="t('app.dataSrcOptions.' + src)"
-                          size="xs"
-                          :color="dataSrc === src ? 'primary' : 'gray'"
-                          :variant="dataSrc === src ? 'solid' : 'ghost'"
-                          @click="dataSrc = src"
-                        />
-                      </div>
-                    </div>
-
-                    <div class="flex items-center gap-2 flex-wrap">
-                      <span class="text-sm font-bold text-gray-700 dark:text-gray-300">{{ t('app.modelSelect') }}</span>
-                      <div class="flex gap-1">
-                        <UButton
-                          v-for="m in ['xgboost', 'lightgbm', 'mlp']"
-                          :key="m"
-                          :label="t('app.modelOptions.' + m)"
-                          size="xs"
-                          :color="model === m ? 'primary' : 'gray'"
-                          :variant="model === m ? 'solid' : 'ghost'"
-                          @click="model = m"
-                        />
-                      </div>
-                    </div>
-
-                    <div class="flex items-center gap-2 flex-wrap">
-                      <span class="text-sm font-bold text-gray-700 dark:text-gray-300">{{ t('app.dataLength') }}</span>
-                      <div class="w-44 xl:w-60 max-w-full px-1 flex items-center gap-1">
-                        <URange
-                          class="flex-1"
-                          v-model="dataLengthYears"
-                          :min="dataLengthMin"
-                          :max="dataLengthMax"
-                          :step="dataLengthStep"
-                          size="sm"
-                        />
-                        <span class="text-xs text-gray-500 w-4 m-1 xl:m-2 text-right tabular-nums">{{ dataLengthYearsDisplay }}</span>
-                        <span class="hidden xl:inline text-xs text-gray-400 whitespace-nowrap">(Max: {{ dataLengthMax }}y)</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div class="flex flex-col gap-2 lg:flex-row lg:items-center lg:gap-3">
-                    <div class="flex items-center gap-2 flex-wrap">
-                      <span class="text-sm font-bold text-gray-700 dark:text-gray-300">{{ t('app.periodSelect') }}</span>
-                      <div class="flex gap-1 flex-wrap">
-                        <UButton
-                          v-for="period in ['1m', '5m', '15m', '30m', '60m', '1d', '1w', '1mo']"
-                          :key="period"
-                          :label="t('periods.' + period)"
-                          size="xs"
-                          :color="intradayFreq === period ? 'primary' : 'gray'"
-                          :variant="intradayFreq === period ? 'solid' : 'ghost'"
-                          :disabled="period === '1m' && ['baostock', 'akshare'].includes(dataSrc)"
-                          @click="intradayFreq = period"
-                        />
-                      </div>
-                    </div>
-
-                    <div class="hidden lg:flex ml-auto gap-2">
-                      <UButton color="gray" size="sm" :loading="loading" @click="analyze(false)">{{ t('app.refresh') }}</UButton>
-                      <UButton color="primary" size="sm" :loading="loading" @click="analyze(true)" :disabled="!hasRunIntraday">{{ t('app.predict') }}</UButton>
-                    </div>
-                  </div>
-
-                  <!-- Mobile Buttons -->
-                  <div class="lg:hidden grid grid-cols-1 sm:grid-cols-2 gap-2 w-full mt-2">
-                      <UButton block color="gray" :loading="loading" @click="analyze(false)">{{ t('app.refresh') }}</UButton>
-                      <UButton block color="primary" :loading="loading" @click="analyze(true)" :disabled="!hasRunIntraday">{{ t('app.predict') }}</UButton>
-                  </div>
-               </div>
+               <!-- Config moved to sidebar -->
                
                <!-- Chart & Info -->
                 <div v-if="hasRunIntraday" class="flex gap-2 flex-col lg:flex-row lg:flex-1 lg:overflow-hidden flex-1">
-                  <!-- Chart Column (75%) -->
-                  <div class="flex-none lg:flex-[3] flex flex-col min-w-0 h-[500px] lg:h-full lg:overflow-hidden min-h-[400px]">
+                  <!-- Chart Column (66%) -->
+                  <div class="flex-none lg:flex-[2] flex flex-col min-w-0 h-[500px] lg:h-full lg:overflow-hidden min-h-[400px]">
                     <UCard :ui="{ body: { padding: 'p-0 sm:p-0', base: 'flex-1 h-full min-h-0' }, header: { padding: 'p-3 sm:p-3' } }" class="flex-1 flex flex-col h-full box-border shadow-none border border-gray-200 dark:border-gray-800">
                       <template #header>
                         <div class="flex justify-between items-center">
@@ -256,12 +209,12 @@
                         </div>
                       </template>
                       <div class="flex-1 relative min-h-0 overflow-hidden h-full">
-                         <ChanChart ref="intradayChartRef"></ChanChart>
+                         <ChanChart ref="intradayChartRef" :loading="loading"></ChanChart>
                       </div>
                     </UCard>
                   </div>
                   
-                  <!-- Info Column (25%) -->
+                  <!-- Info Column (33%) -->
                   <div class="flex-none lg:flex-1 min-w-0 lg:min-w-[300px] h-auto lg:h-full flex-shrink-0">
                     <UCard :ui="{ body: { padding: 'p-0 sm:p-0' } }" class="h-full shadow-none border border-gray-200 dark:border-gray-800 overflow-y-auto">
                       <div class="h-full">
@@ -271,6 +224,7 @@
                           :signal="intradaySignal"
                           :accuracy="intradayAccuracy"
                           :frequency="intradayFreq"
+                          :showCalibrationBins="true"
                           :loading="loading"
                         />
                       </div>
@@ -284,6 +238,13 @@
              </div>
           </div>
           
+          <!-- Pretrain Tab -->
+          <div v-show="activeTab === 'pretrain'" class="h-full w-full flex flex-col lg:overflow-hidden">
+             <div class="lg:h-full lg:overflow-hidden p-2 box-border bg-white dark:bg-gray-900 flex-1">
+                <PretrainPanel :defaultDataSrc="dataSrc" :defaultModel="model" />
+             </div>
+          </div>
+
           <!-- History Tab -->
           <div v-show="activeTab === 'history'" class="h-full w-full flex flex-col lg:overflow-hidden">
              <div class="lg:h-full lg:overflow-hidden p-2 box-border bg-white dark:bg-gray-900 flex-1">
@@ -312,18 +273,35 @@ import { useI18n } from './composables/useI18n'
 const { currentLang: lang, t } = useI18n()
 const toast = useToast()
 
-const tabs = [
+const tabs = computed(() => [
   { name: 'analysis', label: t('app.stockAnalysis'), icon: MemoryChartBar },
   { name: 'intraday', label: t('app.intradayAnalysis'), icon: MemoryClock },
+  { name: 'pretrain', label: t('app.pretrain'), icon: MemoryChartBar },
   { name: 'history', label: t('app.history'), icon: MemoryBook },
   { name: 'help', label: t('app.guide'), icon: MemoryJournal }
-]
+])
 
 const code = ref('002701')
 const mobileSidebarCollapsed = ref(false)
 const showDesktopSidebar = ref(true)
+const userManuallyHidden = ref(false)
+
+const handleManualClose = () => {
+  showDesktopSidebar.value = false
+  // If we are on a "Show" page, mark as manually hidden
+  if (!['pretrain', 'history', 'help'].includes(activeTab.value)) {
+    userManuallyHidden.value = true
+  }
+}
+
+const handleManualOpen = () => {
+  showDesktopSidebar.value = true
+  userManuallyHidden.value = false
+}
+
 const triggerStep = ref(true)
 const biStrict = ref(false)
+const dailyBlendModels = ref(false)
 const loading = ref(false)
 const activeTab = ref('analysis')
 const hasRunAnalysis = ref(false)
@@ -345,6 +323,13 @@ const intradayAccuracy = ref(null)
 const intradayLatestClose = ref('--')
 const intradayLatestDate = ref('--')
 const intradayChartRef = ref(null)
+
+const intradayPretrainedChoice = ref('auto')
+const dailyPretrainedChoice = ref('auto')
+const intradayBlendModels = ref(true)
+const intradayPretrainedLoading = ref(false)
+const intradayPretrainedModels = ref([])
+let intradayPretrainedFetchedAt = 0
 
 const isInitialized = ref(false)
 
@@ -446,6 +431,30 @@ onMounted(() => {
     biStrict.value = savedBiStrict === 'true'
   }
 
+  const savedIntradayPretrained = localStorage.getItem('intradayPretrainedChoice')
+  if (savedIntradayPretrained) {
+    intradayPretrainedChoice.value = savedIntradayPretrained
+  }
+  const savedDailyPretrained = localStorage.getItem('dailyPretrainedChoice')
+  if (savedDailyPretrained) {
+    dailyPretrainedChoice.value = savedDailyPretrained
+  }
+  const savedDailyBlend = localStorage.getItem('dailyBlendModels')
+  if (savedDailyBlend) {
+    dailyBlendModels.value = savedDailyBlend !== 'false'
+  }
+  const savedIntradayBlend = localStorage.getItem('intradayBlendModels')
+  if (savedIntradayBlend) {
+    intradayBlendModels.value = savedIntradayBlend !== 'false'
+  }
+
+  fetchIntradayPretrainedModels({ quiet: true })
+
+  // Apply initial sidebar state
+  if (['pretrain', 'history', 'help'].includes(activeTab.value)) {
+    showDesktopSidebar.value = false
+  }
+
   nextTick(() => {
     isInitialized.value = true
   })
@@ -462,6 +471,21 @@ watch(code, (newVal) => {
 watch(activeTab, (newVal) => {
   if (!isInitialized.value) return
   if (newVal) localStorage.setItem('lastActiveTab', newVal)
+
+  // Sidebar Visibility Logic
+  if (['pretrain', 'history', 'help'].includes(newVal)) {
+    showDesktopSidebar.value = false
+  } else {
+    // Show pages: analysis, intraday
+    if (!userManuallyHidden.value) {
+      showDesktopSidebar.value = true
+    }
+  }
+  
+  // Refresh pretrained models list when entering analysis/intraday tabs
+  if (newVal === 'intraday' || newVal === 'analysis') {
+     fetchIntradayPretrainedModels({ quiet: true })
+  }
 })
 
 watch(lang, (newVal) => {
@@ -507,40 +531,164 @@ watch(biStrict, (newVal) => {
   localStorage.setItem('lastBiStrict', newVal)
 })
 
-// API Calls
-const analyze = async (isPrediction = false, silent = false) => {
-  // Determine if we need a two-step process (Chart first, then Prediction)
-  // Only for Analysis Tab when prediction is requested
-  const isAnalysisTab = activeTab.value === 'analysis'
-  const separatePrediction = isAnalysisTab && isPrediction
+watch(intradayPretrainedChoice, (newVal) => {
+  if (!isInitialized.value) return
+  localStorage.setItem('intradayPretrainedChoice', newVal || 'auto')
+})
 
-  loading.value = true
-  
+watch(intradayBlendModels, (newVal) => {
+  if (!isInitialized.value) return
+  localStorage.setItem('intradayBlendModels', newVal ? 'true' : 'false')
+})
+
+watch(dailyPretrainedChoice, (newVal) => {
+  if (!isInitialized.value) return
+  localStorage.setItem('dailyPretrainedChoice', newVal || 'auto')
+})
+
+watch(dailyBlendModels, (newVal) => {
+  if (!isInitialized.value) return
+  localStorage.setItem('dailyBlendModels', newVal ? 'true' : 'false')
+})
+
+watch([intradayFreq, dataSrc, model], () => {
+  fetchIntradayPretrainedModels({ quiet: true })
+})
+
+const formatUtcShort = (iso) => {
+  const raw = String(iso || '')
+  if (!raw) return ''
+  const d = new Date(raw)
+  if (Number.isNaN(d.getTime())) return raw
+  const pad2 = (n) => String(n).padStart(2, '0')
+  return `${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())} ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`
+}
+
+const fetchIntradayPretrainedModels = async ({ quiet } = {}) => {
+  const now = Date.now()
+  if (quiet && now - intradayPretrainedFetchedAt < 10000) return
+  intradayPretrainedLoading.value = !quiet
   try {
-    const isIntraday = activeTab.value === 'intraday'
-    const frequency = isIntraday ? intradayFreq.value : '1d'
-    
-    // First pass: 
-    // If separatePrediction is true, force include_prediction to false for the first request
-    const firstPassPrediction = separatePrediction ? false : isPrediction
-
-    // Construct API params
-    const params = {
-      code: code.value,
-      frequency: frequency,
-      do_predict: firstPassPrediction,
-      step_calc: triggerStep.value,
-      bi_strict: biStrict.value,
-      data_source: isIntraday ? dataSrc.value : undefined, // Only send data_source for intraday for now, or as needed
-      model: model.value,
-      data_length_years: isIntraday ? dataLengthYears.value : undefined
+    const pageSize = 200
+    let page = 1
+    let total = null
+    const all = []
+    while (true) {
+      const res = await axios.get('/api/pretrained_models', { params: { page, page_size: pageSize } })
+      const data = res.data || {}
+      const items = Array.isArray(data.items) ? data.items : []
+      if (total === null && data.total !== undefined) {
+        const n = Number(data.total)
+        total = Number.isFinite(n) ? n : null
+      }
+      all.push(...items)
+      if (!items.length) break
+      if (total !== null && all.length >= total) break
+      if (items.length < pageSize) break
+      page += 1
+      if (page > 10) break
     }
+    intradayPretrainedModels.value = all
+    intradayPretrainedFetchedAt = now
+  } catch (e) {
+    intradayPretrainedModels.value = []
+  } finally {
+    intradayPretrainedLoading.value = false
+  }
+}
 
-    // Call API (Adjust endpoint as necessary)
-    // Assuming the original logic used a relative path /api/analyze or similar
-    // I need to check where the original axios calls went.
-    // Based on vite config, it was proxying /api to localhost:8001
+const matchedIntradayPretrainedModels = computed(() => {
+  const freq = String(intradayFreq.value || '')
+  const src = String(dataSrc.value || '')
+  const mt = String(model.value || '')
+  return (intradayPretrainedModels.value || []).filter((m) => {
+    return String(m?.frequency || '') === freq && String(m?.data_src || '') === src && String(m?.model_type || '') === mt
+  })
+})
+
+const intradayPretrainedOptions = computed(() => {
+  const opts = [
+    { label: t('app.pretrainedAuto'), value: 'auto' },
+    { label: t('app.pretrainedOff'), value: 'none' }
+  ]
+  for (const m of matchedIntradayPretrainedModels.value || []) {
+    const key = String(m?.key || '')
+    if (!key) continue
+    const name = String(m?.display_name || m?.name || '').trim()
+    const trainedAt = formatUtcShort(m?.trained_at)
+    const feat = Number(m?.feature_count || 0)
+    const metaLabel = `${trainedAt || '-'} F${feat} ${key.slice(0, 8)}`
+    opts.push({ label: name ? `${name} · ${metaLabel}` : metaLabel, value: key })
+  }
+  return opts
+})
+
+const matchedDailyPretrainedModels = computed(() => {
+  const freq = '1d'
+  const src = String(dataSrc.value || '')
+  const mt = String(model.value || '')
+  return (intradayPretrainedModels.value || []).filter((m) => {
+    return String(m?.frequency || '') === freq && String(m?.data_src || '') === src && String(m?.model_type || '') === mt
+  })
+})
+
+const getPretrainedAvailability = ({ isIntraday }) => {
+  const blendOn = isIntraday ? intradayBlendModels.value : dailyBlendModels.value
+  const choice = isIntraday ? intradayPretrainedChoice.value : dailyPretrainedChoice.value
+  if (!blendOn || choice === 'none') return { requested: false, available: true }
+
+  const matched = isIntraday ? matchedIntradayPretrainedModels.value : matchedDailyPretrainedModels.value
+  if (choice === 'auto') return { requested: true, available: (matched || []).length > 0 }
+
+  const key = String(choice || '')
+  const ok = (matched || []).some((m) => String(m?.key || '') === key)
+  return { requested: true, available: ok }
+}
+
+  const analyze = async (isPrediction = false, silent = false, forceRefresh = false) => {
+    const isAnalysisTab = activeTab.value === 'analysis'
+    const separatePrediction = isAnalysisTab && isPrediction
+
+    loading.value = true
     
+    try {
+      const isIntraday = activeTab.value === 'intraday'
+      const frequency = isIntraday ? intradayFreq.value : '1d'
+      
+      const firstPassPrediction = separatePrediction ? false : isPrediction
+
+      const pretrainedAvail = getPretrainedAvailability({ isIntraday })
+      if (!silent && pretrainedAvail.requested && !pretrainedAvail.available) {
+        toast.add({
+          title: t('app.pretrainedUnavailableTitle'),
+          description: t('app.pretrainedUnavailableDesc'),
+          color: 'orange'
+        })
+      }
+
+      const params = {
+        code: code.value,
+        frequency: frequency,
+        do_predict: firstPassPrediction,
+        trigger_step: triggerStep.value,
+        bi_strict: biStrict.value,
+        data_src: dataSrc.value,
+        model: model.value,
+        force_refresh: forceRefresh,
+        data_length_years: isIntraday ? dataLengthYears.value : undefined,
+        use_pretrained: isIntraday
+            ? (intradayBlendModels.value ? (intradayPretrainedChoice.value === 'none' ? false : true) : false)
+            : (dailyBlendModels.value ? (dailyPretrainedChoice.value === 'none' ? false : true) : false),
+        pretrained_model_key:
+          isIntraday 
+            ? (intradayBlendModels.value && intradayPretrainedChoice.value && !['auto', 'none'].includes(intradayPretrainedChoice.value) ? intradayPretrainedChoice.value : undefined)
+            : (dailyBlendModels.value && dailyPretrainedChoice.value && !['auto', 'none'].includes(dailyPretrainedChoice.value) ? dailyPretrainedChoice.value : undefined),
+        blend_models:
+          isIntraday 
+            ? (intradayBlendModels.value && intradayPretrainedChoice.value !== 'none' ? true : undefined)
+            : (dailyBlendModels.value && dailyPretrainedChoice.value !== 'none' ? true : undefined)
+      }
+
     const response = await axios.post('/api/analyze', params)
     
     if (response.data.status === 'success') {
@@ -611,8 +759,9 @@ const analyze = async (isPrediction = false, silent = false) => {
                code: code.value,
                frequency: '1d',
                do_predict: true,
-               step_calc: triggerStep.value,
+               trigger_step: triggerStep.value,
                bi_strict: biStrict.value,
+               data_src: dataSrc.value,
                model: model.value
            }
           

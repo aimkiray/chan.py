@@ -59,6 +59,9 @@ onMounted(() => {
             if (!myChart) {
               console.log('Initializing chart from ResizeObserver')
               myChart = echarts.init(chartDom.value)
+              if (props.loading) {
+                myChart.showLoading()
+              }
               if (lastData) {
                   console.log('Rendering pending data from ResizeObserver')
                   renderChart(lastData)
@@ -91,6 +94,9 @@ onMounted(() => {
         if (chartDom.value && chartDom.value.clientWidth > 0) {
             console.log('Initializing chart from renderChart', chartDom.value.clientWidth, chartDom.value.clientHeight)
             myChart = echarts.init(chartDom.value)
+            if (props.loading) {
+              myChart.showLoading()
+            }
         } else {
             console.warn('Chart container not ready or has 0 dimensions')
             return // Still not ready
@@ -273,6 +279,58 @@ onMounted(() => {
           confine: true,
           axisPointer: {
               type: 'cross'
+          },
+          formatter: (params) => {
+            const list = Array.isArray(params) ? params : [params].filter(Boolean)
+            if (!list.length) return ''
+
+            const k = list.find((p) => p?.seriesName === 'K-Line')
+            const idx = Number.isFinite(k?.dataIndex) ? k.dataIndex : -1
+            const dateLabel = String(list[0]?.axisValueLabel || list[0]?.axisValue || '')
+
+            const fmt2 = (v) => {
+              const n = Number(v)
+              return Number.isFinite(n) ? n.toFixed(2) : '--'
+            }
+
+            let open = null
+            let close = null
+            let low = null
+            let high = null
+            if (Array.isArray(k?.data) && k.data.length >= 4) {
+              open = k.data[0]
+              close = k.data[1]
+              low = k.data[2]
+              high = k.data[3]
+            }
+
+            let pctText = '--'
+            if (idx > 0 && Array.isArray(klines?.[idx - 1]) && klines[idx - 1].length >= 2) {
+              const prevClose = Number(klines[idx - 1][1])
+              const curClose = Number(close)
+              if (Number.isFinite(prevClose) && prevClose !== 0 && Number.isFinite(curClose)) {
+                const pct = ((curClose - prevClose) / prevClose) * 100
+                const sign = pct > 0 ? '+' : ''
+                pctText = `${sign}${pct.toFixed(2)}%`
+              }
+            }
+
+            const rows = []
+            rows.push(`<div class="font-semibold">${dateLabel}</div>`)
+            rows.push(`<div class="text-xs opacity-80">${t('chart.candleTooltip.changePct')}: ${pctText}</div>`)
+            rows.push(`<div class="mt-1">${k?.marker || ''}${t('chart.candleTooltip.open')}: ${fmt2(open)} ${t('chart.candleTooltip.high')}: ${fmt2(high)}<br/>${t('chart.candleTooltip.low')}: ${fmt2(low)} ${t('chart.candleTooltip.close')}: ${fmt2(close)}</div>`)
+
+            const maRows = (list || [])
+              .filter((p) => typeof p?.seriesName === 'string' && p.seriesName.startsWith('MA'))
+              .slice()
+              .sort((a, b) => Number(String(a.seriesName).slice(2)) - Number(String(b.seriesName).slice(2)))
+
+            if (maRows.length) {
+              const maParts = maRows.map((p) => `${p.marker || ''}${p.seriesName}: ${fmt2(p.data)}`)
+              rows.push(`<div class="mt-1">${maParts.join('<br/>')}</div>`)
+            }
+
+            return rows.join('')
           }
       },
       legend: {

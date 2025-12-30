@@ -440,7 +440,7 @@ def _log_trade(title, *msg):
 
 <img src="./Image/chan.py_image_3.png" />
 
-- segseg：字段命名为线段的线段，可以理解成把线段当成笔，算出其相应的线段结构；实际上可以当成父级别的线段；
+- segseg：字段为线段的线段，可以理解成把线段当成笔，算出其相应的线段结构；实际上可以当成父级别的线段；
 - segbsp：即 segseg 对应的买卖点（形态学上的）；
 - segzs：即 segseg 对应的中枢
 

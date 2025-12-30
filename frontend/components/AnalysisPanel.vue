@@ -28,6 +28,43 @@
           {{ signal.is_buy ? `[${t('analysis.buy')} (BUY)]` : `[${t('analysis.sell')} (SELL)]` }}
         </UBadge>
       </div>
+
+      <!-- Model Source Info -->
+      <div v-if="accuracy && accuracy.mode" class="mb-4 p-3 bg-gray-50 dark:bg-gray-800 rounded border border-gray-100 dark:border-gray-700 text-xs">
+         <div class="flex justify-between items-center mb-2">
+            <span class="font-bold text-sm text-gray-700 dark:text-gray-300">{{ t('analysis.modelSource') }}</span>
+            <UBadge :color="getModelModeColor(accuracy.mode)" size="sm" variant="subtle">{{ getModelModeLabel(accuracy.mode) }}</UBadge>
+         </div>
+         
+         <!-- Pretrained Details -->
+         <div v-if="accuracy.mode === 'pretrained' || accuracy.mode === 'ensemble'" class="mb-1">
+            <div class="flex justify-between text-gray-500">
+               <span>{{ t('analysis.pretrainedModel') }}</span>
+               <span class="text-gray-700 dark:text-gray-300 font-mono">{{ getPretrainedName(accuracy) }}</span>
+            </div>
+            <div v-if="accuracy.pretrained_trained_at" class="flex justify-between text-gray-400 mt-0.5">
+               <span>{{ t('analysis.trainedAt') }}</span>
+               <span>{{ formatTime(accuracy.pretrained_trained_at) }}</span>
+            </div>
+         </div>
+
+         <!-- Ensemble Details -->
+         <div v-if="accuracy.mode === 'ensemble'" class="mt-2 pt-2 border-t border-gray-200 dark:border-gray-700">
+            <div class="flex justify-between items-center mb-1">
+               <span class="text-gray-500">{{ t('analysis.ensembleScores') }}</span>
+            </div>
+            <div class="grid grid-cols-2 gap-2">
+               <div class="flex flex-col">
+                  <span class="text-[10px] text-gray-400">Pretrained ({{ ((accuracy.ensemble_weight_pretrained || 0) * 100).toFixed(0) }}%)</span>
+                  <span class="font-medium" :class="getScoreColor(accuracy.pretrained_score)">{{ ((accuracy.pretrained_score || 0) * 100).toFixed(1) }}%</span>
+               </div>
+               <div class="flex flex-col text-right">
+                  <span class="text-[10px] text-gray-400">Online ({{ ((accuracy.ensemble_weight_online || 0) * 100).toFixed(0) }}%)</span>
+                  <span class="font-medium" :class="getScoreColor(accuracy.online_score)">{{ ((accuracy.online_score || 0) * 100).toFixed(1) }}%</span>
+               </div>
+            </div>
+         </div>
+      </div>
       
       <div class="border border-gray-200 dark:border-gray-700 rounded-md overflow-hidden text-sm">
         <div class="flex border-b border-gray-200 dark:border-gray-700 last:border-b-0">
@@ -72,11 +109,54 @@
       {{ t('app.pleasePredict') }}
     </div>
     
-    <div v-if="accuracy" class="mt-6 pt-4 border-t border-gray-100 dark:border-gray-800 text-xs text-gray-500 text-center">
-      {{ t('analysis.accuracy') }}: {{ accuracy.valid_count }}/{{ accuracy.total_count }} 
-      <span class="font-medium ml-1">
-        ({{ accuracy.accuracy !== undefined ? (accuracy.accuracy * 100).toFixed(1) : '--' }}%)
-      </span>
+    <div v-if="accuracy" class="mt-6 pt-4 border-t border-gray-100 dark:border-gray-800 text-xs text-gray-500">
+      <div class="text-center">
+        {{ t('analysis.accuracy') }}: {{ accuracy.valid_count }}/{{ accuracy.total_count }}
+        <span class="font-medium ml-1">
+          ({{ accuracy.accuracy !== undefined ? (accuracy.accuracy * 100).toFixed(1) : '--' }}%)
+        </span>
+      </div>
+
+      <div v-if="accuracy.brier_score !== undefined" class="mt-2 text-center">
+        {{ t('analysis.brier') }}:
+        <span class="font-medium ml-1">{{ Number(accuracy.brier_score).toFixed(4) }}</span>
+      </div>
+
+      <div v-if="accuracy.ece !== undefined" class="mt-1 text-center">
+        {{ t('analysis.ece') }}:
+        <span class="font-medium ml-1">{{ Number(accuracy.ece).toFixed(4) }}</span>
+      </div>
+
+      <div v-if="accuracy.method || accuracy.train_count || accuracy.val_count || accuracy.test_count" class="mt-2 text-center">
+        <span v-if="accuracy.method" class="mr-2">{{ accuracy.method }}</span>
+        <span v-if="accuracy.train_count !== undefined" class="mr-2">train={{ accuracy.train_count }}</span>
+        <span v-if="accuracy.val_count !== undefined" class="mr-2">val={{ accuracy.val_count }}</span>
+        <span v-if="accuracy.test_count !== undefined">test={{ accuracy.test_count }}</span>
+      </div>
+
+      <div v-if="showCalibrationBins && accuracy.calibration_bins && accuracy.calibration_bins.length" class="mt-3">
+        <div class="text-center mb-2">{{ t('analysis.calibrationBins') }}</div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-[11px] border border-gray-100 dark:border-gray-800">
+            <thead class="bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-300">
+              <tr>
+                <th class="p-1 text-left">bin</th>
+                <th class="p-1 text-right">n</th>
+                <th class="p-1 text-right">avg</th>
+                <th class="p-1 text-right">win</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(b, i) in accuracy.calibration_bins" :key="i" class="border-t border-gray-100 dark:border-gray-800">
+                <td class="p-1 text-left tabular-nums">{{ Number(b.low).toFixed(1) }}-{{ Number(b.high).toFixed(1) }}</td>
+                <td class="p-1 text-right tabular-nums">{{ b.count }}</td>
+                <td class="p-1 text-right tabular-nums">{{ (Number(b.avg_pred) * 100).toFixed(1) }}%</td>
+                <td class="p-1 text-right tabular-nums">{{ (Number(b.win_rate) * 100).toFixed(1) }}%</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -95,6 +175,10 @@ const props = defineProps({
     type: String,
     default: '1d'
   },
+  showCalibrationBins: {
+    type: Boolean,
+    default: true
+  },
   loading: Boolean
 })
 
@@ -108,14 +192,35 @@ const timeDiffLabel = computed(() => {
 const timeDiffValue = computed(() => {
   if (!props.signal || props.signal.days_diff === undefined) return '--'
   
-  const val = props.signal.days_diff
-  if (['1s', '1m', '5m', '15m', '30m', '60m'].includes(props.frequency)) {
-    // If it's intraday, maybe display as "bars ago" or convert to time
-    // Assuming days_diff is actually "bars diff" or "time units diff" for intraday
-    // But for now let's just show the number
-    return val + ' ' + t('analysis.barsAgo')
+  const toNumber = (v) => {
+    const n = Number(v)
+    return Number.isFinite(n) ? n : null
   }
-  return val + ' ' + t('analysis.days')
+
+  const formatNumber = (n, decimals = 2) => {
+    if (n === null) return '--'
+    const s = n.toFixed(decimals)
+    return s.replace(/\.?0+$/, '')
+  }
+
+  const val = toNumber(props.signal.days_diff)
+  if (val === null) return '--'
+
+  if (['1s', '1m', '5m', '15m', '30m', '60m'].includes(props.frequency)) {
+    const sec = val * 24 * 3600
+    const barSecMap = {
+      '1s': 1,
+      '1m': 60,
+      '5m': 5 * 60,
+      '15m': 15 * 60,
+      '30m': 30 * 60,
+      '60m': 60 * 60
+    }
+    const barSec = barSecMap[String(props.frequency)] || 60
+    const bars = Math.max(0, Math.round(sec / barSec))
+    return `${bars} ${t('analysis.barsAgo')}`
+  }
+  return `${formatNumber(val, 2)} ${t('analysis.days')}`
 })
 
 const signalDesc = computed(() => {
@@ -184,5 +289,41 @@ const getScoreStatus = (score) => {
   if (score >= 0.5) return 'blue'
   if (score >= 0.3) return 'orange'
   return 'red'
+}
+
+const getModelModeColor = (mode) => {
+  if (mode === 'ensemble') return 'purple'
+  if (mode === 'pretrained') return 'indigo'
+  return 'gray'
+}
+
+const getModelModeLabel = (mode) => {
+  if (mode === 'ensemble') return t('analysis.ensemble')
+  if (mode === 'pretrained') return t('analysis.pretrained')
+  return t('analysis.online')
+}
+
+const getPretrainedName = (acc) => {
+  if (!acc) return '--'
+  if (acc.pretrained_key) {
+      return acc.pretrained_key.slice(0, 8) + '...'
+  }
+  return t('analysis.pretrained')
+}
+
+const formatTime = (iso) => {
+  if (!iso) return '--'
+  try {
+    const d = new Date(iso)
+    return d.toLocaleString()
+  } catch (e) {
+    return iso
+  }
+}
+
+const getScoreColor = (score) => {
+    if (score > 0.6) return 'text-green-600 dark:text-green-400'
+    if (score > 0.5) return 'text-blue-600 dark:text-blue-400'
+    return 'text-gray-600 dark:text-gray-400'
 }
 </script>

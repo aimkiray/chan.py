@@ -1,7 +1,8 @@
 import os
 import json
+import hashlib
 import datetime
-from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, Index
+from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, Index, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 Base = declarative_base()
@@ -40,6 +41,32 @@ class AnalysisResult(Base):
         Index('idx_lookup', 'code', 'frequency', 'params_hash', 'data_latest_time'),
     )
 
+class PretrainedModel(Base):
+    __tablename__ = 'pretrained_model'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    model_key = Column(String(64), unique=True, index=True)
+    model_type = Column(String(50), index=True)
+    frequency = Column(String(10), index=True)
+    data_src = Column(String(50), index=True)
+    name = Column(String(120), index=True)
+
+    params_hash = Column(String(64), index=True)
+    params_json = Column(Text)
+
+    bundle_path = Column(String(255))
+    feature_count = Column(Integer)
+    sample_count = Column(Integer)
+    trained_at = Column(String(40), index=True)
+    accuracy_json = Column(Text)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_pretrained_lookup', 'model_type', 'frequency', 'data_src', 'params_hash'),
+    )
+
 class StorageManager:
     def __init__(self, db_path='analysis.db'):
         if not os.path.isabs(db_path):
@@ -47,13 +74,123 @@ class StorageManager:
             
         self.engine = create_engine(f'sqlite:///{db_path}', connect_args={'check_same_thread': False})
         Base.metadata.create_all(self.engine)
+        self._ensure_schema()
         self.Session = sessionmaker(bind=self.engine)
+
+    def _ensure_schema(self):
+        try:
+            with self.engine.connect() as conn:
+                cols = conn.execute(text("PRAGMA table_info(pretrained_model)")).fetchall()
+                names = [c[1] for c in cols] if cols else []
+                if "name" not in names:
+                    conn.execute(text("ALTER TABLE pretrained_model ADD COLUMN name VARCHAR(120)"))
+                    try:
+                        conn.commit()
+                    except Exception:
+                        try:
+                            conn.connection.commit()
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"Failed to ensure schema: {e}")
+
+    def is_duplicate_pretrain(self, model_type, frequency, data_src, params):
+        session = self.Session()
+        try:
+            params_json = json.dumps(params, sort_keys=True, ensure_ascii=False)
+            params_hash = hashlib.md5(params_json.encode('utf-8')).hexdigest()
+            q = session.query(PretrainedModel).filter(
+                PretrainedModel.model_type == str(model_type or "").strip(),
+                PretrainedModel.frequency == str(frequency or "").strip(),
+                PretrainedModel.data_src == str(data_src or "").strip(),
+                PretrainedModel.params_hash == params_hash,
+            )
+            return q.first() is not None
+        finally:
+            session.close()
+
+    def upsert_pretrained_model(self, model_key, model_type, frequency, data_src, params, meta):
+        session = self.Session()
+        try:
+            now = datetime.datetime.utcnow()
+            params_json = json.dumps(params, sort_keys=True, ensure_ascii=False)
+            params_hash = hashlib.md5(params_json.encode('utf-8')).hexdigest()
+
+            record = session.query(PretrainedModel).filter(PretrainedModel.model_key == model_key).first()
+            if record is None:
+                record = PretrainedModel(model_key=model_key)
+                session.add(record)
+
+            record.model_type = model_type
+            record.frequency = frequency
+            record.data_src = data_src
+            record.params_hash = params_hash
+            record.params_json = params_json
+
+            record.bundle_path = meta.get("bundle_path") if isinstance(meta, dict) else None
+            record.feature_count = meta.get("feature_count") if isinstance(meta, dict) else None
+            record.sample_count = meta.get("sample_count") if isinstance(meta, dict) else None
+            record.trained_at = meta.get("trained_at") if isinstance(meta, dict) else None
+            acc = meta.get("accuracy") if isinstance(meta, dict) else None
+            record.accuracy_json = json.dumps(acc, ensure_ascii=False) if acc is not None else None
+
+            record.updated_at = now
+            if record.created_at is None:
+                record.created_at = now
+
+            session.commit()
+            return record.id
+        except Exception as e:
+            print(f"Failed to upsert pretrained model: {e}")
+            session.rollback()
+            return None
+        finally:
+            session.close()
+
+    def get_pretrained_model_names_by_keys(self, model_keys):
+        if not model_keys:
+            return {}
+        keys = [str(k).strip() for k in model_keys if str(k).strip()]
+        if not keys:
+            return {}
+        session = self.Session()
+        try:
+            rows = session.query(PretrainedModel.model_key, PretrainedModel.name).filter(PretrainedModel.model_key.in_(keys)).all()
+            out = {}
+            for mk, nm in rows:
+                if mk:
+                    out[str(mk)] = nm
+            return out
+        finally:
+            session.close()
+
+    def set_pretrained_model_name(self, model_key, name):
+        session = self.Session()
+        try:
+            mk = str(model_key or "").strip()
+            if not mk:
+                return False
+            record = session.query(PretrainedModel).filter(PretrainedModel.model_key == mk).first()
+            if record is None:
+                record = PretrainedModel(model_key=mk)
+                session.add(record)
+            record.name = name
+            record.updated_at = datetime.datetime.utcnow()
+            if record.created_at is None:
+                record.created_at = record.updated_at
+            session.commit()
+            return True
+        except Exception as e:
+            print(f"Failed to set pretrained model name: {e}")
+            session.rollback()
+            return False
+        finally:
+            session.close()
 
     def save_result(self, code, freq, params, data_latest_time, result_dict, model, signal_info, begin_time=None, end_time=None):
         session = self.Session()
         try:
             params_json = json.dumps(params, sort_keys=True)
-            import hashlib
             params_hash = hashlib.md5(params_json.encode('utf-8')).hexdigest()
             
             # Check if exists to update or insert new? 
