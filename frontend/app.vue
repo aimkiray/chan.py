@@ -45,6 +45,7 @@
           v-model:code="code"
           v-model:triggerStep="triggerStep"
           v-model:biStrict="biStrict"
+          v-model:enableRollingLookback="enableRollingLookback"
           v-model:blend="dailyBlendModels"
           v-model:dataSrc="dataSrc"
           v-model:model="model"
@@ -52,6 +53,9 @@
           v-model:dataLengthYears="dataLengthYears"
           v-model:pretrainedChoice="intradayPretrainedChoice"
           v-model:intradayBlend="intradayBlendModels"
+          v-model:strategyForm="strategyForm"
+          v-model:strategyChanConfig="strategyChanConfig"
+          v-model:pretrainConfig="pretrainConfig"
           :activeTab="activeTab"
           :loading="loading"
           :dataLengthMin="dataLengthMin"
@@ -61,6 +65,8 @@
           :pretrainedLoading="intradayPretrainedLoading"
           mode="desktop"
           @analyze="analyze(true)"
+          @runStrategy="strategyPanelRef.runStrategy()"
+          @runPretrain="pretrainPanelRef.runPretrain()"
           @refresh="analyze(false, false, false)"
           @toggle="handleManualClose"
           @refreshPretrained="fetchIntradayPretrainedModels"
@@ -88,6 +94,7 @@
             v-model:code="code"
             v-model:triggerStep="triggerStep"
             v-model:biStrict="biStrict"
+            v-model:enableRollingLookback="enableRollingLookback"
             v-model:blend="dailyBlendModels"
             v-model:dataSrc="dataSrc"
             v-model:model="model"
@@ -95,6 +102,9 @@
             v-model:dataLengthYears="dataLengthYears"
             v-model:pretrainedChoice="intradayPretrainedChoice"
             v-model:intradayBlend="intradayBlendModels"
+            v-model:strategyForm="strategyForm"
+            v-model:strategyChanConfig="strategyChanConfig"
+            v-model:pretrainConfig="pretrainConfig"
             :activeTab="activeTab"
             :loading="loading"
             :dataLengthMin="dataLengthMin"
@@ -105,6 +115,8 @@
             :collapsed="mobileSidebarCollapsed"
             mode="mobile"
             @analyze="analyze(true); mobileSidebarCollapsed = true"
+            @runStrategy="strategyPanelRef.runStrategy()"
+            @runPretrain="pretrainPanelRef.runPretrain()"
             @refresh="analyze(false, false, false); mobileSidebarCollapsed = true"
             @toggle="mobileSidebarCollapsed = !mobileSidebarCollapsed"
             @refreshPretrained="fetchIntradayPretrainedModels"
@@ -241,7 +253,19 @@
           <!-- Pretrain Tab -->
           <div v-show="activeTab === 'pretrain'" class="h-full w-full flex flex-col lg:overflow-hidden">
              <div class="lg:h-full lg:overflow-hidden p-2 box-border bg-white dark:bg-gray-900 flex-1">
-                <PretrainPanel :defaultDataSrc="dataSrc" :defaultModel="model" />
+                <PretrainPanel ref="pretrainPanelRef" :config="pretrainConfig" :defaultDataSrc="dataSrc" :defaultModel="model" />
+             </div>
+          </div>
+
+          <!-- Strategy Tab -->
+          <div v-show="activeTab === 'strategy'" class="h-full w-full flex flex-col lg:overflow-hidden">
+             <div class="lg:h-full lg:overflow-hidden p-2 box-border bg-white dark:bg-gray-900 flex-1">
+                <StrategyPanel 
+                  ref="strategyPanelRef" 
+                  :form="strategyForm"
+                  :chanConfig="strategyChanConfig"
+                  @view-stock="handleViewStockFromStrategy" 
+                />
              </div>
           </div>
 
@@ -267,16 +291,17 @@
 <script setup>
 import { ref, watch, onMounted, nextTick, computed } from 'vue'
 import axios from 'axios'
-import { MemoryJournal, MemoryChartBar, MemoryBook, MemoryClock, MemoryChevronRight } from '@pictogrammers/memory'
+import { MemoryJournal, MemoryChartBar, MemoryBook, MemoryClock, MemoryChevronRight, MemoryFilter } from '@pictogrammers/memory'
 import { useI18n } from './composables/useI18n'
 
-const { currentLang: lang, t } = useI18n()
+const { currentLang: lang, t, formatTime } = useI18n()
 const toast = useToast()
 
 const tabs = computed(() => [
   { name: 'analysis', label: t('app.stockAnalysis'), icon: MemoryChartBar },
   { name: 'intraday', label: t('app.intradayAnalysis'), icon: MemoryClock },
   { name: 'pretrain', label: t('app.pretrain'), icon: MemoryChartBar },
+  { name: 'strategy', label: t('app.strategy'), icon: MemoryFilter },
   { name: 'history', label: t('app.history'), icon: MemoryBook },
   { name: 'help', label: t('app.guide'), icon: MemoryJournal }
 ])
@@ -301,6 +326,7 @@ const handleManualOpen = () => {
 
 const triggerStep = ref(true)
 const biStrict = ref(false)
+const enableRollingLookback = ref(true)
 const dailyBlendModels = ref(false)
 const loading = ref(false)
 const activeTab = ref('analysis')
@@ -317,6 +343,44 @@ const latestClose = ref('--')
 const latestDate = ref('--')
 const stockName = ref('')
 const chartRef = ref(null)
+
+const pretrainPanelRef = ref(null)
+const strategyPanelRef = ref(null)
+const strategyForm = ref({
+  strategy_name: `Strategy-${new Date().getTime()}`,
+  pool_id: '',
+  model: 'xgboost',
+  min_accuracy: 0.8,
+  frequency: '1d',
+  data_length_years: 1.0,
+  enable_rolling_lookback: true
+})
+const strategyChanConfig = ref({
+  bi_strict: true,
+  bsp2_follow_1: false,
+  bsp3_follow_1: false,
+  gap_as_kl: false,
+  bi_allow_sub_peak: false,
+  macd_algo: 'peak',
+  min_zs_cnt: 0,
+  require_signal: false,
+  signal_lookback: 5,
+  signal_direction: 'buy',
+  bs_type: '1,2,3a,1p,2s,3b'
+})
+
+const pretrainConfig = ref({
+  selectedPoolId: '',
+  poolName: '',
+  overwriteCodes: true,
+  codesText: '',
+  frequency: '1d',
+  model: 'xgboost',
+  dataSrc: 'clickhouse',
+  dataLengthMode: 'years',
+  dataLengthYears: 5.0,
+  forceRefresh: false
+})
 
 const intradaySignal = ref(null)
 const intradayAccuracy = ref(null)
@@ -431,6 +495,11 @@ onMounted(() => {
     biStrict.value = savedBiStrict === 'true'
   }
 
+  const savedEnableRollingLookback = localStorage.getItem('lastEnableRollingLookback')
+  if (savedEnableRollingLookback) {
+    enableRollingLookback.value = savedEnableRollingLookback === 'true'
+  }
+
   const savedIntradayPretrained = localStorage.getItem('intradayPretrainedChoice')
   if (savedIntradayPretrained) {
     intradayPretrainedChoice.value = savedIntradayPretrained
@@ -448,10 +517,24 @@ onMounted(() => {
     intradayBlendModels.value = savedIntradayBlend !== 'false'
   }
 
+  const savedStrategyChanConfig = localStorage.getItem('strategyChanConfig')
+  if (savedStrategyChanConfig) {
+    try {
+      Object.assign(strategyChanConfig.value, JSON.parse(savedStrategyChanConfig))
+    } catch (e) { /* ignore */ }
+  }
+
+  const savedPretrainConfig = localStorage.getItem('pretrainConfig')
+  if (savedPretrainConfig) {
+    try {
+      Object.assign(pretrainConfig.value, JSON.parse(savedPretrainConfig))
+    } catch (e) { /* ignore */ }
+  }
+
   fetchIntradayPretrainedModels({ quiet: true })
 
   // Apply initial sidebar state
-  if (['pretrain', 'history', 'help'].includes(activeTab.value)) {
+  if (['history', 'help'].includes(activeTab.value)) {
     showDesktopSidebar.value = false
   }
 
@@ -473,10 +556,10 @@ watch(activeTab, (newVal) => {
   if (newVal) localStorage.setItem('lastActiveTab', newVal)
 
   // Sidebar Visibility Logic
-  if (['pretrain', 'history', 'help'].includes(newVal)) {
+  if (['history', 'help'].includes(newVal)) {
     showDesktopSidebar.value = false
   } else {
-    // Show pages: analysis, intraday
+    // Show pages: analysis, intraday, pretrain
     if (!userManuallyHidden.value) {
       showDesktopSidebar.value = true
     }
@@ -531,6 +614,11 @@ watch(biStrict, (newVal) => {
   localStorage.setItem('lastBiStrict', newVal)
 })
 
+watch(enableRollingLookback, (newVal) => {
+  if (!isInitialized.value) return
+  localStorage.setItem('lastEnableRollingLookback', newVal)
+})
+
 watch(intradayPretrainedChoice, (newVal) => {
   if (!isInitialized.value) return
   localStorage.setItem('intradayPretrainedChoice', newVal || 'auto')
@@ -551,18 +639,24 @@ watch(dailyBlendModels, (newVal) => {
   localStorage.setItem('dailyBlendModels', newVal ? 'true' : 'false')
 })
 
+watch(strategyForm, (newVal) => {
+  if (!isInitialized.value) return
+  localStorage.setItem('strategyForm', JSON.stringify(newVal))
+}, { deep: true })
+
+watch(strategyChanConfig, (newVal) => {
+  if (!isInitialized.value) return
+  localStorage.setItem('strategyChanConfig', JSON.stringify(newVal))
+}, { deep: true })
+
+watch(pretrainConfig, (newVal) => {
+  if (!isInitialized.value) return
+  localStorage.setItem('pretrainConfig', JSON.stringify(newVal))
+}, { deep: true })
+
 watch([intradayFreq, dataSrc, model], () => {
   fetchIntradayPretrainedModels({ quiet: true })
 })
-
-const formatUtcShort = (iso) => {
-  const raw = String(iso || '')
-  if (!raw) return ''
-  const d = new Date(raw)
-  if (Number.isNaN(d.getTime())) return raw
-  const pad2 = (n) => String(n).padStart(2, '0')
-  return `${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())} ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`
-}
 
 const fetchIntradayPretrainedModels = async ({ quiet } = {}) => {
   const now = Date.now()
@@ -615,7 +709,7 @@ const intradayPretrainedOptions = computed(() => {
     const key = String(m?.key || '')
     if (!key) continue
     const name = String(m?.display_name || m?.name || '').trim()
-    const trainedAt = formatUtcShort(m?.trained_at)
+    const trainedAt = formatTime(m?.trained_at)
     const feat = Number(m?.feature_count || 0)
     const metaLabel = `${trainedAt || '-'} F${feat} ${key.slice(0, 8)}`
     opts.push({ label: name ? `${name} · ${metaLabel}` : metaLabel, value: key })
@@ -672,6 +766,7 @@ const getPretrainedAvailability = ({ isIntraday }) => {
         do_predict: firstPassPrediction,
         trigger_step: triggerStep.value,
         bi_strict: biStrict.value,
+        enable_rolling_lookback: enableRollingLookback.value,
         data_src: dataSrc.value,
         model: model.value,
         force_refresh: forceRefresh,
@@ -839,6 +934,12 @@ const handleViewHistory = async (item) => {
   } finally {
     loading.value = false
   }
+}
+
+const handleViewStockFromStrategy = (stockCode) => {
+  code.value = stockCode
+  activeTab.value = 'analysis'
+  analyze(true)
 }
 </script>
 

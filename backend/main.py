@@ -10,12 +10,12 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict, Any, List, Callable
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,30 +36,100 @@ from backend.chan_service import (
     pretrain_and_persist_model,
     list_pretrained_model_metas,
     get_pretrained_model_detail_by_key,
+    delete_pretrained_model_bundle_by_key,
 )
 from backend.serialization import serialize_chan_data
-from backend.storage import StorageManager
+from backend.storage import StorageManager, StrategyRun
+from backend.strategy_runner import StrategyRunner
 from Plot.PlotMeta import CChanPlotMeta
 from Common.CEnum import KL_TYPE, DATA_SRC
 
 app = FastAPI()
 storage = StorageManager()
+strategy_runner = StrategyRunner(storage)
 
 _pretrain_jobs_lock = threading.Lock()
 _pretrain_jobs = {}
 _PRETRAIN_JOBS_MAX = int(os.environ.get("MLCHAN_PRETRAIN_JOBS_MAX", "50") or 50)
 _PRETRAIN_JOBS_TTL_SEC = int(os.environ.get("MLCHAN_PRETRAIN_JOBS_TTL_SEC", str(6 * 3600)) or (6 * 3600))
 
+_task_queue_cv = threading.Condition()
+_task_queue = []
+_task_current = None
+_task_worker_started = False
+
+def _ensure_task_worker_started():
+    global _task_worker_started
+    with _task_queue_cv:
+        if _task_worker_started:
+            return
+        _task_worker_started = True
+
+    def _worker_loop():
+        global _task_current
+        while True:
+            task = None
+            with _task_queue_cv:
+                while not _task_queue:
+                    _task_queue_cv.wait()
+                task = _task_queue.pop(0)
+                _task_current = task
+            try:
+                fn = task.get("fn")
+                if callable(fn):
+                    fn()
+            except Exception:
+                pass
+            finally:
+                with _task_queue_cv:
+                    _task_current = None
+
+    t = threading.Thread(target=_worker_loop, daemon=True)
+    t.start()
+
+def _enqueue_task(kind: str, ref_id: str, fn: Callable[[], None]):
+    _ensure_task_worker_started()
+    with _task_queue_cv:
+        _task_queue.append({
+            "kind": str(kind),
+            "ref_id": str(ref_id),
+            "enqueued_at": _utc_now_str(),
+            "fn": fn,
+        })
+        _task_queue_cv.notify()
+
+def _cancel_task_if_queued(kind: str, ref_id: str) -> bool:
+    with _task_queue_cv:
+        cur = _task_current
+        if cur and cur.get("kind") == kind and str(cur.get("ref_id")) == str(ref_id):
+            return False
+        kept = []
+        removed = False
+        for t in _task_queue:
+            if t.get("kind") == kind and str(t.get("ref_id")) == str(ref_id):
+                removed = True
+                continue
+            kept.append(t)
+        _task_queue[:] = kept
+        return removed
+
 def _utc_now_str():
     return datetime.datetime.utcnow().isoformat() + "Z"
 
 def _set_pretrain_job(job_id: str, **fields):
+    updated = None
     with _pretrain_jobs_lock:
         job = _pretrain_jobs.get(job_id)
         if not job:
             return
         job.update(fields)
         job["updated_at"] = _utc_now_str()
+        updated = dict(job)
+    try:
+        if updated is not None:
+            storage.upsert_pretrain_job(updated)
+    except Exception:
+        pass
 
 def _parse_utc(s: str):
     if not s:
@@ -71,6 +141,17 @@ def _parse_utc(s: str):
         return datetime.datetime.fromisoformat(ss)
     except Exception:
         return None
+
+def _dt_to_utc_iso(dt):
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        return dt
+    if isinstance(dt, datetime.datetime):
+        if dt.tzinfo is None:
+            return dt.isoformat() + "Z"
+        return dt.astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    return str(dt)
 
 def _model_type_label(model_type: str) -> str:
     mt = str(model_type or "").strip()
@@ -147,6 +228,10 @@ def _purge_pretrain_jobs():
         while len(_pretrain_jobs) > _PRETRAIN_JOBS_MAX and terminal:
             j = terminal.pop(0)
             _pretrain_jobs.pop(j.get("job_id"), None)
+    try:
+        storage.prune_pretrain_jobs(_PRETRAIN_JOBS_MAX, _PRETRAIN_JOBS_TTL_SEC)
+    except Exception:
+        pass
 
 def _shrink_pretrain_result(result):
     if not isinstance(result, dict):
@@ -217,6 +302,7 @@ class AnalyzeRequest(BaseModel):
     use_pretrained: Optional[bool] = None
     pretrained_model_key: Optional[str] = None
     blend_models: Optional[bool] = None
+    enable_rolling_lookback: bool = True # Enable/Disable long-term context features
 
 class PretrainRequest(BaseModel):
     codes: list[str]
@@ -245,8 +331,9 @@ async def create_pretrain_job(req: PretrainRequest):
 
     job_id = str(uuid.uuid4())
     now = _utc_now_str()
+    job_obj = None
     with _pretrain_jobs_lock:
-        _pretrain_jobs[job_id] = {
+        job_obj = {
             "job_id": job_id,
             "status": "queued",
             "progress": 0.0,
@@ -266,6 +353,12 @@ async def create_pretrain_job(req: PretrainRequest):
             "created_at": now,
             "updated_at": now,
         }
+        _pretrain_jobs[job_id] = job_obj
+
+    try:
+        storage.upsert_pretrain_job(dict(job_obj))
+    except Exception:
+        pass
 
     def run_job():
         try:
@@ -375,34 +468,126 @@ async def create_pretrain_job(req: PretrainRequest):
             _purge_pretrain_jobs()
             gc.collect()
 
-    t = threading.Thread(target=run_job, daemon=True)
-    t.start()
+    _enqueue_task("pretrain_job", job_id, run_job)
     return {"job_id": job_id}
 
 @app.get("/api/pretrain_jobs/{job_id}")
 async def get_pretrain_job(job_id: str):
     with _pretrain_jobs_lock:
         job = _pretrain_jobs.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="job not found")
-        return job
+        if job:
+            return job
+    job = None
+    try:
+        job = storage.get_pretrain_job(job_id)
+    except Exception:
+        job = None
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
 
 @app.get("/api/pretrain_jobs")
-async def list_pretrain_jobs(limit: int = 200):
+async def list_pretrain_jobs(page: Optional[int] = None, page_size: int = 50, limit: int = 200):
+    if page is None:
+        try:
+            return storage.list_pretrain_jobs(limit=int(limit), include_success=False)
+        except Exception:
+            return {"items": []}
+    try:
+        return storage.list_pretrain_jobs(page=int(page), page_size=int(page_size), include_success=False)
+    except Exception:
+        return {"items": [], "total": 0, "page": int(page or 1), "page_size": int(page_size or 50)}
+
+@app.delete("/api/pretrain_jobs/{job_id}")
+async def delete_pretrain_job(job_id: str):
+    removed_mem = False
+    job = None
     with _pretrain_jobs_lock:
-        jobs = list(_pretrain_jobs.values())
-    def sort_key(j):
-        return j.get("updated_at", "") or ""
-    jobs.sort(key=sort_key, reverse=True)
-    return {"items": jobs[: int(limit)]}
+        job = _pretrain_jobs.get(job_id)
+    st = str(job.get("status")) if isinstance(job, dict) else ""
+    if st in ("running",):
+        raise HTTPException(status_code=409, detail="job is running")
+    if st in ("queued",):
+        if not _cancel_task_if_queued("pretrain_job", job_id):
+            raise HTTPException(status_code=409, detail="job is running")
+    else:
+        _cancel_task_if_queued("pretrain_job", job_id)
+
+    with _pretrain_jobs_lock:
+        if job_id in _pretrain_jobs:
+            _pretrain_jobs.pop(job_id, None)
+            removed_mem = True
+
+    deleted_db = False
+    try:
+        deleted_db = bool(storage.delete_pretrain_job(job_id))
+    except Exception:
+        deleted_db = False
+    if not removed_mem and not deleted_db:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {"status": "success", "job_id": job_id, "deleted_db": deleted_db}
+
+class BatchDeletePretrainJobsRequest(BaseModel):
+    job_ids: List[str] = []
+
+@app.post("/api/pretrain_jobs/batch_delete")
+async def batch_delete_pretrain_jobs(req: BatchDeletePretrainJobsRequest):
+    raw = [] if req is None else (req.job_ids or [])
+    job_ids = []
+    seen = set()
+    for x in raw:
+        jid = str(x or "").strip()
+        if not jid or jid in seen:
+            continue
+        seen.add(jid)
+        job_ids.append(jid)
+
+    deleted = []
+    failed = []
+    for jid in job_ids:
+        j = None
+        with _pretrain_jobs_lock:
+            j = _pretrain_jobs.get(jid)
+        st = str(j.get("status")) if isinstance(j, dict) else ""
+        if st in ("running",):
+            failed.append({"job_id": jid, "reason": "running"})
+            continue
+        if st in ("queued",):
+            if not _cancel_task_if_queued("pretrain_job", jid):
+                failed.append({"job_id": jid, "reason": "running"})
+                continue
+        else:
+            _cancel_task_if_queued("pretrain_job", jid)
+
+        with _pretrain_jobs_lock:
+            if jid in _pretrain_jobs:
+                _pretrain_jobs.pop(jid, None)
+
+        ok = False
+        try:
+            ok = bool(storage.delete_pretrain_job(jid))
+        except Exception:
+            ok = False
+        if ok:
+            deleted.append(jid)
+        else:
+            failed.append({"job_id": jid, "reason": "not_found"})
+    return {"status": "success", "deleted": deleted, "failed": failed}
 
 @app.get("/api/pretrained_models")
 async def list_pretrained_models(page: Optional[int] = None, page_size: int = 20, limit: int = 200):
     if page is None:
-        items = list_pretrained_model_metas(limit=int(limit))
-        keys = [str(m.get("key") or "").strip() for m in items if isinstance(m, dict)]
-        name_map = storage.get_pretrained_model_names_by_keys(keys)
-        items = [_attach_pretrained_display_name(m, name_map.get(str(m.get("key")))) for m in items]
+        lim = int(limit)
+        if lim < 1:
+            lim = 1
+        if lim > 200:
+            lim = 200
+        data = storage.get_pretrained_models(page=1, page_size=lim)
+        items = []
+        for it in data.get("items") or []:
+            meta = dict(it)
+            meta["meta"] = {}
+            items.append(_attach_pretrained_display_name(meta, it.get("name")))
         return {"items": items}
 
     p = int(page)
@@ -414,43 +599,95 @@ async def list_pretrained_models(page: Optional[int] = None, page_size: int = 20
     if ps > 200:
         ps = 200
 
-    all_items = list_pretrained_model_metas(limit=None)
-    total = len(all_items)
-    start = (p - 1) * ps
-    end = start + ps
-    items = all_items[start:end]
-    keys = [str(m.get("key") or "").strip() for m in items if isinstance(m, dict)]
-    name_map = storage.get_pretrained_model_names_by_keys(keys)
-    items = [_attach_pretrained_display_name(m, name_map.get(str(m.get("key")))) for m in items]
-    return {"items": items, "total": total, "page": p, "page_size": ps}
+    data = storage.get_pretrained_models(page=p, page_size=ps)
+    items = []
+    for it in data.get("items") or []:
+        meta = dict(it)
+        meta["meta"] = {}
+        items.append(_attach_pretrained_display_name(meta, it.get("name")))
+    return {"items": items, "total": int(data.get("total") or 0), "page": p, "page_size": ps}
+
+class BatchDeletePretrainedModelsRequest(BaseModel):
+    keys: List[str] = []
+
+@app.post("/api/pretrained_models/batch_delete")
+async def batch_delete_pretrained_models(req: BatchDeletePretrainedModelsRequest):
+    raw = [] if req is None else (req.keys or [])
+    keys = []
+    seen = set()
+    for x in raw:
+        k = str(x or "").strip()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        keys.append(k)
+
+    deleted = []
+    failed = []
+    for k in keys:
+        deleted_files = None
+        try:
+            deleted_files = delete_pretrained_model_bundle_by_key(k)
+        except Exception:
+            deleted_files = {"status": "error", "key": str(k or "")}
+
+        deleted_db = False
+        try:
+            deleted_db = bool(storage.delete_pretrained_model(k))
+        except Exception:
+            deleted_db = False
+
+        if (deleted_files or {}).get("status") == "not_found" and not deleted_db:
+            failed.append({"key": k, "reason": "not_found"})
+        else:
+            deleted.append({"key": k, "deleted_files": deleted_files, "deleted_db": deleted_db})
+    return {"status": "success", "deleted": deleted, "failed": failed}
 
 @app.get("/api/pretrained_models/{key}")
 async def get_pretrained_model_detail(key: str):
     meta = get_pretrained_model_detail_by_key(key)
-    if not meta:
-        raise HTTPException(status_code=404, detail="model not found")
-    m = meta.get("meta", {}) or {}
-    per_code = m.get("per_code_sample_count", {}) or {}
-    sample_count = m.get("sample_count", None)
-    if sample_count is None:
-        try:
-            sample_count = int(sum([int(v) for v in per_code.values()]))
-        except Exception:
-            sample_count = 0
-    result = {
-        "status": "success",
-        "bundle_path": meta.get("bundle_path"),
-        "model_type": meta.get("model_type"),
-        "frequency": meta.get("frequency"),
-        "data_src": meta.get("data_src"),
-        "feature_count": meta.get("feature_count", 0),
-        "sample_count": sample_count,
-        "accuracy": m.get("accuracy"),
-        "codes": m.get("codes", []),
-        "per_code_sample_count": per_code,
-        "trained_at": meta.get("trained_at"),
-        "begin_time": m.get("begin_time"),
-    }
+    if meta:
+        m = meta.get("meta", {}) or {}
+        per_code = m.get("per_code_sample_count", {}) or {}
+        sample_count = m.get("sample_count", None)
+        if sample_count is None:
+            try:
+                sample_count = int(sum([int(v) for v in per_code.values()]))
+            except Exception:
+                sample_count = 0
+        result = {
+            "status": "success",
+            "bundle_path": meta.get("bundle_path"),
+            "model_type": meta.get("model_type"),
+            "frequency": meta.get("frequency"),
+            "data_src": meta.get("data_src"),
+            "feature_count": meta.get("feature_count", 0),
+            "sample_count": sample_count,
+            "accuracy": m.get("accuracy"),
+            "codes": m.get("codes", []),
+            "per_code_sample_count": per_code,
+            "trained_at": meta.get("trained_at"),
+            "begin_time": m.get("begin_time"),
+        }
+    else:
+        db = storage.get_pretrained_model_by_key(key)
+        if not db:
+            raise HTTPException(status_code=404, detail="model not found")
+        result = {
+            "status": "success",
+            "bundle_path": db.get("bundle_path"),
+            "model_type": db.get("model_type"),
+            "frequency": db.get("frequency"),
+            "data_src": db.get("data_src"),
+            "feature_count": db.get("feature_count") or 0,
+            "sample_count": db.get("sample_count") or 0,
+            "accuracy": db.get("accuracy"),
+            "codes": [],
+            "per_code_sample_count": {},
+            "trained_at": db.get("trained_at"),
+            "begin_time": None,
+        }
+
     name_map = storage.get_pretrained_model_names_by_keys([key])
     result["name"] = name_map.get(key)
     result["display_name"] = (str(result["name"]).strip() if result.get("name") else "") or _auto_pretrained_model_name(
@@ -464,7 +701,9 @@ async def get_pretrained_model_detail(key: str):
 async def update_pretrained_model_name(key: str, req: UpdatePretrainedModelNameRequest):
     meta = get_pretrained_model_detail_by_key(key)
     if not meta:
-        raise HTTPException(status_code=404, detail="model not found")
+        db = storage.get_pretrained_model_by_key(key)
+        if not db:
+            raise HTTPException(status_code=404, detail="model not found")
     raw = None if req is None else req.name
     name = None
     if raw is not None:
@@ -476,8 +715,28 @@ async def update_pretrained_model_name(key: str, req: UpdatePretrainedModelNameR
     ok = storage.set_pretrained_model_name(key, name)
     if not ok:
         raise HTTPException(status_code=500, detail="failed to update name")
-    display_name = name or _auto_pretrained_model_name(meta.get("model_type"), meta.get("frequency"), meta.get("trained_at"))
+    base = meta or storage.get_pretrained_model_by_key(key) or {}
+    display_name = name or _auto_pretrained_model_name(base.get("model_type"), base.get("frequency"), base.get("trained_at"))
     return {"status": "success", "key": key, "name": name, "display_name": display_name}
+
+@app.delete("/api/pretrained_models/{key}")
+async def delete_pretrained_model(key: str):
+    deleted_files = None
+    try:
+        deleted_files = delete_pretrained_model_bundle_by_key(key)
+    except Exception:
+        deleted_files = {"status": "error", "key": str(key or "")}
+
+    deleted_db = False
+    try:
+        deleted_db = bool(storage.delete_pretrained_model(key))
+    except Exception:
+        deleted_db = False
+
+    if (deleted_files or {}).get("status") == "not_found" and not deleted_db:
+        raise HTTPException(status_code=404, detail="model not found")
+
+    return {"status": "success", "key": str(key or ""), "deleted_files": deleted_files, "deleted_db": deleted_db}
 
 @app.get("/api/history")
 async def get_history(code: Optional[str] = None, page: int = 1, page_size: int = 10):
@@ -583,6 +842,8 @@ async def analyze_stock(req: AnalyzeRequest):
             params["pretrained_model_key"] = req.pretrained_model_key
         if req.blend_models is not None:
             params["blend_models"] = req.blend_models
+        
+        params["enable_rolling_lookback"] = req.enable_rolling_lookback
 
         if not bool(req.blend_models):
             params["use_pretrained"] = False
@@ -637,7 +898,8 @@ async def analyze_stock(req: AnalyzeRequest):
             data_src, 
             preloaded_data=kl_list, 
             do_predict=req.do_predict,
-            begin_time=begin_time
+            begin_time=begin_time,
+            enable_rolling_lookback=req.enable_rolling_lookback
         )
         
         if not chan or not last_snapshot:
@@ -935,6 +1197,154 @@ async def download_data(code: str, frequency: str = "1d"):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+class StrategyRequest(BaseModel):
+    strategy_name: str
+    scope: str = "hs300"
+    pool_id: Optional[str] = None
+    model: str = "xgboost"
+    min_accuracy: float = 0.8
+    frequency: str = "1d"
+    data_length_years: float = 1.0
+    chan_config: Optional[Dict[str, Any]] = None
+    require_signal: bool = False
+    signal_lookback: int = 5
+    signal_direction: str = "buy"  # buy, sell, both
+    enable_rolling_lookback: bool = True # Enable/Disable long-term context features (250-bar lookback)
+
+class StrategyRunsBatchDeleteRequest(BaseModel):
+    run_ids: List[int] = []
+
+@app.post("/api/strategy/run")
+async def run_strategy(req: StrategyRequest):
+    try:
+        params = req.dict()
+        session = storage.Session()
+        run = StrategyRun(
+            strategy_name=req.strategy_name,
+            params_json=json.dumps(params),
+            status="pending",
+            progress=0
+        )
+        session.add(run)
+        session.commit()
+        run_id = run.id
+        session.close()
+
+        _enqueue_task("strategy_run", str(run_id), lambda: strategy_runner.run_strategy_sync(run_id, params))
+        
+        return {"status": "success", "run_id": run_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/strategy/runs")
+async def list_strategy_runs(page: int = 1, page_size: int = 20, limit: Optional[int] = None):
+    if limit is not None:
+        session = storage.Session()
+        try:
+            runs = session.query(StrategyRun).order_by(StrategyRun.created_at.desc()).limit(limit).all()
+            return [
+                {
+                    "id": r.id,
+                    "strategy_name": r.strategy_name,
+                    "status": r.status,
+                    "progress": r.progress,
+                    "created_at": _dt_to_utc_iso(r.created_at),
+                    "completed_at": _dt_to_utc_iso(r.completed_at),
+                    "total": r.total_stocks,
+                    "processed": r.processed_stocks,
+                    "result_count": int(getattr(r, "result_count", 0) or 0),
+                }
+                for r in runs
+            ]
+        finally:
+            session.close()
+
+    return storage.list_strategy_runs(page=page, page_size=page_size)
+
+@app.post("/api/strategy/runs/batch_delete")
+async def batch_delete_strategy_runs(req: StrategyRunsBatchDeleteRequest):
+    ids = []
+    for x in (req.run_ids or []):
+        try:
+            ids.append(int(x))
+        except Exception:
+            continue
+    ids = list(dict.fromkeys(ids))
+    if not ids:
+        return {"deleted": [], "failed": []}
+
+    failed = []
+    cancellable = []
+    session = storage.Session()
+    try:
+        for rid in ids:
+            run = session.query(StrategyRun).filter(StrategyRun.id == rid).first()
+            if not run:
+                failed.append({"run_id": rid, "reason": "not_found"})
+                continue
+            st = str(run.status or "")
+            if st in ["running", "pending"]:
+                failed.append({"run_id": rid, "reason": "running"})
+                continue
+            if st == "queued":
+                if not _cancel_task_if_queued("strategy_run", str(rid)):
+                    failed.append({"run_id": rid, "reason": "running"})
+                    continue
+            cancellable.append(rid)
+    finally:
+        session.close()
+
+    res = storage.batch_delete_strategy_runs(cancellable)
+    merged_failed = (res.get("failed") or []) + failed
+    return {"deleted": res.get("deleted") or [], "failed": merged_failed}
+
+@app.delete("/api/strategy/runs/{run_id}")
+async def delete_strategy_run(run_id: int):
+    rid = int(run_id)
+    session = storage.Session()
+    try:
+        run = session.query(StrategyRun).filter(StrategyRun.id == rid).first()
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        st = str(run.status or "")
+        if st in ["running", "pending"]:
+            raise HTTPException(status_code=409, detail="run is running")
+        if st == "queued":
+            if not _cancel_task_if_queued("strategy_run", str(rid)):
+                raise HTTPException(status_code=409, detail="run is running")
+    finally:
+        session.close()
+    return storage.delete_strategy_run(rid)
+
+@app.get("/api/strategy/runs/{run_id}")
+async def get_strategy_run(run_id: int):
+    session = storage.Session()
+    try:
+        run = session.query(StrategyRun).filter(StrategyRun.id == run_id).first()
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        
+        result = []
+        if run.result_json:
+            try:
+                result = json.loads(run.result_json)
+            except:
+                pass
+                
+        return {
+            "id": run.id,
+            "strategy_name": run.strategy_name,
+            "status": run.status,
+            "progress": run.progress,
+            "params": json.loads(run.params_json) if run.params_json else {},
+            "results": result,
+            "result_count": int(getattr(run, "result_count", 0) or 0),
+            "created_at": _dt_to_utc_iso(run.created_at),
+            "completed_at": _dt_to_utc_iso(run.completed_at)
+        }
+    finally:
+        session.close()
 
 # Mount static files if "static" directory exists (For Production/Deployment)
 static_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")

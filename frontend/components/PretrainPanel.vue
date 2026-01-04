@@ -1,105 +1,8 @@
 <template>
   <div class="h-full flex flex-col">
-    <div class="p-2 border-b border-gray-100 dark:border-gray-800 flex justify-between items-center bg-gray-50 dark:bg-gray-900">
-      <h3 class="text-base font-bold text-gray-700 dark:text-gray-200 m-0">{{ t('pretrain.title') }}</h3>
-      <div class="flex items-center gap-2">
-        <UButton size="sm" color="primary" :loading="loading" @click="runPretrain">
-          {{ t('pretrain.run') }}
-        </UButton>
-      </div>
-    </div>
-
-    <div class="flex-1 overflow-auto p-3">
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
-        <UCard :ui="{ body: { padding: 'p-3' } }" class="shadow-none border border-gray-200 dark:border-gray-800">
-          <div class="space-y-4">
-            <div>
-              <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('pretrain.stockPool') }}</div>
-              <div class="flex flex-col sm:flex-row gap-2">
-                <USelectMenu
-                  v-model="selectedPoolId"
-                  :options="poolOptions"
-                  value-attribute="value"
-                  option-attribute="label"
-                  size="sm"
-                  class="flex-1"
-                  :disabled="dataSrc !== 'clickhouse' || poolsLoading"
-                  :placeholder="dataSrc !== 'clickhouse' ? t('pretrain.poolClickhouseOnly') : t('pretrain.poolPlaceholder')"
-                />
-                <UButton
-                  size="sm"
-                  color="gray"
-                  :loading="poolMembersLoading"
-                  :disabled="dataSrc !== 'clickhouse' || !selectedPoolId"
-                  @click="fillCodesFromPool"
-                >
-                  {{ t('pretrain.loadPool') }}
-                </UButton>
-              </div>
-              <div class="mt-2 flex items-center justify-between gap-2">
-                <UCheckbox v-model="overwriteCodes" :label="t('pretrain.overwriteCodes')" />
-                <div class="text-xs text-gray-500">
-                  <span v-if="poolsLoading">{{ t('pretrain.loadingPools') }}</span>
-                  <span v-else-if="poolMetaLabel">{{ poolMetaLabel }}</span>
-                </div>
-              </div>
-            </div>
-
-            <div>
-              <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('pretrain.codes') }}</div>
-              <textarea
-                v-model="codesText"
-                class="w-full min-h-[120px] rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 p-2 text-sm text-gray-800 dark:text-gray-200 outline-none focus:ring-2 focus:ring-blue-500/40"
-                :placeholder="t('pretrain.codesPlaceholder')"
-              />
-              <div class="mt-1 text-xs text-gray-500">{{ t('pretrain.codesHint') }}</div>
-            </div>
-
-            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div>
-                <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('pretrain.frequency') }}</div>
-                <USelectMenu v-model="frequency" :options="frequencyOptions" value-attribute="value" option-attribute="label" size="sm" />
-              </div>
-              <div>
-                <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('pretrain.model') }}</div>
-                <USelectMenu v-model="model" :options="modelOptions" value-attribute="value" option-attribute="label" size="sm" />
-              </div>
-            </div>
-
-            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div>
-                <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('pretrain.dataSrc') }}</div>
-                <USelectMenu v-model="dataSrc" :options="dataSrcOptions" value-attribute="value" option-attribute="label" size="sm" />
-              </div>
-              <div>
-                <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('pretrain.dataLength') }}</div>
-                <div class="flex items-center gap-2">
-                  <USelectMenu v-model="dataLengthMode" :options="dataLengthModeOptions" value-attribute="value" option-attribute="label" size="sm" class="w-40" />
-                  <UInput
-                    v-model="dataLengthYears"
-                    type="number"
-                    step="0.1"
-                    min="0.1"
-                    placeholder="5.0"
-                    size="sm"
-                    class="flex-1"
-                    :disabled="dataLengthMode !== 'years'"
-                  />
-                </div>
-              </div>
-            </div>
-
-            <div class="flex items-center justify-between gap-2">
-              <UCheckbox v-model="forceRefresh" :label="t('pretrain.forceRefresh')" />
-            </div>
-
-            <div class="text-xs text-gray-500">
-              {{ t('pretrain.note') }}
-            </div>
-          </div>
-        </UCard>
-
-        <UCard :ui="{ body: { padding: 'p-3' } }" class="shadow-none border border-gray-200 dark:border-gray-800 flex flex-col min-h-0">
+    <div class="flex-1 min-h-0 p-3 flex flex-col">
+      <div class="grid grid-cols-1 gap-3 h-full">
+        <UCard :ui="{ body: { base: 'flex-1 min-h-0 flex flex-col', padding: 'p-3' } }" class="shadow-none border border-gray-200 dark:border-gray-800 flex flex-col min-h-0 h-full">
           <div class="flex items-center justify-between gap-2">
             <div class="flex items-center gap-2 min-w-0">
               <UButton
@@ -115,19 +18,52 @@
                 {{ selectedJob ? t('pretrain.detailTitle') : t('pretrain.listTitle') }}
               </div>
             </div>
-            <UButton v-if="!selectedJob" size="xs" color="gray" :loading="listLoading" @click="refreshLists">
-              {{ t('pretrain.refreshList') }}
-            </UButton>
+            <div v-if="!selectedJob" class="flex items-center gap-2">
+              <span v-if="selectedCount > 0" class="text-xs text-gray-500">
+                {{ t('pretrain.selectedCount').replace('{n}', String(selectedCount)) }}
+              </span>
+              <UButton
+                size="xs"
+                color="red"
+                variant="soft"
+                :disabled="selectedCount <= 0"
+                :loading="batchDeleting"
+                @click="batchDelete"
+              >
+                {{ t('pretrain.batchDelete') }}
+              </UButton>
+              <UButton size="xs" color="gray" :loading="listLoading" @click="refreshLists">
+                {{ t('pretrain.refreshList') }}
+              </UButton>
+            </div>
           </div>
 
-          <div v-if="!selectedJob" class="mt-2">
-            <UTable
+          <div v-if="!selectedJob" class="mt-2 flex-1 min-h-0 flex flex-col">
+            <div class="flex-1 min-h-0 overflow-auto">
+              <UTable
               :rows="listRows"
               :columns="listColumns"
               :loading="listLoading"
               class="w-full"
               :ui="{ th: { base: 'whitespace-nowrap', padding: 'px-3 py-2' }, td: { padding: 'px-3 py-2' } }"
             >
+              <template #select-header>
+                <UCheckbox
+                  :model-value="allVisibleSelected"
+                  :disabled="selectableRowKeys.length === 0"
+                  @update:model-value="toggleSelectAllVisible"
+                />
+              </template>
+
+              <template #select-data="{ row }">
+                <UCheckbox
+                  :model-value="isSelected(row)"
+                  :disabled="!isRowDeletable(row)"
+                  @click.stop
+                  @update:model-value="(v) => setSelected(row, v)"
+                />
+              </template>
+
               <template #combined-data="{ row }">
                 <div class="flex items-center justify-left min-w-[40px]">
                   <div
@@ -213,9 +149,20 @@
                 >
                   {{ t('pretrain.rename') }}
                 </UButton>
+                <UButton
+                  size="xs"
+                  variant="link"
+                  color="red"
+                  :loading="deleteLoadingKey === rowKey(row)"
+                  :disabled="row.kind === 'job' && row.status === 'running'"
+                  @click="deleteItem(row, $event)"
+                >
+                  {{ t('pretrain.delete') }}
+                </UButton>
               </template>
             </UTable>
-            <div v-if="modelsTotalPages > 1" class="mt-2 flex items-center justify-end gap-2">
+            </div>
+            <div v-if="modelsTotalPages > 1" class="mt-2 flex items-center justify-end gap-2 shrink-0">
               <span class="text-xs text-gray-500">
                 {{
                   t('pretrain.pageInfo')
@@ -229,10 +176,27 @@
                 color="gray"
                 variant="soft"
                 :disabled="modelsPage <= 1"
+                @click="changeModelsPage(1)"
+              >
+                &lt;&lt;
+              </UButton>
+              <UButton
+                size="xs"
+                color="gray"
+                variant="soft"
+                :disabled="modelsPage <= 1"
                 @click="changeModelsPage(modelsPage - 1)"
               >
                 {{ t('pretrain.prevPage') }}
               </UButton>
+              <div class="flex items-center gap-1">
+                <UInput
+                  v-model="modelsPageInput"
+                  size="xs"
+                  class="w-12 text-center"
+                  @keydown.enter="jumpToModelsPage"
+                />
+              </div>
               <UButton
                 size="xs"
                 color="gray"
@@ -242,10 +206,19 @@
               >
                 {{ t('pretrain.nextPage') }}
               </UButton>
+              <UButton
+                size="xs"
+                color="gray"
+                variant="soft"
+                :disabled="modelsPage >= modelsTotalPages"
+                @click="changeModelsPage(modelsTotalPages)"
+              >
+                &gt;&gt;
+              </UButton>
             </div>
           </div>
 
-          <div v-else class="mt-3 border-t border-gray-100 dark:border-gray-800 pt-3 flex-1 min-h-0 overflow-auto">
+          <div v-else class="mt-3 border-t border-gray-100 dark:border-gray-800 pt-3 flex-1 min-h-0 flex flex-col">
             <div
               v-if="selectedJob && (selectedJob.status === 'running' || selectedJob.status === 'queued') && progressPct(selectedJob) < 100"
               class="flex items-start justify-between gap-3"
@@ -335,14 +308,65 @@
                 </div>
               </div>
 
-              <div v-if="detailResult.status === 'success' && perCodeRows.length" class="border-t border-gray-100 dark:border-gray-800 pt-3">
-                <div class="font-medium text-gray-700 dark:text-gray-300 mb-2 text-sm">{{ t('pretrain.perCodeSamples') }}</div>
-                <UTable
-                  :rows="perCodeRows"
+              <div v-if="detailResult.status === 'success' && perCodeRows.length" class="border-t border-gray-100 dark:border-gray-800 pt-3 flex-1 min-h-0 flex flex-col">
+                <div class="font-medium text-gray-700 dark:text-gray-300 mb-2 text-sm shrink-0">{{ t('pretrain.perCodeSamples') }}</div>
+                <div class="flex-1 min-h-0 overflow-auto">
+                  <UTable
+                  :rows="paginatedPerCodeRows"
                   :columns="perCodeColumns"
                   class="w-full"
                   :ui="{ th: { base: 'whitespace-nowrap', padding: 'px-3 py-2' }, td: { padding: 'px-3 py-2' } }"
                 />
+                </div>
+                <div v-if="detailTotalPages > 1" class="mt-2 flex items-center justify-end gap-2 border-t border-gray-100 dark:border-gray-800 pt-2 shrink-0">
+                  <span class="text-xs text-gray-500">
+                    {{ t('pretrain.pageInfo', { page: detailPage, pages: detailTotalPages, total: perCodeRows.length }) }}
+                  </span>
+                  <UButton
+                    size="xs"
+                    color="gray"
+                    variant="soft"
+                    :disabled="detailPage <= 1"
+                    @click="detailPage = 1"
+                  >
+                    &lt;&lt;
+                  </UButton>
+                  <UButton
+                    size="xs"
+                    color="gray"
+                    variant="soft"
+                    :disabled="detailPage <= 1"
+                    @click="detailPage = Math.max(1, detailPage - 1)"
+                  >
+                    {{ t('pretrain.prevPage') }}
+                  </UButton>
+                  <div class="flex items-center gap-1">
+                    <UInput
+                      v-model="detailPageInput"
+                      size="xs"
+                      class="w-12 text-center"
+                      @keydown.enter="jumpToDetailPage"
+                    />
+                  </div>
+                  <UButton
+                    size="xs"
+                    color="gray"
+                    variant="soft"
+                    :disabled="detailPage >= detailTotalPages"
+                    @click="detailPage = Math.min(detailTotalPages, detailPage + 1)"
+                  >
+                    {{ t('pretrain.nextPage') }}
+                  </UButton>
+                  <UButton
+                    size="xs"
+                    color="gray"
+                    variant="soft"
+                    :disabled="detailPage >= detailTotalPages"
+                    @click="detailPage = detailTotalPages"
+                  >
+                    &gt;&gt;
+                  </UButton>
+                </div>
               </div>
             </div>
 
@@ -378,8 +402,18 @@ import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import axios from 'axios'
 import { useI18n } from '../composables/useI18n'
 
-const { t } = useI18n()
+const { t, formatTime } = useI18n()
 const toast = useToast()
+
+const formatAxiosError = (e) => {
+  const detail = e?.response?.data?.detail
+  if (detail) return String(detail)
+  const msg = String(e?.message || '')
+  if (!e?.response && (e?.code === 'ERR_NETWORK' || msg.toLowerCase().includes('network'))) {
+    return t('app.networkError')
+  }
+  return msg
+}
 
 const props = defineProps({
   defaultDataSrc: {
@@ -389,6 +423,10 @@ const props = defineProps({
   defaultModel: {
     type: String,
     default: 'xgboost'
+  },
+  config: {
+    type: Object,
+    default: () => ({})
   }
 })
 
@@ -400,32 +438,24 @@ let jobPollTimer = null
 let listPollTimer = null
 let lastModelsFetchAt = 0
 
-const codesText = ref('')
-const frequency = ref('1d')
-const dataSrc = ref(props.defaultDataSrc || 'clickhouse')
-const model = ref(props.defaultModel || 'xgboost')
-
-const dataLengthMode = ref('years')
-const dataLengthYears = ref(5.0)
-
-const poolsLoading = ref(false)
-const poolMembersLoading = ref(false)
-const pools = ref([])
-const selectedPoolId = ref('')
-const overwriteCodes = ref(true)
-const forceRefresh = ref(false)
-
 const listLoading = ref(false)
 const jobItems = ref([])
 const modelItems = ref([])
 const modelsPage = ref(1)
 const modelsPageSize = ref(20)
 const modelsTotal = ref(0)
+const detailPage = ref(1)
+const detailPageSize = ref(20)
+const modelsPageInput = ref('')
+const detailPageInput = ref('')
 
 const renameOpen = ref(false)
 const renameSaving = ref(false)
 const renameKey = ref('')
 const renameValue = ref('')
+const deleteLoadingKey = ref('')
+const batchDeleting = ref(false)
+const selectedRowKeys = ref([])
 
 const modelsTotalPages = computed(() => {
   const ps = Number(modelsPageSize.value || 20)
@@ -438,70 +468,10 @@ const modelsTotalPages = computed(() => {
 const selectedJob = ref(null)
 const detailResult = ref(null)
 
-if (typeof window !== 'undefined') {
-  const saved = localStorage.getItem('pretrain.codesText')
-  if (saved) codesText.value = saved
-}
-
-watch(codesText, (v) => {
-  if (typeof window === 'undefined') return
-  localStorage.setItem('pretrain.codesText', v || '')
-})
-
-const frequencyOptions = computed(() => [
-  { label: t('periods.1d'), value: '1d' },
-  { label: t('periods.1w'), value: '1w' },
-  { label: t('periods.1mo'), value: '1mo' },
-  { label: t('periods.60m'), value: '60m' },
-  { label: t('periods.30m'), value: '30m' },
-  { label: t('periods.15m'), value: '15m' },
-  { label: t('periods.5m'), value: '5m' },
-  { label: t('periods.1m'), value: '1m' }
-])
-
-const dataSrcOptions = computed(() => [
-  { label: t('app.dataSrcOptions.clickhouse'), value: 'clickhouse' },
-  { label: t('app.dataSrcOptions.baostock'), value: 'baostock' },
-  { label: t('app.dataSrcOptions.akshare'), value: 'akshare' }
-])
-
-const modelOptions = computed(() => [
-  { label: t('app.modelOptions.xgboost'), value: 'xgboost' },
-  { label: t('app.modelOptions.lightgbm'), value: 'lightgbm' },
-  { label: t('app.modelOptions.mlp'), value: 'mlp' }
-])
-
-const dataLengthModeOptions = computed(() => [
-  { label: t('pretrain.dataLengthMax'), value: 'max' },
-  { label: t('pretrain.dataLengthYears'), value: 'years' }
-])
-
-const poolOptions = computed(() =>
-  (pools.value || [])
-    .slice()
-    .sort((a, b) => {
-      const an = Number(a?.stock_count || 0)
-      const bn = Number(b?.stock_count || 0)
-      if (an !== bn) return an - bn
-      const al = String(a?.pool_name || a?.pool_id || '')
-      const bl = String(b?.pool_name || b?.pool_id || '')
-      return al.localeCompare(bl)
-    })
-    .map((p) => ({
-      value: p.pool_id,
-      label: p.stock_count ? `${p.pool_name} (${p.stock_count})` : String(p.pool_name || p.pool_id)
-    }))
-)
-
-const poolMetaLabel = computed(() => {
-  if (dataSrc.value !== 'clickhouse') return ''
-  const n = (pools.value || []).length
-  if (!n) return t('pretrain.noPools')
-  return t('pretrain.poolCount').replace('{n}', String(n))
-})
+const selectedCount = computed(() => (selectedRowKeys.value || []).length)
 
 const codes = computed(() => {
-  const raw = (codesText.value || '').trim()
+  const raw = (props.config.codesText || '').trim()
   if (!raw) return []
   return raw
     .split(/[\s,，;；]+/g)
@@ -509,11 +479,28 @@ const codes = computed(() => {
     .filter(Boolean)
 })
 
+
+
 const perCodeRows = computed(() => {
   const map = detailResult.value?.per_code_sample_count || {}
   return Object.keys(map)
     .sort()
     .map((code) => ({ code, samples: map[code] }))
+})
+
+const detailTotalPages = computed(() => {
+  const t = perCodeRows.value?.length || 0
+  const ps = Number(detailPageSize.value || 20)
+  const p = Math.ceil(t / Math.max(1, ps))
+  return Math.max(1, p || 1)
+})
+
+const paginatedPerCodeRows = computed(() => {
+  const all = perCodeRows.value || []
+  const ps = Number(detailPageSize.value || 20)
+  const p = Math.max(1, detailPage.value)
+  const start = (p - 1) * ps
+  return all.slice(start, start + ps)
 })
 
 const perCodeColumns = computed(() => [
@@ -559,15 +546,6 @@ const circleOffset = (pct) => {
   return circleCirc * (1 - clamped / 100)
 }
 
-const formatTime = (iso) => {
-  const raw = String(iso || '')
-  if (!raw) return ''
-  const d = new Date(raw)
-  if (Number.isNaN(d.getTime())) return raw
-  const pad2 = (n) => String(n).padStart(2, '0')
-  return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`
-}
-
 const dataLengthShort = (row) => {
   const y = row?.data_length_years
   if (y !== null && y !== undefined && y !== '') {
@@ -581,79 +559,9 @@ const dataLengthShort = (row) => {
   return ''
 }
 
-const fetchPools = async () => {
-  if (dataSrc.value !== 'clickhouse') return
-  poolsLoading.value = true
-  try {
-    const res = await axios.get('/api/stock_pools')
-    const items = res.data?.items || []
-    pools.value = Array.isArray(items) ? items : []
-  } catch (e) {
-    console.error(e)
-    pools.value = []
-  } finally {
-    poolsLoading.value = false
-  }
-}
 
-watch(
-  [poolOptions, dataSrc],
-  () => {
-    if (dataSrc.value !== 'clickhouse') return
-    const opts = poolOptions.value || []
-    if (!opts.length) return
-    const cur = selectedPoolId.value
-    if (cur && opts.some((o) => o?.value === cur)) return
-    selectedPoolId.value = opts[0].value
-  },
-  { immediate: true }
-)
-
-const fillCodesFromPool = async () => {
-  if (dataSrc.value !== 'clickhouse' || !selectedPoolId.value) return
-  poolMembersLoading.value = true
-  try {
-    const res = await axios.get(`/api/stock_pools/${encodeURIComponent(selectedPoolId.value)}/members`, {
-      params: { limit: 10000 }
-    })
-    const codesFromPool = res.data?.codes || []
-    if (!Array.isArray(codesFromPool) || codesFromPool.length === 0) {
-      toast.add({ title: t('pretrain.poolEmpty'), color: 'orange' })
-      return
-    }
-
-    if (overwriteCodes.value) {
-      codesText.value = codesFromPool.join('\n')
-    } else {
-      const cur = new Set(codes.value)
-      for (const c of codesFromPool) cur.add(c)
-      codesText.value = Array.from(cur).join('\n')
-    }
-    toast.add({ title: t('pretrain.poolLoaded').replace('{n}', String(codesFromPool.length)), color: 'green' })
-  } catch (e) {
-    console.error(e)
-    const detail = e?.response?.data?.detail || e?.message || ''
-    toast.add({ title: t('pretrain.failed'), description: detail, color: 'red' })
-  } finally {
-    poolMembersLoading.value = false
-  }
-}
-
-watch(
-  () => dataSrc.value,
-  (v) => {
-    if (v !== 'clickhouse') {
-      pools.value = []
-      selectedPoolId.value = ''
-      return
-    }
-    fetchPools()
-  },
-  { immediate: true }
-)
 
 onMounted(() => {
-  fetchPools()
   refreshLists()
   listPollTimer = setInterval(() => {
     refreshLists({ quiet: true })
@@ -727,6 +635,22 @@ const changeModelsPage = async (nextPage) => {
   await refreshLists({ quiet: true, forceModels: true })
 }
 
+const jumpToModelsPage = () => {
+  const p = parseInt(modelsPageInput.value)
+  if (Number.isFinite(p) && p >= 1 && p <= modelsTotalPages.value) {
+    changeModelsPage(p)
+    modelsPageInput.value = ''
+  }
+}
+
+const jumpToDetailPage = () => {
+  const p = parseInt(detailPageInput.value)
+  if (Number.isFinite(p) && p >= 1 && p <= detailTotalPages.value) {
+    detailPage.value = p
+    detailPageInput.value = ''
+  }
+}
+
 const listRows = computed(() => {
   const rows = []
   for (const j of jobItems.value || []) {
@@ -783,6 +707,7 @@ const listRows = computed(() => {
 })
 
 const listColumns = computed(() => [
+  { key: 'select', label: '', class: 'w-[36px]' },
   { key: 'combined', label: t('pretrain.statusProgressStage'), class: 'w-[60px]' },
   { key: 'params', label: t('pretrain.params') },
   { key: 'updated_at', label: t('pretrain.updatedAt'), class: 'w-[100px]' },
@@ -793,6 +718,7 @@ const openItem = async (row) => {
   if (!row) return
   selectedJob.value = row
   detailResult.value = null
+  detailPage.value = 1
   try {
     if (row.kind === 'job' && row.job_id) {
       const res = await axios.get(`/api/pretrain_jobs/${encodeURIComponent(row.job_id)}`)
@@ -828,6 +754,151 @@ const openRename = (row) => {
   renameKey.value = String(row.key || '')
   renameValue.value = String(row.name || '')
   renameOpen.value = true
+}
+
+const rowKey = (row) => {
+  if (!row) return ''
+  if (row.kind === 'model') return `model:${String(row.key || '')}`
+  if (row.kind === 'job') return `job:${String(row.job_id || '')}`
+  return ''
+}
+
+const isRowDeletable = (row) => {
+  if (!row) return false
+  if (row.kind === 'job') return String(row.status || '') !== 'running'
+  if (row.kind === 'model') return true
+  return false
+}
+
+const selectedKeySet = computed(() => new Set((selectedRowKeys.value || []).filter(Boolean)))
+
+const isSelected = (row) => {
+  const k = rowKey(row)
+  if (!k) return false
+  return selectedKeySet.value.has(k)
+}
+
+const setSelected = (row, val) => {
+  const k = rowKey(row)
+  if (!k) return
+  if (!isRowDeletable(row)) return
+  const next = new Set(selectedKeySet.value)
+  if (val) next.add(k)
+  else next.delete(k)
+  selectedRowKeys.value = Array.from(next)
+}
+
+const selectableRowKeys = computed(() => {
+  const rows = listRows.value || []
+  const out = []
+  for (const r of rows) {
+    if (!isRowDeletable(r)) continue
+    const k = rowKey(r)
+    if (k) out.push(k)
+  }
+  return out
+})
+
+const allVisibleSelected = computed(() => {
+  const keys = selectableRowKeys.value || []
+  if (!keys.length) return false
+  const set = selectedKeySet.value
+  for (const k of keys) {
+    if (!set.has(k)) return false
+  }
+  return true
+})
+
+const toggleSelectAllVisible = (val) => {
+  const keys = selectableRowKeys.value || []
+  if (!keys.length) return
+  const next = new Set(selectedKeySet.value)
+  if (val) {
+    for (const k of keys) next.add(k)
+  } else {
+    for (const k of keys) next.delete(k)
+  }
+  selectedRowKeys.value = Array.from(next)
+}
+
+const batchDelete = async () => {
+  if (selectedCount.value <= 0) return
+  if (!confirm(t('pretrain.batchDeleteConfirm'))) return
+
+  const set = selectedKeySet.value
+  const jobIds = []
+  const modelKeys = []
+  for (const k of set) {
+    if (k.startsWith('job:')) {
+      const jid = k.slice(4)
+      if (jid) jobIds.push(jid)
+    } else if (k.startsWith('model:')) {
+      const mk = k.slice(6)
+      if (mk) modelKeys.push(mk)
+    }
+  }
+  if (!jobIds.length && !modelKeys.length) return
+
+  batchDeleting.value = true
+  try {
+    const failed = []
+    if (modelKeys.length) {
+      const res = await axios.post('/api/pretrained_models/batch_delete', { keys: modelKeys })
+      for (const f of res.data?.failed || []) failed.push(f)
+    }
+    if (jobIds.length) {
+      const res = await axios.post('/api/pretrain_jobs/batch_delete', { job_ids: jobIds })
+      for (const f of res.data?.failed || []) failed.push(f)
+    }
+    selectedRowKeys.value = []
+    await refreshLists({ quiet: true, forceModels: true })
+    if (failed.length) {
+      toast.add({ title: t('pretrain.deleteFailed'), description: String(failed.length), color: 'red' })
+    } else {
+      toast.add({ title: t('pretrain.deleted'), color: 'green' })
+    }
+  } catch (e) {
+    console.error(e)
+    toast.add({ title: t('pretrain.deleteFailed'), description: formatAxiosError(e), color: 'red' })
+  } finally {
+    batchDeleting.value = false
+  }
+}
+
+const deleteItem = async (row, ev) => {
+  if (ev && typeof ev.stopPropagation === 'function') ev.stopPropagation()
+  if (!row) return
+  if (!isRowDeletable(row)) return
+  if (!confirm(t('pretrain.deleteConfirm'))) return
+
+  const k = rowKey(row)
+  deleteLoadingKey.value = k
+  try {
+    if (row.kind === 'model' && row.key) {
+      await axios.delete(`/api/pretrained_models/${encodeURIComponent(row.key)}`)
+      selectedRowKeys.value = (selectedRowKeys.value || []).filter((x) => x !== k)
+      if (selectedJob.value?.kind === 'model' && selectedJob.value?.key === row.key) {
+        closeDetail()
+      }
+      await refreshLists({ quiet: true, forceModels: true })
+      toast.add({ title: t('pretrain.deleted'), color: 'green' })
+      return
+    }
+    if (row.kind === 'job' && row.job_id) {
+      await axios.delete(`/api/pretrain_jobs/${encodeURIComponent(row.job_id)}`)
+      selectedRowKeys.value = (selectedRowKeys.value || []).filter((x) => x !== k)
+      if (selectedJob.value?.kind === 'job' && selectedJob.value?.job_id === row.job_id) {
+        closeDetail()
+      }
+      await refreshLists({ quiet: true })
+      toast.add({ title: t('pretrain.deleted'), color: 'green' })
+    }
+  } catch (e) {
+    console.error(e)
+    toast.add({ title: t('pretrain.deleteFailed'), description: formatAxiosError(e), color: 'red' })
+  } finally {
+    if (deleteLoadingKey.value === k) deleteLoadingKey.value = ''
+  }
 }
 
 const saveRename = async () => {
@@ -911,18 +982,15 @@ const runPretrain = async () => {
   stopJobPolling()
   jobId.value = ''
   try {
-    const selectedPool = pools.value.find(p => p.pool_id === selectedPoolId.value)
-    const poolName = selectedPool ? (selectedPool.pool_name || selectedPool.pool_id) : null
-
     const body = {
       codes: codes.value,
-      frequency: frequency.value,
-      data_src: dataSrc.value,
-      model: model.value,
-      data_length_mode: dataLengthMode.value === 'years' ? 'default' : 'max',
-      data_length_years: dataLengthMode.value === 'years' ? Number(dataLengthYears.value) : null,
-      force_refresh: !!forceRefresh.value,
-      pool_name: poolName
+      frequency: props.config.frequency,
+      data_src: props.config.dataSrc,
+      model: props.config.model,
+      data_length_mode: props.config.dataLengthMode === 'years' ? 'default' : 'max',
+      data_length_years: props.config.dataLengthMode === 'years' ? Number(props.config.dataLengthYears) : null,
+      force_refresh: !!props.config.forceRefresh,
+      pool_name: props.config.poolName || null
     }
 
     try {
@@ -970,4 +1038,6 @@ const runPretrain = async () => {
     if (!jobId.value) loading.value = false
   }
 }
+
+defineExpose({ runPretrain })
 </script>

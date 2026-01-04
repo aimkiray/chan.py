@@ -132,7 +132,7 @@ class CChan:
                                 delta_days = (klu_dt - begin_dt).days
                                 
                                 # Debug print
-                                print(f"[DEBUG] Check Gap: Raw={self.begin_time} Parsed={begin_dt}, Actual={klu_dt}, Gap={delta_days} days")
+                                # print(f"[DEBUG] Check Gap: Raw={self.begin_time} Parsed={begin_dt}, Actual={klu_dt}, Gap={delta_days} days")
 
                                 # If gap is significant (e.g., > 10 days), add warning
                                 # 10 days allows for long holidays (e.g. CNY)

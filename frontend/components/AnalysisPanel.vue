@@ -141,17 +141,17 @@
             <thead class="bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-300">
               <tr>
                 <th class="p-1 text-left">bin</th>
-                <th class="p-1 text-right">n</th>
-                <th class="p-1 text-right">avg</th>
-                <th class="p-1 text-right">win</th>
+                <th class="p-1 text-left">n</th>
+                <th class="p-1 text-left">avg</th>
+                <th class="p-1 text-left">win</th>
               </tr>
             </thead>
             <tbody>
               <tr v-for="(b, i) in accuracy.calibration_bins" :key="i" class="border-t border-gray-100 dark:border-gray-800">
                 <td class="p-1 text-left tabular-nums">{{ Number(b.low).toFixed(1) }}-{{ Number(b.high).toFixed(1) }}</td>
-                <td class="p-1 text-right tabular-nums">{{ b.count }}</td>
-                <td class="p-1 text-right tabular-nums">{{ (Number(b.avg_pred) * 100).toFixed(1) }}%</td>
-                <td class="p-1 text-right tabular-nums">{{ (Number(b.win_rate) * 100).toFixed(1) }}%</td>
+                <td class="p-1 text-left tabular-nums">{{ b.count }}</td>
+                <td class="p-1 text-left tabular-nums">{{ (Number(b.avg_pred) * 100).toFixed(1) }}%</td>
+                <td class="p-1 text-left tabular-nums">{{ (Number(b.win_rate) * 100).toFixed(1) }}%</td>
               </tr>
             </tbody>
           </table>
@@ -164,7 +164,7 @@
 <script setup>
 import { computed } from 'vue'
 
-const { t } = useI18n()
+const { t, formatTime: formatTimeI18n } = useI18n()
 
 const props = defineProps({
   latestClose: [String, Number],
@@ -314,8 +314,8 @@ const getPretrainedName = (acc) => {
 const formatTime = (iso) => {
   if (!iso) return '--'
   try {
-    const d = new Date(iso)
-    return d.toLocaleString()
+    const s = formatTimeI18n(iso, { withYear: true, withSeconds: false })
+    return s || '--'
   } catch (e) {
     return iso
   }

@@ -11,6 +11,7 @@ from typing import Dict, TypedDict, Optional
 import urllib.request
 import urllib.parse
 from zoneinfo import ZoneInfo
+import concurrent.futures
 import xgboost as xgb
 import lightgbm as lgb
 from sklearn.neural_network import MLPClassifier
@@ -36,16 +37,66 @@ class T_SAMPLE_INFO(TypedDict):
     is_buy: bool
     open_time: CTime
 
-def stragety_feature(last_klu):
-    return {
+def stragety_feature(last_klu, enable_rolling_lookback=True):
+    # Improved feature engineering for better generalization
+    # Avoid absolute price/volume values which lead to overfitting
+    
+    # Calculate simple moving averages (approximation)
+    # Since we only have last_klu here, we rely on what's available or compute ratios
+    # But ideally we should have access to history. 
+    # For now, we add more normalized indicators.
+    
+    # Note: KLine Unit usually has MACD computed if CChan ran with it.
+    
+    feat = {
         "open_klu_rate": (last_klu.close - last_klu.open)/last_klu.open,
         "high_low_rate": (last_klu.high - last_klu.low)/last_klu.close,
-        "close": last_klu.close,
-        "volume": float(last_klu.qfq_volume) if hasattr(last_klu, 'qfq_volume') else 0.0
+        # Normalized Close: Close relative to Open (intraday strength)
+        "close_open_ratio": last_klu.close / last_klu.open,
+        # Normalized High/Low position
+        "close_pos_in_bar": (last_klu.close - last_klu.low) / (last_klu.high - last_klu.low + 1e-8),
     }
+
+    if enable_rolling_lookback:
+        # Add Long-Term Context (Rolling Lookback)
+        # We traverse back 250 bars (approx 1 year) to find High/Low
+        # This captures "Position in Range" which is critical for Zhuang Gu (e.g. low in 1 year range)
+        try:
+            high_250 = last_klu.high
+            low_250 = last_klu.low
+            curr = last_klu
+            count = 0
+            limit = 250
+            while curr.pre and count < limit:
+                curr = curr.pre
+                if curr.high > high_250: high_250 = curr.high
+                if curr.low < low_250: low_250 = curr.low
+                count += 1
+            
+            if count > 20: # Only if we have enough history
+                feat["price_rank_250"] = (last_klu.close - low_250) / (high_250 - low_250 + 1e-8)
+                feat["volatility_250"] = (high_250 - low_250) / (low_250 + 1e-8)
+        except Exception:
+            pass
+    
+    if hasattr(last_klu, 'macd'):
+        feat.update({
+            "macd_dif": last_klu.macd.DIF,
+            "macd_dea": last_klu.macd.DEA,
+            "macd_bar": last_klu.macd.macd,
+        })
+        
+    return feat
 
 def normalize_code(code):
     code = code.strip().lower()
+    if code.endswith(".sh"):
+        return f"sh.{code[:-3]}"
+    if code.endswith(".sz"):
+        return f"sz.{code[:-3]}"
+    if code.endswith(".bj"):
+        return f"bj.{code[:-3]}"
+    
     if code.startswith("sh.") or code.startswith("sz.") or code.startswith("bj."):
         return code
     if code.startswith("sh") and len(code) == 8 and code[2:].isdigit():
@@ -445,7 +496,7 @@ def get_latest_data_time(code, level, data_src_type):
     return None
 
 
-def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, data_src_type=DATA_SRC.BAO_STOCK, preloaded_data=None, do_predict=False, begin_time=None):
+def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, data_src_type=DATA_SRC.BAO_STOCK, preloaded_data=None, do_predict=False, begin_time=None, enable_rolling_lookback=True):
     code = normalize_code(code)
     
     # Adjust begin_time based on frequency to avoid fetching too much data
@@ -519,8 +570,12 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
     
     if trigger_step:
         print(f"Start processing {code} from {begin_time}...")
+        kl_count = 0
+        bsp_count = 0
+        
         # Iterate through steps to collect training samples
         for i, chan_snapshot in enumerate(chan.step_load()):
+            kl_count += 1
             if i % 100 == 0:
                 print(f"Processing step {i}...")
             last_snapshot = chan_snapshot
@@ -536,6 +591,7 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
             
             # Record BSP when it appears
             if last_bsp.klu.idx not in bsp_dict and cur_lv_chan[-2].idx == last_bsp.klu.klc.idx:
+                bsp_count += 1
                 bsp_dict[last_bsp.klu.idx] = {
                     "feature": last_bsp.features,
                     "is_buy": last_bsp.is_buy,
@@ -543,7 +599,9 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
                     "bsp_obj": last_bsp
                 }
                 # Add custom strategy features
-                bsp_dict[last_bsp.klu.idx]['feature'].add_feat(stragety_feature(last_klu))
+                bsp_dict[last_bsp.klu.idx]['feature'].add_feat(stragety_feature(last_klu, enable_rolling_lookback=enable_rolling_lookback))
+
+        print(f"[DEBUG] {code}: Processed {kl_count} K-lines, Found {bsp_count} valid Buy/Sell Points (Training Samples)")
 
         # Re-calculate to ensure latest state is fully updated for plotting
         if last_snapshot:
@@ -593,19 +651,21 @@ def build_training_data(bsp_dict, feature_meta=None):
     for _, info in bsp_dict.items():
         lookahead = 5
         cur_klu = info['bsp_obj'].klu
+        base_price = cur_klu.close
         future_klu = cur_klu
         for _ in range(lookahead):
             if future_klu.next:
                 future_klu = future_klu.next
             else:
                 break
-        
         if info['is_buy']:
-            profit = (future_klu.close - cur_klu.close) / cur_klu.close
+            profit = (future_klu.close - base_price) / (base_price or 1e-12)
         else:
-            profit = (cur_klu.close - future_klu.close) / cur_klu.close
+            profit = (base_price - future_klu.close) / (base_price or 1e-12)
             
-        label = 1 if profit > 0 else 0
+        # Threshold: Must be at least 1% profit to count as valid signal
+        # This filters out noise where profit is 0.001%
+        label = 1 if profit > 0.01 else 0
         feat_vec = [info['feature'].get(k, -9999999) for k in feature_meta]
         X.append(feat_vec)
         y.append(label)
@@ -629,27 +689,38 @@ def build_training_data_from_infos(infos, feature_meta):
 
     for info in infos:
         lookahead = 5
-        cur_klu = info['bsp_obj'].klu
+        
+        decision_klu = info.get('decision_klu')
+        
+        if decision_klu:
+            cur_klu = decision_klu
+            base_price = cur_klu.close
+        else:
+            cur_klu = info['bsp_obj'].klu
+            base_price = cur_klu.close
+            
         future_klu = cur_klu
         for _ in range(lookahead):
-            if future_klu.next:
+            if getattr(future_klu, 'next', None):
                 future_klu = future_klu.next
             else:
                 break
         
         if info['is_buy']:
-            profit = (future_klu.close - cur_klu.close) / cur_klu.close
+            profit = (future_klu.close - base_price) / (base_price or 1e-12)
         else:
-            profit = (cur_klu.close - future_klu.close) / cur_klu.close
+            profit = (base_price - future_klu.close) / (base_price or 1e-12)
             
-        label = 1 if profit > 0 else 0
+        # Threshold: Must be at least 1% profit to count as valid signal
+        # This filters out noise where profit is 0.001%
+        label = 1 if profit > 0.01 else 0
         feat_vec = [info['feature'].get(k, -9999999) for k in feature_meta]
         X.append(feat_vec)
         y.append(label)
 
     return X, y
 
-def train_model_from_xy(X_train, y_train, model_type="xgboost"):
+def train_model_from_xy(X_train, y_train, model_type="xgboost", n_jobs=-1):
     if not X_train:
         return None
     if len(set(y_train)) < 2:
@@ -657,10 +728,10 @@ def train_model_from_xy(X_train, y_train, model_type="xgboost"):
 
     model = None
     if model_type == "xgboost":
-        model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, eval_metric='logloss')
+        model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, eval_metric='logloss', n_jobs=n_jobs)
         model.fit(X_train, y_train)
     elif model_type == "lightgbm":
-        model = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, verbosity=-1)
+        model = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, verbosity=-1, n_jobs=n_jobs)
         model.fit(X_train, y_train)
     elif model_type == "mlp":
         model = Pipeline([
@@ -733,7 +804,7 @@ def evaluate_model_accuracy(model, X, y, threshold=0.5):
 
     return correct, total, (correct / total if total > 0 else 0.0)
 
-def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.2, val_ratio=0.2, threshold=0.5, calibrate_method="sigmoid", min_train=50, min_val=20, min_test=20):
+def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.2, val_ratio=0.2, threshold=0.5, calibrate_method="sigmoid", min_train=50, min_val=20, min_test=20, n_jobs=-1):
     empty_model = None
     empty_meta = []
     if not bsp_dict:
@@ -757,24 +828,92 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.2, va
         pass
 
     n = len(infos)
-    if n < (min_train + min_val + min_test):
-        feature_meta = build_feature_meta(bsp_dict)
-        X_all, y_all = build_training_data_from_infos(infos, feature_meta)
-        model = None
-        try:
-            model = train_model_from_xy(X_all, y_all, model_type=model_type)
-        except Exception:
-            model = None
-        valid_count, total_count, acc = evaluate_model_accuracy(model, X_all, y_all, threshold=threshold)
-        return model, feature_meta, {
-            "valid_count": valid_count,
-            "total_count": total_count,
-            "accuracy": acc,
-            "method": "fallback_all_data",
-            "train_count": len(X_all),
+    
+    # CASE 1: Insufficient Data (< 10 samples)
+    if n < 10:
+        return empty_model, empty_meta, {
+            "valid_count": 0,
+            "total_count": 0,
+            "accuracy": 0.0,
+            "method": "insufficient_data",
+            "train_count": n,
             "val_count": 0,
             "test_count": 0,
-            "brier_score": brier_score(model, X_all, y_all),
+            "brier_score": 0.0,
+            "ece": 0.0,
+            "calibration_bins": []
+        }
+
+    # CASE 2: Small Data (10 <= n < 90) - Simple Train/Test Split
+    if n < (min_train + min_val + min_test):
+        feature_meta = build_feature_meta(bsp_dict)
+        test_window = max(3, int(n * 0.2))
+        fold_count = 3
+        first_train_end = max(5, n - fold_count * test_window)
+
+        total_correct = 0
+        total_test = 0
+        used_folds = 0
+        for i in range(fold_count):
+            train_end = first_train_end + i * test_window
+            test_start = train_end
+            test_end = min(train_end + test_window, n)
+            if train_end <= 0 or test_start >= n or test_start >= test_end:
+                continue
+
+            train_infos = infos[:train_end]
+            test_infos = infos[test_start:test_end]
+            X_train, y_train = build_training_data_from_infos(train_infos, feature_meta)
+            X_test, y_test = build_training_data_from_infos(test_infos, feature_meta)
+            if len(set(y_train)) < 2 or len(set(y_test)) < 2:
+                continue
+
+            try:
+                model = train_model_from_xy(X_train, y_train, model_type=model_type, n_jobs=n_jobs)
+            except Exception:
+                model = None
+
+            valid_count, total_count, _ = evaluate_model_accuracy(model, X_test, y_test, threshold=threshold)
+            total_correct += int(valid_count)
+            total_test += int(total_count)
+            used_folds += 1
+
+        min_total_test = max(8, test_window * 2)
+        if total_test < min_total_test or used_folds <= 0:
+            return None, feature_meta, {
+                "valid_count": 0,
+                "total_count": total_test,
+                "accuracy": 0.0,
+                "method": "insufficient_data",
+                "train_count": n,
+                "val_count": 0,
+                "test_count": total_test,
+                "brier_score": 0.0,
+                "ece": 0.0,
+                "calibration_bins": []
+            }
+
+        try:
+            X_all, y_all = build_training_data_from_infos(infos, feature_meta)
+        except Exception:
+            X_all, y_all = [], []
+        final_model = None
+        if X_all and len(set(y_all)) >= 2:
+            try:
+                final_model = train_model_from_xy(X_all, y_all, model_type=model_type, n_jobs=n_jobs)
+            except Exception:
+                final_model = None
+
+        acc = (total_correct / total_test) if total_test > 0 else 0.0
+        return final_model, feature_meta, {
+            "valid_count": total_correct,
+            "total_count": total_test,
+            "accuracy": acc,
+            "method": "walk_forward_small",
+            "train_count": n,
+            "val_count": 0,
+            "test_count": total_test,
+            "brier_score": 0.0,
             "ece": 0.0,
             "calibration_bins": []
         }
@@ -793,9 +932,23 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.2, va
     X_val, y_val = build_training_data_from_infos(val_infos, feature_meta)
     X_test, y_test = build_training_data_from_infos(test_infos, feature_meta)
 
+    if len(set(y_train)) < 2 or len(set(y_test)) < 2:
+        return None, feature_meta, {
+            "valid_count": 0,
+            "total_count": len(y_test),
+            "accuracy": 0.0,
+            "method": "single_class_split",
+            "train_count": len(X_train),
+            "val_count": len(X_val),
+            "test_count": len(X_test),
+            "brier_score": 0.0,
+            "ece": 0.0,
+            "calibration_bins": []
+        }
+
     model = None
     try:
-        model = train_model_from_xy(X_train, y_train, model_type=model_type)
+        model = train_model_from_xy(X_train, y_train, model_type=model_type, n_jobs=n_jobs)
     except Exception:
         model = None
 
@@ -941,7 +1094,7 @@ def predict_bsp(model, bsp, feature_meta):
         # If model only has one class, probs might be [[1.0]] (not standard sklearn behavior but possible)
         # Sklearn classifiers usually return probability for all classes in model.classes_
         
-        print(f"Model raw probabilities: {probs}")
+        # print(f"Model raw probabilities: {probs}")
 
         # Check shape
         if len(probs[0]) >= 2:
@@ -1131,6 +1284,52 @@ def get_pretrained_model_detail_by_key(key: str):
     except Exception:
         return None
 
+def delete_pretrained_model_bundle_by_key(key: str):
+    meta = get_pretrained_model_detail_by_key(key)
+    if not meta:
+        return {"status": "not_found", "key": str(key or "")}
+
+    bundle_path, meta_path = _pretrained_model_paths_by_key(str(key).strip())
+    removed_meta = False
+    removed_bundle = False
+    missing = []
+
+    try:
+        if os.path.exists(meta_path):
+            os.remove(meta_path)
+            removed_meta = True
+        else:
+            missing.append(meta_path)
+    except Exception:
+        pass
+
+    try:
+        bp = str(meta.get("bundle_path") or bundle_path)
+        if bp and os.path.exists(bp):
+            os.remove(bp)
+            removed_bundle = True
+        else:
+            if bp:
+                missing.append(bp)
+    except Exception:
+        pass
+
+    if not removed_bundle:
+        try:
+            if os.path.exists(bundle_path):
+                os.remove(bundle_path)
+                removed_bundle = True
+        except Exception:
+            pass
+
+    return {
+        "status": "success",
+        "key": str(key).strip(),
+        "removed_meta": removed_meta,
+        "removed_bundle": removed_bundle,
+        "missing": missing,
+    }
+
 def load_pretrained_model_bundle(model_type: str, frequency: str, data_src: str):
     items = list_pretrained_model_metas(limit=None)
     mt = str(model_type or "")
@@ -1270,6 +1469,77 @@ def evaluate_fixed_model_time_split(bsp_dict, model, feature_meta, test_ratio=0.
         "calibration_bins": bins
     }
 
+def _process_code_for_pretrain(args):
+    code, level, begin_time, data_src_type = args
+    code = normalize_code(code)
+    try:
+        kl_list = fetch_stock_data(code, level, begin_time, None, data_src_type)
+        if not kl_list:
+            return code, None, [], set()
+            
+        latest_time = str(kl_list[-1].time)
+        
+        _, bsp_dict, _, _ = get_chan_data(
+            code=code,
+            trigger_step=True,
+            bi_strict=True,
+            level=level,
+            data_src_type=data_src_type,
+            preloaded_data=kl_list,
+            do_predict=True,
+            begin_time=begin_time
+        )
+        
+        local_samples = []
+        feature_keys = set()
+        
+        if bsp_dict:
+            for info in bsp_dict.values():
+                bsp_obj = info.get("bsp_obj", None)
+                if not bsp_obj or not getattr(bsp_obj, "klu", None):
+                    continue
+                cur_klu = bsp_obj.klu
+                future_klu = cur_klu
+                for _ in range(5):
+                    nxt = getattr(future_klu, "next", None)
+                    if nxt:
+                        future_klu = nxt
+                    else:
+                        break
+                try:
+                    cur_close = float(cur_klu.close)
+                    future_close = float(future_klu.close)
+                except Exception:
+                    continue
+                if not cur_close:
+                    continue
+
+                is_buy = bool(info.get("is_buy", False))
+                profit = (future_close - cur_close) / cur_close if is_buy else (cur_close - future_close) / cur_close
+                label = 1 if profit > 0 else 0
+
+                feat = info.get("feature", None)
+                try:
+                    feat_dict = dict(feat) if feat is not None else {}
+                except Exception:
+                    feat_dict = {}
+                
+                if feat_dict:
+                    for k in feat_dict.keys():
+                        feature_keys.add(k)
+
+                open_ts = 0
+                try:
+                    open_ts = int(getattr(info.get("open_time", None), "ts", 0) or 0)
+                except Exception:
+                    open_ts = 0
+                local_samples.append({"open_ts": open_ts, "feature": feat_dict, "label": label})
+        
+        return code, latest_time, local_samples, feature_keys
+    except Exception as e:
+        print(f"Error processing {code}: {e}")
+        return code, None, [], set()
+
 def pretrain_and_persist_model(codes, level, data_src_type, begin_time, model_type="xgboost", frequency="1d", data_src="clickhouse", calibrate_method="isotonic", progress_cb=None, pool_name=None):
     if not codes:
         return None, {
@@ -1299,70 +1569,46 @@ def pretrain_and_persist_model(codes, level, data_src_type, begin_time, model_ty
     report("collecting", 0.0, "start")
 
     try:
-        for idx, raw_code in enumerate(codes):
-            code = normalize_code(raw_code)
-            report("collecting", min(0.8, 0.05 + 0.75 * (idx / total)), f"{idx + 1}/{total} {code}")
-            kl_list = fetch_stock_data(code, level, begin_time, None, data_src_type)
-            if not kl_list:
-                continue
-
-            per_code_latest_time[code] = str(kl_list[-1].time)
-
-            _, bsp_dict, _, _ = get_chan_data(
-                code=code,
-                trigger_step=True,
-                bi_strict=True,
-                level=level,
-                data_src_type=data_src_type,
-                preloaded_data=kl_list,
-                do_predict=True,
-                begin_time=begin_time
-            )
-
-            if bsp_dict:
-                per_code_sample_count[code] = len(bsp_dict)
-                for info in bsp_dict.values():
-                    bsp_obj = info.get("bsp_obj", None)
-                    if not bsp_obj or not getattr(bsp_obj, "klu", None):
-                        continue
-                    cur_klu = bsp_obj.klu
-                    future_klu = cur_klu
-                    for _ in range(5):
-                        nxt = getattr(future_klu, "next", None)
-                        if nxt:
-                            future_klu = nxt
-                        else:
-                            break
-                    try:
-                        cur_close = float(cur_klu.close)
-                        future_close = float(future_klu.close)
-                    except Exception:
-                        continue
-                    if not cur_close:
-                        continue
-
-                    is_buy = bool(info.get("is_buy", False))
-                    profit = (future_close - cur_close) / cur_close if is_buy else (cur_close - future_close) / cur_close
-                    label = 1 if profit > 0 else 0
-
-                    feat = info.get("feature", None)
-                    try:
-                        feat_dict = dict(feat) if feat is not None else {}
-                    except Exception:
-                        feat_dict = {}
-                    if feat_dict:
-                        for k in feat_dict.keys():
-                            feature_keys.add(k)
-
-                    open_ts = 0
-                    try:
-                        open_ts = int(getattr(info.get("open_time", None), "ts", 0) or 0)
-                    except Exception:
-                        open_ts = 0
-                    samples.append({"open_ts": open_ts, "feature": feat_dict, "label": label})
-
-            del bsp_dict
-            del kl_list
+        # Optimized for server environment: Use ProcessPoolExecutor for parallel data processing
+        # This utilizes the multiple cores (e.g. 64 cores) efficiently
+        # Logic: Env Var -> min(60, CPU) -> bound by len(codes)
+        
+        default_workers = min(60, os.cpu_count() or 4)
+        env_workers = os.environ.get("MLCHAN_PRETRAIN_WORKERS")
+        if env_workers:
+            try:
+                max_workers = int(env_workers)
+            except ValueError:
+                max_workers = default_workers
+        else:
+            max_workers = default_workers
+            
+        # Ensure at least 1 and not more than tasks
+        max_workers = max(1, min(max_workers, len(codes)))
+        
+        print(f"Starting pretrain data collection with {max_workers} workers for {len(codes)} codes.")
+        
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            tasks = [(code, level, begin_time, data_src_type) for code in codes]
+            future_to_code = {executor.submit(_process_code_for_pretrain, t): t[0] for t in tasks}
+            
+            completed_count = 0
+            for future in concurrent.futures.as_completed(future_to_code):
+                completed_count += 1
+                orig_code = future_to_code[future]
+                report("collecting", min(0.8, 0.05 + 0.75 * (completed_count / total)), f"{completed_count}/{total} {orig_code}")
+                
+                try:
+                    r_code, r_latest, r_samples, r_keys = future.result()
+                    if r_latest:
+                        per_code_latest_time[r_code] = r_latest
+                    if r_samples:
+                        samples.extend(r_samples)
+                        per_code_sample_count[r_code] = len(r_samples)
+                    if r_keys:
+                        feature_keys.update(r_keys)
+                except Exception as e:
+                    print(f"Worker exception for {orig_code}: {e}")
 
         if not samples:
             return None, {
