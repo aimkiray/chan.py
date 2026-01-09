@@ -13,6 +13,8 @@ from backend.chan_service import (
     fetch_stock_data,
     CChanCustom,
     train_time_split_backtest,
+    compute_recent_accuracy,
+    predict_proba_1,
     stragety_feature,
     get_stock_name
 )
@@ -56,15 +58,39 @@ def _process_single_stock_strategy(
     enable_rolling_lookback: bool,
     model_type: str,
     min_accuracy: float,
+    min_recent_accuracy: Optional[float],
+    recent_accuracy_years: float,
     require_signal: bool,
     signal_lookback: int,
-    signal_direction: str
+    signal_direction: str,
+    min_signal_score: Optional[float],
+    min_bsp_count: int,
+    min_test_count: int,
+    profit_threshold: Optional[float],
+    auto_profit_quantile: float,
+    profit_lookahead: int,
+    autype,
 ):
     try:
         # Set thread limits for worker process
         os.environ["OMP_NUM_THREADS"] = "1"
         os.environ["MKL_NUM_THREADS"] = "1"
         os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+        used_autype = AUTYPE.HFQ
+        try:
+            if isinstance(autype, AUTYPE):
+                used_autype = autype
+            else:
+                raw = str(autype or "").strip().lower()
+                if raw == "qfq":
+                    used_autype = AUTYPE.QFQ
+                elif raw == "none":
+                    used_autype = AUTYPE.NONE
+                else:
+                    used_autype = AUTYPE.HFQ
+        except Exception:
+            used_autype = AUTYPE.HFQ
         
         # Fetch Data
         kl_list = fetch_stock_data(
@@ -72,7 +98,8 @@ def _process_single_stock_strategy(
             kl_type, 
             begin_time, 
             None, 
-            data_src
+            data_src,
+            autype=used_autype,
         )
         
         if not kl_list or len(kl_list) < 100:
@@ -131,13 +158,22 @@ def _process_single_stock_strategy(
                     "kl_type": str(kl_type),
                     "begin_time": begin_time,
                     "data_src": str(data_src),
+                    "autype": str(getattr(used_autype, "name", used_autype)),
                     "custom_chan_config": custom_chan_config,
                     "enable_rolling_lookback": enable_rolling_lookback,
                     "model_type": model_type,
                     "min_accuracy": float(min_accuracy),
+                    "min_recent_accuracy": float(min_recent_accuracy) if min_recent_accuracy is not None else None,
+                    "recent_accuracy_years": float(recent_accuracy_years),
                     "require_signal": require_signal,
                     "signal_lookback": signal_lookback,
                     "signal_direction": signal_direction,
+                    "min_signal_score": float(min_signal_score) if min_signal_score is not None else None,
+                    "min_bsp_count": int(min_bsp_count),
+                    "min_test_count": int(min_test_count),
+                    "profit_threshold": float(profit_threshold) if profit_threshold is not None else None,
+                    "auto_profit_quantile": float(auto_profit_quantile),
+                    "profit_lookahead": int(profit_lookahead),
                     "data_start_time": data_start_time,
                     "data_end_time": data_end_time
                 }
@@ -160,7 +196,7 @@ def _process_single_stock_strategy(
             data_src=data_src,
             lv_list=[kl_type],
             config=chan_config,
-            autype=AUTYPE.QFQ,
+            autype=used_autype,
             preloaded_data=kl_list,
         )
 
@@ -199,19 +235,51 @@ def _process_single_stock_strategy(
 
         last_klu = last_snapshot[0][-1][-1]
         latest_bsp_list = last_snapshot.get_latest_bsp(number=0)
+
+        if int(min_bsp_count) > 0 and len(bsp_dict) < int(min_bsp_count):
+            method = f"insufficient_samples<{int(min_bsp_count)} total={len(bsp_dict)}"
+            try:
+                if key_hash and storage:
+                    storage.save_strategy_cache(
+                        key_hash,
+                        code,
+                        0.0,
+                        len(bsp_dict),
+                        method,
+                        None,
+                        data_start_time,
+                        data_end_time,
+                        cache_params,
+                    )
+            except Exception:
+                pass
+            return code, None, len(bsp_dict), 0.0, method
         
         # Train with n_jobs=1 to avoid thread explosion
+        backtest_kwargs = {
+            "model_type": model_type,
+            "calibrate_method": "isotonic",
+            "n_jobs": 1,
+            "profit_threshold": profit_threshold,
+            "auto_profit_quantile": auto_profit_quantile,
+            "profit_lookahead": profit_lookahead,
+        }
+        if int(min_test_count) > 0:
+            backtest_kwargs["min_test"] = int(min_test_count)
         bst, feature_meta, accuracy_info = train_time_split_backtest(
             bsp_dict, 
-            model_type=model_type, 
-            calibrate_method="isotonic",
-            n_jobs=1
+            **backtest_kwargs,
         )
         
         current_accuracy = 0.0
         method = ""
+        test_count = 0
         if accuracy_info:
             current_accuracy = float(accuracy_info.get("accuracy", 0.0))
+            try:
+                test_count = int(float(accuracy_info.get("test_count", 0) or 0))
+            except Exception:
+                test_count = 0
             method = (
                 f"{accuracy_info.get('method', '')}"
                 f" train={accuracy_info.get('train_count', 0)}"
@@ -219,26 +287,49 @@ def _process_single_stock_strategy(
                 f" valid={accuracy_info.get('valid_count', 0)}"
                 f" total={accuracy_info.get('total_count', 0)}"
             )
-        
+        if int(min_test_count) > 0 and test_count < int(min_test_count):
+            method = (method + f" insufficient_test<{int(min_test_count)}") if method else f"insufficient_test<{int(min_test_count)}"
+            current_accuracy = 0.0
+
         result = None
-        if current_accuracy >= min_accuracy:
-            # Match Accuracy!
-            # Check Signal if required
+        recent_accuracy = None
+        try:
+            if min_recent_accuracy is not None:
+                recent_kwargs = {
+                    "model_type": model_type,
+                    "recent_years": recent_accuracy_years,
+                    "calibrate_method": "isotonic",
+                    "n_jobs": 1,
+                    "profit_threshold": profit_threshold,
+                    "auto_profit_quantile": auto_profit_quantile,
+                    "profit_lookahead": profit_lookahead,
+                }
+                if int(min_test_count) > 0:
+                    recent_kwargs["min_test"] = int(min_test_count)
+                recent_info = compute_recent_accuracy(
+                    bsp_dict,
+                    **recent_kwargs,
+                )
+                recent_accuracy = float((recent_info or {}).get("accuracy", 0.0))
+        except Exception:
+            recent_accuracy = None
+
+        if current_accuracy >= float(min_accuracy):
             has_signal = False
             latest_signal_date = ""
             latest_signal_type = ""
+            selected_bsp = None
 
             if require_signal:
                 last_idx = last_klu.idx
-                
                 for bsp in latest_bsp_list:
                     if signal_direction == 'buy' and not bsp.is_buy:
                         continue
                     if signal_direction == 'sell' and bsp.is_buy:
                         continue
-                        
                     if abs(bsp.klu.idx - last_idx) < signal_lookback:
                         has_signal = True
+                        selected_bsp = bsp
                         latest_signal_date = bsp.klu.time.to_str()
                         latest_signal_type = bsp.type2str()
                         if bsp.is_buy:
@@ -250,16 +341,53 @@ def _process_single_stock_strategy(
                         break
             else:
                 has_signal = True
-            
-            if has_signal:
-                 stock_name = get_stock_name(code, data_src)
-                 result = {
-                     "code": code,
-                     "name": stock_name,
-                     "accuracy": current_accuracy,
-                     "latest_date": latest_signal_date if require_signal else last_klu.time.to_str(),
-                     "signal_type": latest_signal_type
-                 }
+                if latest_bsp_list:
+                    selected_bsp = latest_bsp_list[0]
+                    latest_signal_date = selected_bsp.klu.time.to_str()
+                    latest_signal_type = selected_bsp.type2str()
+                    if selected_bsp.is_buy:
+                        latest_signal_type += " (Buy)"
+                    else:
+                        latest_signal_type += " (Sell)"
+
+            signal_score = None
+            if has_signal and selected_bsp is not None and bst and feature_meta:
+                try:
+                    feat_obj = None
+                    try:
+                        feat_obj = (bsp_dict.get(selected_bsp.klu.idx) or {}).get("feature")
+                    except Exception:
+                        feat_obj = None
+                    if feat_obj is None:
+                        feat_obj = selected_bsp.features
+                        try:
+                            feat_obj.add_feat(stragety_feature(last_klu, enable_rolling_lookback=enable_rolling_lookback))
+                        except Exception:
+                            pass
+                    feat_vec = [feat_obj.get(k, -9999999) for k in feature_meta]
+                    signal_score = float(predict_proba_1(bst, [feat_vec])[0])
+                except Exception:
+                    signal_score = None
+
+            recent_ok = True
+            if min_recent_accuracy is not None:
+                recent_ok = recent_accuracy is not None and float(recent_accuracy) >= float(min_recent_accuracy)
+
+            score_ok = True
+            if min_signal_score is not None:
+                score_ok = signal_score is not None and float(signal_score) >= float(min_signal_score)
+
+            if has_signal and recent_ok and score_ok:
+                stock_name = get_stock_name(code, data_src)
+                result = {
+                    "code": code,
+                    "name": stock_name,
+                    "accuracy": current_accuracy,
+                    "recent_accuracy": recent_accuracy,
+                    "signal_score": signal_score,
+                    "latest_date": latest_signal_date if require_signal else last_klu.time.to_str(),
+                    "signal_type": latest_signal_type
+                }
         
         # Save to cache
         try:
@@ -318,12 +446,104 @@ class StrategyRunner:
             scope = params.get('scope', 'hs300')
             model_type = params.get('model', 'xgboost')
             frequency = params.get('frequency', '1d')
+            raw_autype = str(params.get("autype", "hfq") or "hfq").strip().lower()
+            if raw_autype not in ("qfq", "hfq", "none"):
+                raw_autype = "hfq"
             data_length_years = float(params.get('data_length_years', 1.0))
             min_accuracy = float(params.get('min_accuracy', 0.8))
+            if min_accuracy < 0:
+                min_accuracy = 0.0
+            if min_accuracy > 1:
+                min_accuracy = 1.0
+            min_recent_accuracy = params.get('min_recent_accuracy', None)
+            try:
+                if min_recent_accuracy is not None:
+                    min_recent_accuracy = float(min_recent_accuracy)
+            except Exception:
+                min_recent_accuracy = None
+            if min_recent_accuracy is not None:
+                if min_recent_accuracy < 0:
+                    min_recent_accuracy = 0.0
+                if min_recent_accuracy > 1:
+                    min_recent_accuracy = 1.0
+            recent_accuracy_years = params.get('recent_accuracy_years', 1.0)
+            try:
+                recent_accuracy_years = float(recent_accuracy_years)
+            except Exception:
+                recent_accuracy_years = 1.0
+            if recent_accuracy_years <= 0:
+                recent_accuracy_years = 1.0
             custom_chan_config = params.get('chan_config') or {}
             require_signal = params.get('require_signal', False)
             signal_lookback = int(params.get('signal_lookback', 5))
             signal_direction = params.get('signal_direction', 'buy')
+            min_signal_score = params.get('min_signal_score', None)
+            try:
+                if min_signal_score is not None:
+                    min_signal_score = float(min_signal_score)
+            except Exception:
+                min_signal_score = None
+            if min_signal_score is not None:
+                if min_signal_score < 0:
+                    min_signal_score = 0.0
+                if min_signal_score > 1:
+                    min_signal_score = 1.0
+                require_signal = True
+            if signal_lookback < 1:
+                signal_lookback = 5
+
+            min_bsp_count = params.get('min_bsp_count', 0)
+            if min_bsp_count in ["", "null", "None", None]:
+                min_bsp_count = 0
+            try:
+                min_bsp_count = int(float(min_bsp_count))
+            except Exception:
+                min_bsp_count = 0
+            if min_bsp_count < 0:
+                min_bsp_count = 0
+            if min_bsp_count > 1000000:
+                min_bsp_count = 1000000
+
+            min_test_count = params.get('min_test_count', 0)
+            if min_test_count in ["", "null", "None", None]:
+                min_test_count = 0
+            try:
+                min_test_count = int(float(min_test_count))
+            except Exception:
+                min_test_count = 0
+            if min_test_count < 0:
+                min_test_count = 0
+            if min_test_count > 1000000:
+                min_test_count = 1000000
+
+            profit_threshold = params.get('profit_threshold', 0.01)
+            if profit_threshold in ["", "null", "None"]:
+                profit_threshold = None
+            try:
+                if profit_threshold is not None:
+                    profit_threshold = float(profit_threshold)
+            except Exception:
+                profit_threshold = 0.01
+            if profit_threshold is not None and profit_threshold < 0:
+                profit_threshold = 0.0
+            auto_profit_quantile = params.get('auto_profit_quantile', 0.7)
+            try:
+                auto_profit_quantile = float(auto_profit_quantile)
+            except Exception:
+                auto_profit_quantile = 0.7
+            if auto_profit_quantile < 0:
+                auto_profit_quantile = 0.0
+            if auto_profit_quantile > 1:
+                auto_profit_quantile = 1.0
+            profit_lookahead = params.get('profit_lookahead', 5)
+            try:
+                profit_lookahead = int(float(profit_lookahead))
+            except Exception:
+                profit_lookahead = 5
+            if profit_lookahead < 0:
+                profit_lookahead = 0
+            if profit_lookahead > 250:
+                profit_lookahead = 250
             pool_id = params.get('pool_id')
             enable_rolling_lookback = params.get('enable_rolling_lookback', True)
             
@@ -350,10 +570,22 @@ class StrategyRunner:
             results = []
             processed = 0
             
-            kl_type = KL_TYPE.K_DAY if frequency == '1d' else KL_TYPE.K_30M
-            if frequency == '30m': kl_type = KL_TYPE.K_30M
-            elif frequency == '5m': kl_type = KL_TYPE.K_5M
-            elif frequency == '60m': kl_type = KL_TYPE.K_60M
+            freq = str(frequency or "").strip().lower() or "1d"
+            kl_type = KL_TYPE.K_DAY
+            if freq == "30m":
+                kl_type = KL_TYPE.K_30M
+            elif freq == "5m":
+                kl_type = KL_TYPE.K_5M
+            elif freq == "60m":
+                kl_type = KL_TYPE.K_60M
+            elif freq == "15m":
+                kl_type = KL_TYPE.K_15M
+            elif freq == "1m":
+                kl_type = KL_TYPE.K_1M
+            elif freq == "1w":
+                kl_type = KL_TYPE.K_WEEK
+            elif freq == "1mo":
+                kl_type = KL_TYPE.K_MON
             
             begin_time = (datetime.datetime.now() - datetime.timedelta(days=int(data_length_years * 365))).strftime("%Y-%m-%d")
 
@@ -400,9 +632,18 @@ class StrategyRunner:
                             enable_rolling_lookback,
                             model_type,
                             min_accuracy,
+                            min_recent_accuracy,
+                            recent_accuracy_years,
                             require_signal,
                             signal_lookback,
-                            signal_direction
+                            signal_direction,
+                            min_signal_score,
+                            min_bsp_count,
+                            min_test_count,
+                            profit_threshold,
+                            auto_profit_quantile,
+                            profit_lookahead,
+                            raw_autype,
                         )
                         active_futures.add(fut)
                         future_to_code[fut] = code

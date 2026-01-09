@@ -19,6 +19,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import TimeSeriesSplit
 import baostock as bs
 
 # Add parent directory to path to allow importing from root
@@ -195,7 +196,14 @@ def _eastmoney_tail_limit(level: KL_TYPE) -> int:
         return 16
     return 16
 
-def _fetch_latest_klines_eastmoney(code: str, level: KL_TYPE, limit: int = 5, autype: AUTYPE = AUTYPE.QFQ):
+def _fetch_latest_klines_eastmoney(
+    code: str,
+    level: KL_TYPE,
+    limit: int = 5,
+    autype: AUTYPE = AUTYPE.QFQ,
+    beg: Optional[str] = None,
+    end: str = "20500000",
+):
     from Common.CEnum import DATA_FIELD
     from KLine.KLine_Unit import CKLine_Unit
 
@@ -204,17 +212,22 @@ def _fetch_latest_klines_eastmoney(code: str, level: KL_TYPE, limit: int = 5, au
         return []
 
     secid = _eastmoney_secid(code)
-    fqt = 1 if autype == AUTYPE.QFQ else 0
-    fields1 = "f1,f2,f3,f4,f5,f6"
+    fqt_map = {AUTYPE.NONE: 0, AUTYPE.QFQ: 1, AUTYPE.HFQ: 2}
+    fqt = fqt_map.get(autype, 1)
+    fields1 = "f1,f2,f3,f4,f5,f6,f7,f8"
     fields2 = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+    beg_val = str(beg or "0").strip() or "0"
+    lmt_val = min(100000, max(1, int(limit)))
     params = {
         "fields1": fields1,
         "fields2": fields2,
         "klt": str(klt),
         "fqt": str(fqt),
         "secid": secid,
-        "end": "20500101",
-        "lmt": str(int(limit)),
+        "beg": beg_val,
+        "end": str(end or "20500000"),
+        "lmt": str(lmt_val),
+        "iscca": "1",
     }
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get?" + urllib.parse.urlencode(params)
 
@@ -261,6 +274,8 @@ def _fetch_latest_klines_eastmoney(code: str, level: KL_TYPE, limit: int = 5, au
         h = to_float(parts[3])
         l = to_float(parts[4])
         v = to_float(parts[5]) or 0.0
+        if str(klt) in ("101", "102", "103", "1", "5", "15", "30", "60"):
+            v *= 100.0
         amt = to_float(parts[6]) if len(parts) > 6 else 0.0
         amt = amt or 0.0
 
@@ -288,6 +303,117 @@ def _fetch_latest_klines_eastmoney(code: str, level: KL_TYPE, limit: int = 5, au
                 }
             )
         )
+
+    if not out:
+        return []
+
+    out.sort(key=lambda x: x.time.ts)
+    uniq = []
+    last_ts = None
+    for k in out:
+        ts = k.time.ts
+        if last_ts is not None and ts == last_ts:
+            uniq[-1] = k
+            continue
+        uniq.append(k)
+        last_ts = ts
+    return uniq
+
+def _fetch_recent_klines_eastmoney(code: str, level: KL_TYPE, days: int, autype: AUTYPE = AUTYPE.NONE):
+    import datetime
+
+    max_days = int(days or 0)
+    if max_days <= 0:
+        return []
+
+    out = []
+    seen_days = set()
+    end_key = "20500101"
+    last_end_key = None
+
+    for _ in range(max_days * 2):
+        if last_end_key == end_key:
+            break
+        last_end_key = end_key
+
+        batch = _fetch_latest_klines_eastmoney(code, level, limit=6000, autype=autype, end=end_key)
+        if not batch:
+            break
+
+        out.extend(batch)
+
+        batch_dates = []
+        for k in batch:
+            t = k.time
+            d = datetime.date(int(t.year), int(t.month), int(t.day))
+            seen_days.add(d)
+            batch_dates.append(d)
+
+        if len(seen_days) >= max_days:
+            break
+
+        earliest = min(batch_dates) if batch_dates else None
+        if earliest is None:
+            break
+        end_key = (earliest - datetime.timedelta(days=1)).strftime("%Y%m%d")
+
+    if not out:
+        return []
+
+    out.sort(key=lambda x: x.time.ts)
+    uniq = []
+    last_ts = None
+    for k in out:
+        ts = k.time.ts
+        if last_ts is not None and ts == last_ts:
+            uniq[-1] = k
+            continue
+        uniq.append(k)
+        last_ts = ts
+    return uniq
+
+def _fetch_recent_klines_akshare(code: str, level: KL_TYPE, days: int):
+    import datetime
+
+    max_days = int(days or 0)
+    if max_days <= 0:
+        return []
+
+    try:
+        from DataAPI.AkShareAPI import CAkShare
+    except Exception:
+        return []
+
+    out = []
+    seen_days = set()
+    end_dt = datetime.date.today()
+
+    for _ in range(8):
+        begin_dt = end_dt - datetime.timedelta(days=30)
+        api = CAkShare(code, k_type=level, begin_date=begin_dt.strftime("%Y-%m-%d"), end_date=end_dt.strftime("%Y-%m-%d"), autype=AUTYPE.NONE)
+        try:
+            batch = list(api.get_kl_data())
+        except Exception:
+            batch = []
+
+        if not batch:
+            break
+
+        out.extend(batch)
+        batch_dates = []
+        for k in batch:
+            t = k.time
+            d = datetime.date(int(t.year), int(t.month), int(t.day))
+            seen_days.add(d)
+            batch_dates.append(d)
+
+        if len(seen_days) >= max_days:
+            break
+
+        earliest = min(batch_dates) if batch_dates else None
+        if earliest is None:
+            break
+        end_dt = earliest - datetime.timedelta(days=1)
 
     if not out:
         return []
@@ -338,6 +464,87 @@ def _merge_klines_tail(base_list, tail_list):
         seen.add(ts)
         dedup.append(k)
     return dedup
+
+def _append_klines_tail(base_list, tail_list):
+    if not base_list:
+        return list(tail_list or [])
+    if not tail_list:
+        return base_list
+    last_ts = base_list[-1].time.ts if base_list else None
+    if last_ts is None:
+        return _merge_klines_tail(base_list, tail_list)
+    for k in tail_list:
+        if k.time.ts > last_ts:
+            base_list.append(k)
+    return base_list
+
+def _adjust_tail_by_clickhouse_factors(code: str, tail_list, autype: AUTYPE):
+    if not tail_list or autype == AUTYPE.NONE:
+        return tail_list or []
+
+    from bisect import bisect_right
+    import datetime
+    from DataAPI.ClickHouseAPI import CClickHouseAPI
+
+    CClickHouseAPI.do_init()
+    try:
+        dates = []
+        for k in tail_list:
+            t = k.time
+            dates.append(datetime.date(int(t.year), int(t.month), int(t.day)))
+        if not dates:
+            return tail_list
+
+        begin_date = min(dates).strftime("%Y-%m-%d")
+        end_date = max(dates).strftime("%Y-%m-%d")
+
+        code = normalize_code(code)
+        api = CClickHouseAPI(code=code, k_type=KL_TYPE.K_DAY, begin_date=begin_date, end_date=end_date, autype=autype)
+        api._ensure_connection()
+
+        normalized_code = str(code or "").lower().replace(".", "")
+        factor_trading_dates = []
+        factor_by_date = {}
+        if autype == AUTYPE.QFQ:
+            factor_trading_dates, factor_by_date = api._get_qfq_factors_by_date(
+                normalized_code=normalized_code,
+                begin_date=begin_date,
+                end_date=end_date,
+            )
+        elif autype == AUTYPE.HFQ:
+            factor_trading_dates, factor_by_date = api._get_hfq_factors_by_date(
+                normalized_code=normalized_code,
+                begin_date=begin_date,
+                end_date=end_date,
+            )
+
+        if not factor_by_date:
+            return tail_list
+
+        for k in tail_list:
+            t = k.time
+            row_date = datetime.date(int(t.year), int(t.month), int(t.day))
+            factor = factor_by_date.get(row_date)
+            if factor is None and factor_trading_dates:
+                idx = bisect_right(factor_trading_dates, row_date) - 1
+                if idx >= 0:
+                    factor = factor_by_date.get(factor_trading_dates[idx])
+            if factor is None:
+                continue
+            o = float(k.open) * factor
+            h = float(k.high) * factor
+            l = float(k.low) * factor
+            c = float(k.close) * factor
+            hi = max(h, o, c)
+            lo = min(l, o, c)
+            k.open = o
+            k.high = hi
+            k.low = lo
+            k.close = c
+
+        return tail_list
+    finally:
+        CClickHouseAPI.do_close()
 
 def get_stock_name(code, data_src_type=DATA_SRC.BAO_STOCK):
     """
@@ -454,14 +661,70 @@ def fetch_stock_data(code, level, begin_time, end_time, data_src_type, autype=AU
             and data_src_type == DATA_SRC.CLICK_HOUSE
             and end_time is None
         ):
-            tail = _fetch_latest_klines_eastmoney(code, level, limit=_eastmoney_tail_limit(level), autype=autype)
-            if tail:
-                data_list = _merge_klines_tail(data_list, tail)
+            if level == KL_TYPE.K_1M:
+                try:
+                    now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
+                except Exception:
+                    now = datetime.datetime.now()
+                today = now.date()
+                beg = today.strftime("%Y%m%d")
+                if data_list:
+                    try:
+                        t = data_list[-1].time
+                        last_date = datetime.date(int(t.year), int(t.month), int(t.day))
+                        if last_date >= today:
+                            beg = last_date.strftime("%Y%m%d")
+                    except Exception:
+                        pass
+
+                raw_tail = _fetch_latest_klines_eastmoney(
+                    code,
+                    level,
+                    limit=100000,
+                    autype=AUTYPE.NONE,
+                    beg=beg,
+                    end="20500000",
+                )
+                if raw_tail:
+                    tail = _adjust_tail_by_clickhouse_factors(code=code, tail_list=raw_tail, autype=autype)
+                    data_list = _merge_klines_tail(data_list, tail)
+            else:
+                base_limit = _eastmoney_tail_limit(level)
+                cap_map = {
+                    KL_TYPE.K_1M: 6000,
+                    KL_TYPE.K_5M: 2400,
+                    KL_TYPE.K_15M: 2000,
+                    KL_TYPE.K_30M: 1200,
+                    KL_TYPE.K_60M: 800,
+                    KL_TYPE.K_DAY: 64,
+                    KL_TYPE.K_WEEK: 128,
+                    KL_TYPE.K_MON: 128,
+                }
+                cap = cap_map.get(level, max(512, base_limit))
+                limit = base_limit
+                last_ts = data_list[-1].time.ts if data_list else None
+                raw_tail = None
+                for _ in range(8):
+                    raw_tail = _fetch_latest_klines_eastmoney(code, level, limit=limit, autype=AUTYPE.NONE)
+                    if not raw_tail:
+                        break
+                    if last_ts is None:
+                        break
+                    first_ts = raw_tail[0].time.ts
+                    if first_ts <= last_ts:
+                        break
+                    if limit >= cap:
+                        break
+                    limit = min(cap, int(limit * 2))
+
+                if raw_tail:
+                    tail = _adjust_tail_by_clickhouse_factors(code=code, tail_list=raw_tail, autype=autype)
+                    data_list = _merge_klines_tail(data_list, tail)
         return data_list
     finally:
         StockAPI.do_close()
 
-def get_latest_data_time(code, level, data_src_type):
+def get_latest_data_time(code, level, data_src_type, autype: AUTYPE = AUTYPE.QFQ):
     """
     Optimized function to get ONLY the latest data time without fetching full history.
     """
@@ -481,13 +744,15 @@ def get_latest_data_time(code, level, data_src_type):
     
     # Reuse fetch_stock_data but with short range
     try:
+        use_online_latest = bool(data_src_type == DATA_SRC.CLICK_HOUSE)
         data_list = fetch_stock_data(
             code,
             level,
             begin_time,
             end_time,
             data_src_type,
-            use_online_latest=(data_src_type == DATA_SRC.CLICK_HOUSE),
+            autype=autype,
+            use_online_latest=use_online_latest,
         )
         if data_list:
             return str(data_list[-1].time)
@@ -496,7 +761,7 @@ def get_latest_data_time(code, level, data_src_type):
     return None
 
 
-def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, data_src_type=DATA_SRC.BAO_STOCK, preloaded_data=None, do_predict=False, begin_time=None, enable_rolling_lookback=True):
+def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, data_src_type=DATA_SRC.BAO_STOCK, preloaded_data=None, do_predict=False, begin_time=None, enable_rolling_lookback=True, autype: AUTYPE = AUTYPE.QFQ):
     code = normalize_code(code)
     
     # Adjust begin_time based on frequency to avoid fetching too much data
@@ -548,7 +813,7 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
                 data_src=data_src,
                 lv_list=lv_list,
                 config=config,
-                autype=AUTYPE.QFQ,
+                autype=autype,
                 preloaded_data=preloaded_data
             )
         else:
@@ -559,7 +824,7 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
                 data_src=data_src,
                 lv_list=lv_list,
                 config=config,
-                autype=AUTYPE.QFQ,
+                autype=autype,
             )
     except Exception as e:
         print(f"Error loading CChan: {e}")
@@ -596,7 +861,8 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
                     "feature": last_bsp.features,
                     "is_buy": last_bsp.is_buy,
                     "open_time": last_klu.time,
-                    "bsp_obj": last_bsp
+                    "bsp_obj": last_bsp,
+                    "decision_klu": last_klu,
                 }
                 # Add custom strategy features
                 bsp_dict[last_bsp.klu.idx]['feature'].add_feat(stragety_feature(last_klu, enable_rolling_lookback=enable_rolling_lookback))
@@ -635,7 +901,53 @@ class SingleClassModel:
     def predict(self, X):
         return [self.label] * len(X)
 
-def build_training_data(bsp_dict, feature_meta=None):
+def _quantile(values, q: float):
+    if not values:
+        return 0.0
+    q = float(q)
+    if q <= 0.0:
+        return float(min(values))
+    if q >= 1.0:
+        return float(max(values))
+    vals = sorted(float(v) for v in values)
+    n = len(vals)
+    if n == 1:
+        return float(vals[0])
+    pos = q * (n - 1)
+    lo = int(pos)
+    hi = min(lo + 1, n - 1)
+    w = pos - lo
+    return float(vals[lo] * (1.0 - w) + vals[hi] * w)
+
+def _profit_for_info(info, lookahead: int = 5):
+    decision_klu = info.get('decision_klu')
+    cur_klu = decision_klu if decision_klu else info['bsp_obj'].klu
+    base_price = cur_klu.close
+    future_klu = cur_klu
+    for _ in range(int(lookahead or 0)):
+        nxt = getattr(future_klu, 'next', None)
+        if nxt:
+            future_klu = nxt
+        else:
+            break
+    if info['is_buy']:
+        profit = (future_klu.close - base_price) / (base_price or 1e-12)
+    else:
+        profit = (base_price - future_klu.close) / (base_price or 1e-12)
+    return float(profit)
+
+def _auto_profit_threshold_from_infos(infos, q: float = 0.7, min_threshold: float = 0.0, profit_lookahead: int = 5):
+    profits = []
+    for info in infos or []:
+        try:
+            profits.append(_profit_for_info(info, lookahead=profit_lookahead))
+        except Exception:
+            continue
+    if not profits:
+        return float(min_threshold)
+    return float(max(float(min_threshold), _quantile(profits, q)))
+
+def build_training_data(bsp_dict, feature_meta=None, profit_threshold: Optional[float] = 0.01, auto_profit_quantile: float = 0.7, profit_lookahead: int = 5):
     X = []
     y = []
     if not bsp_dict:
@@ -648,24 +960,18 @@ def build_training_data(bsp_dict, feature_meta=None):
                 all_keys.add(k)
         feature_meta = sorted(all_keys)
 
+    infos = list(bsp_dict.values())
+    if profit_threshold is None:
+        used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead)
+    else:
+        used_profit_threshold = float(profit_threshold)
+
     for _, info in bsp_dict.items():
-        lookahead = 5
-        cur_klu = info['bsp_obj'].klu
-        base_price = cur_klu.close
-        future_klu = cur_klu
-        for _ in range(lookahead):
-            if future_klu.next:
-                future_klu = future_klu.next
-            else:
-                break
-        if info['is_buy']:
-            profit = (future_klu.close - base_price) / (base_price or 1e-12)
-        else:
-            profit = (base_price - future_klu.close) / (base_price or 1e-12)
-            
-        # Threshold: Must be at least 1% profit to count as valid signal
-        # This filters out noise where profit is 0.001%
-        label = 1 if profit > 0.01 else 0
+        try:
+            profit = _profit_for_info(info, lookahead=profit_lookahead)
+        except Exception:
+            profit = 0.0
+        label = 1 if float(profit) > used_profit_threshold else 0
         feat_vec = [info['feature'].get(k, -9999999) for k in feature_meta]
         X.append(feat_vec)
         y.append(label)
@@ -681,44 +987,55 @@ def build_feature_meta(bsp_dict):
             all_keys.add(k)
     return sorted(all_keys)
 
-def build_training_data_from_infos(infos, feature_meta):
+def build_training_data_from_infos(infos, feature_meta, profit_threshold: Optional[float] = 0.01, auto_profit_quantile: float = 0.7, profit_lookahead: int = 5):
     X = []
     y = []
     if not infos:
         return X, y
 
+    if profit_threshold is None:
+        used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead)
+    else:
+        used_profit_threshold = float(profit_threshold)
+
     for info in infos:
-        lookahead = 5
-        
-        decision_klu = info.get('decision_klu')
-        
-        if decision_klu:
-            cur_klu = decision_klu
-            base_price = cur_klu.close
-        else:
-            cur_klu = info['bsp_obj'].klu
-            base_price = cur_klu.close
-            
-        future_klu = cur_klu
-        for _ in range(lookahead):
-            if getattr(future_klu, 'next', None):
-                future_klu = future_klu.next
-            else:
-                break
-        
-        if info['is_buy']:
-            profit = (future_klu.close - base_price) / (base_price or 1e-12)
-        else:
-            profit = (base_price - future_klu.close) / (base_price or 1e-12)
-            
-        # Threshold: Must be at least 1% profit to count as valid signal
-        # This filters out noise where profit is 0.001%
-        label = 1 if profit > 0.01 else 0
+        try:
+            profit = _profit_for_info(info, lookahead=profit_lookahead)
+        except Exception:
+            profit = 0.0
+        label = 1 if float(profit) > used_profit_threshold else 0
         feat_vec = [info['feature'].get(k, -9999999) for k in feature_meta]
         X.append(feat_vec)
         y.append(label)
 
     return X, y
+
+def build_estimator(model_type="xgboost", n_jobs=-1):
+    if model_type == "xgboost":
+        return xgb.XGBClassifier(
+            n_estimators=100,
+            learning_rate=0.1,
+            max_depth=5,
+            eval_metric='logloss',
+            n_jobs=n_jobs,
+            missing=-9999999,
+            random_state=42,
+        )
+    if model_type == "lightgbm":
+        return lgb.LGBMClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, verbosity=-1, n_jobs=n_jobs)
+    if model_type == "mlp":
+        return Pipeline([
+            ('imputer', SimpleImputer(missing_values=-9999999, strategy='mean')),
+            ('scaler', StandardScaler()),
+            ('mlp', MLPClassifier(
+                hidden_layer_sizes=(100, 50),
+                max_iter=2000,
+                learning_rate='adaptive',
+                early_stopping=True,
+                random_state=42
+            ))
+        ])
+    return xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, eval_metric='logloss')
 
 def train_model_from_xy(X_train, y_train, model_type="xgboost", n_jobs=-1):
     if not X_train:
@@ -726,30 +1043,8 @@ def train_model_from_xy(X_train, y_train, model_type="xgboost", n_jobs=-1):
     if len(set(y_train)) < 2:
         return SingleClassModel(list(set(y_train))[0])
 
-    model = None
-    if model_type == "xgboost":
-        model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, eval_metric='logloss', n_jobs=n_jobs)
-        model.fit(X_train, y_train)
-    elif model_type == "lightgbm":
-        model = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, verbosity=-1, n_jobs=n_jobs)
-        model.fit(X_train, y_train)
-    elif model_type == "mlp":
-        model = Pipeline([
-            ('imputer', SimpleImputer(missing_values=-9999999, strategy='mean')),
-            ('scaler', StandardScaler()),
-            ('mlp', MLPClassifier(
-                hidden_layer_sizes=(100, 50), 
-                max_iter=2000, 
-                learning_rate='adaptive',
-                early_stopping=True,
-                random_state=42
-            ))
-        ])
-        model.fit(X_train, y_train)
-    else:
-        model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, eval_metric='logloss')
-        model.fit(X_train, y_train)
-
+    model = build_estimator(model_type=model_type, n_jobs=n_jobs)
+    model.fit(X_train, y_train)
     return model
 
 def predict_proba_1(model, X):
@@ -781,20 +1076,16 @@ def evaluate_model_accuracy(model, X, y, threshold=0.5):
     if not model or not X or not y:
         return 0, 0, 0.0
 
+    preds = None
     try:
-        preds = model.predict(X)
-        preds = list(map(int, preds))
+        probs = predict_proba_1(model, X)
+        preds = [1 if float(p) >= float(threshold) else 0 for p in probs]
     except Exception:
-        probs = model.predict_proba(X)
-        preds = []
-        for row in probs:
-            if len(row) >= 2:
-                p1 = row[1]
-            elif len(row) == 1:
-                p1 = row[0]
-            else:
-                p1 = 0.0
-            preds.append(1 if p1 >= threshold else 0)
+        try:
+            preds = model.predict(X)
+            preds = list(map(int, preds))
+        except Exception:
+            preds = [0 for _ in range(len(X))]
 
     correct = 0
     total = min(len(preds), len(y))
@@ -804,7 +1095,7 @@ def evaluate_model_accuracy(model, X, y, threshold=0.5):
 
     return correct, total, (correct / total if total > 0 else 0.0)
 
-def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.2, val_ratio=0.2, threshold=0.5, calibrate_method="sigmoid", min_train=50, min_val=20, min_test=20, n_jobs=-1):
+def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.2, val_ratio=0.2, threshold=0.5, calibrate_method="sigmoid", min_train=50, min_val=20, min_test=20, n_jobs=-1, profit_threshold: Optional[float] = 0.01, auto_profit_quantile: float = 0.7, profit_lookahead: int = 5):
     empty_model = None
     empty_meta = []
     if not bsp_dict:
@@ -850,6 +1141,10 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.2, va
         test_window = max(3, int(n * 0.2))
         fold_count = 3
         first_train_end = max(5, n - fold_count * test_window)
+        if profit_threshold is None:
+            used_profit_threshold = _auto_profit_threshold_from_infos(infos[:first_train_end], q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead)
+        else:
+            used_profit_threshold = float(profit_threshold)
 
         total_correct = 0
         total_test = 0
@@ -863,8 +1158,8 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.2, va
 
             train_infos = infos[:train_end]
             test_infos = infos[test_start:test_end]
-            X_train, y_train = build_training_data_from_infos(train_infos, feature_meta)
-            X_test, y_test = build_training_data_from_infos(test_infos, feature_meta)
+            X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+            X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
             if len(set(y_train)) < 2 or len(set(y_test)) < 2:
                 continue
 
@@ -894,7 +1189,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.2, va
             }
 
         try:
-            X_all, y_all = build_training_data_from_infos(infos, feature_meta)
+            X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
         except Exception:
             X_all, y_all = [], []
         final_model = None
@@ -928,9 +1223,13 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.2, va
     test_infos = infos[val_end:]
 
     feature_meta = build_feature_meta(bsp_dict)
-    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta)
-    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta)
-    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta)
+    if profit_threshold is None:
+        used_profit_threshold = _auto_profit_threshold_from_infos(train_infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead)
+    else:
+        used_profit_threshold = float(profit_threshold)
+    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
 
     if len(set(y_train)) < 2 or len(set(y_test)) < 2:
         return None, feature_meta, {
@@ -955,23 +1254,52 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.2, va
     calibrated = False
     score_model = model
     used_calibrate_method = None
-    if model and X_val and y_val and len(set(y_val)) >= 2:
-        try:
-            chosen_method = calibrate_method
-            if chosen_method == "isotonic" and len(y_val) < 200:
-                chosen_method = "sigmoid"
+    if model and not isinstance(model, SingleClassModel):
+        X_cal = list(X_train or [])
+        y_cal = list(y_train or [])
+        if X_val and y_val:
+            X_cal.extend(X_val)
+            y_cal.extend(y_val)
+
+        if X_val and y_val and len(set(y_val)) >= 2:
             try:
-                cal = CalibratedClassifierCV(estimator=model, method=chosen_method, cv='prefit')
-            except TypeError:
-                cal = CalibratedClassifierCV(base_estimator=model, method=chosen_method, cv='prefit')
-            cal.fit(X_val, y_val)
-            score_model = cal
-            calibrated = True
-            used_calibrate_method = chosen_method
-        except Exception:
-            score_model = model
-            calibrated = False
-            used_calibrate_method = None
+                chosen_method = calibrate_method
+                if chosen_method == "isotonic" and len(y_val) < 200:
+                    chosen_method = "sigmoid"
+                try:
+                    cal = CalibratedClassifierCV(estimator=model, method=chosen_method, cv="prefit")
+                except TypeError:
+                    cal = CalibratedClassifierCV(base_estimator=model, method=chosen_method, cv="prefit")
+                cal.fit(X_val, y_val)
+                score_model = cal
+                calibrated = True
+                used_calibrate_method = chosen_method
+            except Exception:
+                score_model = model
+                calibrated = False
+                used_calibrate_method = None
+
+        if not calibrated and X_cal and y_cal and len(set(y_cal)) >= 2:
+            n_splits = 3 if len(y_cal) >= 120 else (2 if len(y_cal) >= 60 else 0)
+            if n_splits >= 2:
+                chosen_method = calibrate_method
+                if chosen_method == "isotonic" and len(y_cal) < 200:
+                    chosen_method = "sigmoid"
+                try:
+                    est = build_estimator(model_type=model_type, n_jobs=n_jobs)
+                    tscv = TimeSeriesSplit(n_splits=n_splits)
+                    try:
+                        cal = CalibratedClassifierCV(estimator=est, method=chosen_method, cv=tscv)
+                    except TypeError:
+                        cal = CalibratedClassifierCV(base_estimator=est, method=chosen_method, cv=tscv)
+                    cal.fit(X_cal, y_cal)
+                    score_model = cal
+                    calibrated = True
+                    used_calibrate_method = f"{chosen_method}_cv_ts"
+                except Exception:
+                    score_model = model
+                    calibrated = False
+                    used_calibrate_method = None
 
     valid_count, total_count, acc = evaluate_model_accuracy(score_model, X_test, y_test, threshold=threshold)
 
@@ -1027,7 +1355,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.2, va
         "calibration_bins": bins
     }
 
-def compute_time_split_accuracy(bsp_dict, model_type="xgboost", test_ratio=0.2, threshold=0.5, min_train=50, min_test=20):
+def compute_time_split_accuracy(bsp_dict, model_type="xgboost", test_ratio=0.2, threshold=0.5, min_train=50, min_test=20, profit_threshold: Optional[float] = 0.01, auto_profit_quantile: float = 0.7, profit_lookahead: int = 5):
     if not bsp_dict:
         return {
             "valid_count": 0,
@@ -1047,17 +1375,154 @@ def compute_time_split_accuracy(bsp_dict, model_type="xgboost", test_ratio=0.2, 
         calibrate_method="isotonic",
         min_train=min_train,
         min_val=0,
-        min_test=min_test
+        min_test=min_test,
+        profit_threshold=profit_threshold,
+        auto_profit_quantile=auto_profit_quantile,
+        profit_lookahead=profit_lookahead,
     )
     return info
 
-def get_or_train_model(_bsp_dict, _chan, model_type="xgboost"):
+def compute_recent_accuracy(bsp_dict, model_type="xgboost", recent_years: float = 1.0, threshold: float = 0.5, calibrate_method: str = "isotonic", min_train: int = 50, min_val: int = 20, min_test: int = 20, n_jobs: int = -1, profit_threshold: Optional[float] = 0.01, auto_profit_quantile: float = 0.7, profit_lookahead: int = 5):
+    if not bsp_dict:
+        return {
+            "valid_count": 0,
+            "total_count": 0,
+            "accuracy": 0.0,
+            "method": "recent_empty",
+            "train_count": 0,
+            "val_count": 0,
+            "test_count": 0
+        }
+
+    infos = list(bsp_dict.values())
+    try:
+        infos.sort(key=lambda i: getattr(i.get("open_time"), "ts", 0))
+    except Exception:
+        pass
+
+    if not infos:
+        return {
+            "valid_count": 0,
+            "total_count": 0,
+            "accuracy": 0.0,
+            "method": "recent_empty",
+            "train_count": 0,
+            "val_count": 0,
+            "test_count": 0
+        }
+
+    anchor_ts = getattr(infos[-1].get("open_time"), "ts", 0) or 0
+    try:
+        years = float(recent_years)
+    except Exception:
+        years = 1.0
+    if years <= 0:
+        years = 1.0
+    cutoff_ts = int(anchor_ts) - int(years * 365 * 24 * 3600)
+
+    train_infos = []
+    test_infos = []
+    for info in infos:
+        ts = getattr(info.get("open_time"), "ts", 0) or 0
+        if int(ts) >= int(cutoff_ts):
+            test_infos.append(info)
+        else:
+            train_infos.append(info)
+
+    if len(train_infos) < int(min_train) or len(test_infos) < int(min_test):
+        return {
+            "valid_count": 0,
+            "total_count": len(test_infos),
+            "accuracy": 0.0,
+            "method": "recent_insufficient_data",
+            "train_count": len(train_infos),
+            "val_count": 0,
+            "test_count": len(test_infos)
+        }
+
+    feature_meta = build_feature_meta(bsp_dict)
+    if profit_threshold is None:
+        used_profit_threshold = _auto_profit_threshold_from_infos(train_infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead)
+    else:
+        used_profit_threshold = float(profit_threshold)
+
+    val_size = max(int(min_val), int(len(train_infos) * 0.2))
+    val_size = min(val_size, max(0, len(train_infos) - int(min_train)))
+    if val_size < int(min_val):
+        val_size = 0
+
+    base_train_infos = train_infos[:-val_size] if val_size > 0 else train_infos
+    val_infos = train_infos[-val_size:] if val_size > 0 else []
+
+    X_train, y_train = build_training_data_from_infos(base_train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+
+    if len(set(y_train)) < 2 or len(set(y_test)) < 2:
+        return {
+            "valid_count": 0,
+            "total_count": len(y_test),
+            "accuracy": 0.0,
+            "method": "recent_single_class_split",
+            "train_count": len(X_train),
+            "val_count": len(X_val),
+            "test_count": len(X_test)
+        }
+
+    model = None
+    try:
+        model = train_model_from_xy(X_train, y_train, model_type=model_type, n_jobs=n_jobs)
+    except Exception:
+        model = None
+
+    if not model:
+        return {
+            "valid_count": 0,
+            "total_count": len(y_test),
+            "accuracy": 0.0,
+            "method": "recent_train_failed",
+            "train_count": len(X_train),
+            "val_count": len(X_val),
+            "test_count": len(X_test)
+        }
+
+    score_model = model
+    calibrated = False
+    used_calibrate_method = ""
+    chosen_method = str(calibrate_method or "").strip() or "isotonic"
+
+    if X_val and y_val and len(set(y_val)) >= 2:
+        try:
+            try:
+                cal = CalibratedClassifierCV(estimator=model, method=chosen_method, cv="prefit")
+            except TypeError:
+                cal = CalibratedClassifierCV(base_estimator=model, method=chosen_method, cv="prefit")
+            cal.fit(X_val, y_val)
+            score_model = cal
+            calibrated = True
+            used_calibrate_method = chosen_method
+        except Exception:
+            score_model = model
+
+    valid_count, total_count, acc = evaluate_model_accuracy(score_model, X_test, y_test, threshold=threshold)
+    return {
+        "valid_count": valid_count,
+        "total_count": total_count,
+        "accuracy": acc,
+        "method": f"recent_cutoff_calibrated_{used_calibrate_method}" if calibrated and used_calibrate_method else ("recent_cutoff_calibrated" if calibrated else "recent_cutoff_uncalibrated"),
+        "train_count": len(X_train),
+        "val_count": len(X_val),
+        "test_count": len(X_test),
+        "brier_score": brier_score(score_model, X_test, y_test),
+    }
+
+def get_or_train_model(_bsp_dict, _chan, model_type="xgboost", profit_threshold: Optional[float] = 0.01, auto_profit_quantile: float = 0.7, profit_lookahead: int = 5):
     # Prepare data for XGBoost
     if not _bsp_dict:
         return None, None
 
     feature_meta = build_feature_meta(_bsp_dict)
-    X_train, y_train, feature_meta = build_training_data(_bsp_dict, feature_meta)
+    X_train, y_train, feature_meta = build_training_data(_bsp_dict, feature_meta, profit_threshold=profit_threshold, auto_profit_quantile=auto_profit_quantile, profit_lookahead=profit_lookahead)
         
     print(f"Training data size: {len(X_train)}")
     print(f"Class distribution: {set(y_train)}")
@@ -1330,11 +1795,29 @@ def delete_pretrained_model_bundle_by_key(key: str):
         "missing": missing,
     }
 
-def load_pretrained_model_bundle(model_type: str, frequency: str, data_src: str):
+def load_pretrained_model_bundle(model_type: str, frequency: str, data_src: str, autype: Optional[object] = None):
     items = list_pretrained_model_metas(limit=None)
     mt = str(model_type or "")
     freq = str(frequency or "")
     src = str(data_src or "")
+    want_autype = None
+    if autype is not None:
+        try:
+            if isinstance(autype, AUTYPE):
+                want_autype = str(getattr(autype, "name", "") or "").strip().upper() or None
+            else:
+                raw = str(autype or "").strip().lower()
+                if raw == "hfq":
+                    want_autype = "HFQ"
+                elif raw == "qfq":
+                    want_autype = "QFQ"
+                elif raw == "none":
+                    want_autype = "NONE"
+                else:
+                    want_autype = str(autype or "").strip().upper() or None
+        except Exception:
+            want_autype = None
+
     candidates = []
     for m in items or []:
         if not isinstance(m, dict):
@@ -1347,7 +1830,40 @@ def load_pretrained_model_bundle(model_type: str, frequency: str, data_src: str)
             continue
         if int(m.get("version") or 0) != int(MODEL_CACHE_VERSION):
             continue
+        try:
+            if int(m.get("feature_count") or 0) <= 0:
+                continue
+        except Exception:
+            continue
+        if want_autype:
+            try:
+                meta = m.get("meta", {}) if isinstance(m.get("meta", {}), dict) else {}
+                got = str(meta.get("autype") or "").strip().upper()
+                if got and got != want_autype:
+                    continue
+            except Exception:
+                pass
         candidates.append(m)
+
+    if not candidates and want_autype:
+        for m in items or []:
+            if not isinstance(m, dict):
+                continue
+            if str(m.get("model_type") or "") != mt:
+                continue
+            if str(m.get("frequency") or "") != freq:
+                continue
+            if str(m.get("data_src") or "") != src:
+                continue
+            if int(m.get("version") or 0) != int(MODEL_CACHE_VERSION):
+                continue
+            try:
+                if int(m.get("feature_count") or 0) <= 0:
+                    continue
+            except Exception:
+                continue
+            candidates.append(m)
+
     if not candidates:
         return None
     key = str(candidates[0].get("key") or "").strip()
@@ -1370,9 +1886,12 @@ def load_pretrained_model_bundle_by_key(key: str):
         return None
     if bundle.get("key") and str(bundle.get("key")) != str(key):
         return None
+    fm = bundle.get("feature_meta")
+    if not isinstance(fm, list) or len(fm) <= 0:
+        return None
     return bundle
 
-def evaluate_fixed_model_time_split(bsp_dict, model, feature_meta, test_ratio=0.2, threshold=0.5):
+def evaluate_fixed_model_time_split(bsp_dict, model, feature_meta, test_ratio=0.2, threshold=0.5, profit_threshold: Optional[float] = 0.01, auto_profit_quantile: float = 0.7, profit_lookahead: int = 5):
     if not bsp_dict or not model or not feature_meta:
         return {
             "valid_count": 0,
@@ -1395,7 +1914,7 @@ def evaluate_fixed_model_time_split(bsp_dict, model, feature_meta, test_ratio=0.
 
     n = len(infos)
     if n <= 1:
-        X_all, y_all = build_training_data_from_infos(infos, feature_meta)
+        X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=profit_threshold, auto_profit_quantile=auto_profit_quantile, profit_lookahead=profit_lookahead)
         valid_count, total_count, acc = evaluate_model_accuracy(model, X_all, y_all, threshold=threshold)
         return {
             "valid_count": valid_count,
@@ -1414,7 +1933,7 @@ def evaluate_fixed_model_time_split(bsp_dict, model, feature_meta, test_ratio=0.
     split = max(1, min(split, n - 1))
     test_infos = infos[split:]
 
-    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta)
+    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=profit_threshold, auto_profit_quantile=auto_profit_quantile, profit_lookahead=profit_lookahead)
     valid_count, total_count, acc = evaluate_model_accuracy(model, X_test, y_test, threshold=threshold)
 
     bins = []
@@ -1470,10 +1989,37 @@ def evaluate_fixed_model_time_split(bsp_dict, model, feature_meta, test_ratio=0.
     }
 
 def _process_code_for_pretrain(args):
-    code, level, begin_time, data_src_type = args
+    profit_threshold = 0.01
+    profit_lookahead = 5
+    autype = AUTYPE.HFQ
+    if isinstance(args, (list, tuple)) and len(args) >= 6:
+        code, level, begin_time, data_src_type, profit_threshold, profit_lookahead = args[:6]
+        if len(args) >= 7:
+            autype = args[6]
+    elif isinstance(args, (list, tuple)) and len(args) >= 5:
+        code, level, begin_time, data_src_type, profit_threshold = args[:5]
+        if len(args) >= 6:
+            autype = args[5]
+    else:
+        code, level, begin_time, data_src_type = args
+        if isinstance(args, (list, tuple)) and len(args) >= 5:
+            autype = args[4]
     code = normalize_code(code)
     try:
-        kl_list = fetch_stock_data(code, level, begin_time, None, data_src_type)
+        if not isinstance(autype, AUTYPE):
+            raw = str(autype or "").strip()
+            if raw:
+                raw = raw.upper()
+                if raw in AUTYPE.__members__:
+                    autype = AUTYPE[raw]
+                else:
+                    autype = AUTYPE.HFQ
+            else:
+                autype = AUTYPE.HFQ
+    except Exception:
+        autype = AUTYPE.HFQ
+    try:
+        kl_list = fetch_stock_data(code, level, begin_time, None, data_src_type, autype=autype)
         if not kl_list:
             return code, None, [], set()
             
@@ -1487,7 +2033,8 @@ def _process_code_for_pretrain(args):
             data_src_type=data_src_type,
             preloaded_data=kl_list,
             do_predict=True,
-            begin_time=begin_time
+            begin_time=begin_time,
+            autype=autype,
         )
         
         local_samples = []
@@ -1498,9 +2045,10 @@ def _process_code_for_pretrain(args):
                 bsp_obj = info.get("bsp_obj", None)
                 if not bsp_obj or not getattr(bsp_obj, "klu", None):
                     continue
-                cur_klu = bsp_obj.klu
+                decision_klu = info.get("decision_klu", None)
+                cur_klu = decision_klu if decision_klu is not None else bsp_obj.klu
                 future_klu = cur_klu
-                for _ in range(5):
+                for _ in range(int(profit_lookahead or 0)):
                     nxt = getattr(future_klu, "next", None)
                     if nxt:
                         future_klu = nxt
@@ -1516,11 +2064,23 @@ def _process_code_for_pretrain(args):
 
                 is_buy = bool(info.get("is_buy", False))
                 profit = (future_close - cur_close) / cur_close if is_buy else (cur_close - future_close) / cur_close
-                label = 1 if profit > 0 else 0
+                try:
+                    used_profit_threshold = None if profit_threshold is None else float(profit_threshold)
+                except Exception:
+                    used_profit_threshold = 0.01
+                label = None if used_profit_threshold is None else (1 if float(profit) > used_profit_threshold else 0)
 
                 feat = info.get("feature", None)
+                feat_dict = {}
                 try:
-                    feat_dict = dict(feat) if feat is not None else {}
+                    if feat is None:
+                        feat_dict = {}
+                    elif isinstance(feat, dict):
+                        feat_dict = dict(feat)
+                    elif hasattr(feat, "items"):
+                        feat_dict = dict(feat.items())
+                    else:
+                        feat_dict = dict(feat)
                 except Exception:
                     feat_dict = {}
                 
@@ -1533,14 +2093,14 @@ def _process_code_for_pretrain(args):
                     open_ts = int(getattr(info.get("open_time", None), "ts", 0) or 0)
                 except Exception:
                     open_ts = 0
-                local_samples.append({"open_ts": open_ts, "feature": feat_dict, "label": label})
+                local_samples.append({"open_ts": open_ts, "feature": feat_dict, "profit": float(profit), "label": label})
         
         return code, latest_time, local_samples, feature_keys
     except Exception as e:
         print(f"Error processing {code}: {e}")
         return code, None, [], set()
 
-def pretrain_and_persist_model(codes, level, data_src_type, begin_time, model_type="xgboost", frequency="1d", data_src="clickhouse", calibrate_method="isotonic", progress_cb=None, pool_name=None):
+def pretrain_and_persist_model(codes, level, data_src_type, begin_time, model_type="xgboost", frequency="1d", data_src="clickhouse", calibrate_method="isotonic", progress_cb=None, pool_name=None, profit_threshold: Optional[float] = 0.01, auto_profit_quantile: float = 0.7, profit_lookahead: int = 5, autype: AUTYPE = AUTYPE.HFQ):
     if not codes:
         return None, {
             "status": "error",
@@ -1589,7 +2149,15 @@ def pretrain_and_persist_model(codes, level, data_src_type, begin_time, model_ty
         print(f"Starting pretrain data collection with {max_workers} workers for {len(codes)} codes.")
         
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-            tasks = [(code, level, begin_time, data_src_type) for code in codes]
+            autype_name = None
+            try:
+                autype_name = autype.name if isinstance(autype, AUTYPE) else str(autype or "").strip().upper()
+            except Exception:
+                autype_name = "HFQ"
+            if not autype_name:
+                autype_name = "HFQ"
+
+            tasks = [(code, level, begin_time, data_src_type, profit_threshold, profit_lookahead, autype_name) for code in codes]
             future_to_code = {executor.submit(_process_code_for_pretrain, t): t[0] for t in tasks}
             
             completed_count = 0
@@ -1621,13 +2189,19 @@ def pretrain_and_persist_model(codes, level, data_src_type, begin_time, model_ty
         feature_meta = sorted(feature_keys)
         samples.sort(key=lambda s: int(s.get("open_ts", 0) or 0))
 
-        def build_xy(rows):
+        def build_xy(rows, used_profit_threshold: float):
             X = []
             y = []
             for r in rows:
                 feat = r.get("feature", {}) or {}
                 X.append([feat.get(k, -9999999) for k in feature_meta])
-                y.append(int(r.get("label", 0) or 0))
+                if "profit" in r and r.get("profit") is not None:
+                    try:
+                        y.append(1 if float(r.get("profit")) > float(used_profit_threshold) else 0)
+                    except Exception:
+                        y.append(int(r.get("label", 0) or 0))
+                else:
+                    y.append(int(r.get("label", 0) or 0))
             return X, y
 
         n = len(samples)
@@ -1637,9 +2211,22 @@ def pretrain_and_persist_model(codes, level, data_src_type, begin_time, model_ty
         min_train = 50
         min_val = 20
         min_test = 20
+        used_profit_threshold = None
 
         if n < (min_train + min_val + min_test):
-            X_all, y_all = build_xy(samples)
+            if profit_threshold is None:
+                profits = []
+                for r in samples:
+                    if r.get("profit") is None:
+                        continue
+                    try:
+                        profits.append(float(r.get("profit")))
+                    except Exception:
+                        continue
+                used_profit_threshold = max(0.0, _quantile(profits, auto_profit_quantile)) if profits else 0.0
+            else:
+                used_profit_threshold = float(profit_threshold)
+            X_all, y_all = build_xy(samples, used_profit_threshold)
             model = None
             try:
                 model = train_model_from_xy(X_all, y_all, model_type=model_type)
@@ -1668,9 +2255,22 @@ def pretrain_and_persist_model(codes, level, data_src_type, begin_time, model_ty
             val_rows = samples[train_end:val_end]
             test_rows = samples[val_end:]
 
-            X_train, y_train = build_xy(train_rows)
-            X_val, y_val = build_xy(val_rows)
-            X_test, y_test = build_xy(test_rows)
+            if profit_threshold is None:
+                profits = []
+                for r in train_rows:
+                    if r.get("profit") is None:
+                        continue
+                    try:
+                        profits.append(float(r.get("profit")))
+                    except Exception:
+                        continue
+                used_profit_threshold = max(0.0, _quantile(profits, auto_profit_quantile)) if profits else 0.0
+            else:
+                used_profit_threshold = float(profit_threshold)
+
+            X_train, y_train = build_xy(train_rows, used_profit_threshold)
+            X_val, y_val = build_xy(val_rows, used_profit_threshold)
+            X_test, y_test = build_xy(test_rows, used_profit_threshold)
 
             model = None
             try:
@@ -1681,23 +2281,52 @@ def pretrain_and_persist_model(codes, level, data_src_type, begin_time, model_ty
             calibrated = False
             score_model = model
             used_calibrate_method = None
-            if model and not isinstance(model, SingleClassModel) and X_val and y_val and len(set(y_val)) >= 2:
-                try:
-                    chosen_method = calibrate_method
-                    if chosen_method == "isotonic" and len(y_val) < 200:
-                        chosen_method = "sigmoid"
+            if model and not isinstance(model, SingleClassModel):
+                X_cal = list(X_train or [])
+                y_cal = list(y_train or [])
+                if X_val and y_val:
+                    X_cal.extend(X_val)
+                    y_cal.extend(y_val)
+
+                if X_val and y_val and len(set(y_val)) >= 2:
                     try:
-                        cal = CalibratedClassifierCV(estimator=model, method=chosen_method, cv='prefit')
-                    except TypeError:
-                        cal = CalibratedClassifierCV(base_estimator=model, method=chosen_method, cv='prefit')
-                    cal.fit(X_val, y_val)
-                    score_model = cal
-                    calibrated = True
-                    used_calibrate_method = chosen_method
-                except Exception:
-                    score_model = model
-                    calibrated = False
-                    used_calibrate_method = None
+                        chosen_method = calibrate_method
+                        if chosen_method == "isotonic" and len(y_val) < 200:
+                            chosen_method = "sigmoid"
+                        try:
+                            cal = CalibratedClassifierCV(estimator=model, method=chosen_method, cv="prefit")
+                        except TypeError:
+                            cal = CalibratedClassifierCV(base_estimator=model, method=chosen_method, cv="prefit")
+                        cal.fit(X_val, y_val)
+                        score_model = cal
+                        calibrated = True
+                        used_calibrate_method = chosen_method
+                    except Exception:
+                        score_model = model
+                        calibrated = False
+                        used_calibrate_method = None
+
+                if not calibrated and X_cal and y_cal and len(set(y_cal)) >= 2:
+                    n_splits = 3 if len(y_cal) >= 120 else (2 if len(y_cal) >= 60 else 0)
+                    if n_splits >= 2:
+                        chosen_method = calibrate_method
+                        if chosen_method == "isotonic" and len(y_cal) < 200:
+                            chosen_method = "sigmoid"
+                        try:
+                            est = build_estimator(model_type=model_type, n_jobs=-1)
+                            tscv = TimeSeriesSplit(n_splits=n_splits)
+                            try:
+                                cal = CalibratedClassifierCV(estimator=est, method=chosen_method, cv=tscv)
+                            except TypeError:
+                                cal = CalibratedClassifierCV(base_estimator=est, method=chosen_method, cv=tscv)
+                            cal.fit(X_cal, y_cal)
+                            score_model = cal
+                            calibrated = True
+                            used_calibrate_method = f"{chosen_method}_cv_ts"
+                        except Exception:
+                            score_model = model
+                            calibrated = False
+                            used_calibrate_method = None
 
             valid_count, total_count, acc = evaluate_model_accuracy(score_model, X_test, y_test, threshold=threshold)
 
@@ -1763,11 +2392,14 @@ def pretrain_and_persist_model(codes, level, data_src_type, begin_time, model_ty
         meta = {
             "accuracy": accuracy_info,
             "begin_time": begin_time,
+            "autype": (autype.name if isinstance(autype, AUTYPE) else str(autype or "")),
             "codes": list(per_code_latest_time.keys()),
             "per_code_latest_time": per_code_latest_time,
             "per_code_sample_count": per_code_sample_count,
             "sample_count": len(samples),
-            "pool_name": pool_name
+            "pool_name": pool_name,
+            "profit_threshold": used_profit_threshold,
+            "profit_lookahead": int(profit_lookahead or 0),
         }
         report("saving", 0.95, "saving")
         path, model_key, trained_at = save_pretrained_model_bundle(

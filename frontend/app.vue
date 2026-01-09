@@ -41,8 +41,9 @@
     <div class="lg:overflow-hidden lg:h-[calc(100vh-40px)] flex-1 flex flex-col lg:flex-row">
       <!-- Sidebar (Left) - Hidden on Mobile -->
       <div v-show="showDesktopSidebar" class="hidden lg:flex w-[260px] bg-gray-50 dark:bg-gray-950 border-r border-gray-200 dark:border-gray-800 flex-col p-4 overflow-y-auto transition-all">
-        <SidebarContent 
+          <SidebarContent 
           v-model:code="code"
+          v-model:autype="autype"
           v-model:triggerStep="triggerStep"
           v-model:biStrict="biStrict"
           v-model:enableRollingLookback="enableRollingLookback"
@@ -68,10 +69,11 @@
           @runStrategy="strategyPanelRef.runStrategy()"
           @runPretrain="pretrainPanelRef.runPretrain()"
           @refresh="analyze(false, false, false)"
-          @toggle="handleManualClose"
-          @refreshPretrained="fetchIntradayPretrainedModels"
-        />
-      </div>
+            @toggle="handleManualClose"
+            @refreshPretrained="fetchIntradayPretrainedModels"
+            @searchHistory="handleSearchHistory"
+          />
+        </div>
 
       <!-- Main Content (Right) -->
       <div class="p-0 flex flex-col lg:overflow-hidden bg-white dark:bg-gray-900 flex-1 relative">
@@ -85,6 +87,34 @@
             <svg width="16" height="16" viewBox="0 0 24 24" class="text-gray-500 dark:text-gray-400"><path :d="MemoryChevronRight" /></svg>
         </div>
 
+        <!-- Mobile Tabs (Visible only on mobile) -->
+        <div class="lg:hidden relative border-b border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-950 shrink-0">
+          <div
+            ref="mobileTabsEl"
+            class="flex items-stretch gap-1 overflow-x-auto overflow-y-hidden whitespace-nowrap px-2 snap-x snap-mandatory scroll-px-2 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            style="-webkit-overflow-scrolling: touch;"
+            @scroll="updateMobileTabsHint"
+          >
+            <button 
+              v-for="tab in tabs" 
+              :key="tab.name" 
+              @click="activeTab = tab.name"
+              class="shrink-0 px-3 h-11 flex items-center gap-2 text-sm transition-colors border-b-2 snap-start"
+              :class="activeTab === tab.name ? 'bg-white dark:bg-gray-900 text-blue-600 border-blue-600 font-medium' : 'text-gray-600 dark:text-gray-400 border-transparent hover:bg-gray-100 dark:hover:bg-gray-800'"
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24"><path :d="tab.icon" /></svg>
+              <span class="whitespace-nowrap">{{ tab.label }}</span>
+            </button>
+          </div>
+
+          <div v-show="mobileTabsCanScrollLeft" class="pointer-events-none absolute left-0 top-0 bottom-0 w-10 bg-gradient-to-r from-gray-50 dark:from-gray-950 to-transparent flex items-center justify-start pl-1">
+            <UIcon name="i-heroicons-chevron-left" class="w-4 h-4 text-gray-400" />
+          </div>
+          <div v-show="mobileTabsCanScrollRight" class="pointer-events-none absolute right-0 top-0 bottom-0 w-10 bg-gradient-to-l from-gray-50 dark:from-gray-950 to-transparent flex items-center justify-end pr-1">
+            <UIcon name="i-heroicons-chevron-right" class="w-4 h-4 text-gray-400" />
+          </div>
+        </div>
+
         <!-- Mobile Sidebar (Top) -->
         <div
           class="lg:hidden bg-gray-50 dark:bg-gray-950 border-b border-gray-200 dark:border-gray-800 flex-shrink-0 overflow-hidden"
@@ -92,6 +122,7 @@
         >
           <SidebarContent 
             v-model:code="code"
+            v-model:autype="autype"
             v-model:triggerStep="triggerStep"
             v-model:biStrict="biStrict"
             v-model:enableRollingLookback="enableRollingLookback"
@@ -121,20 +152,6 @@
             @toggle="mobileSidebarCollapsed = !mobileSidebarCollapsed"
             @refreshPretrained="fetchIntradayPretrainedModels"
           />
-        </div>
-
-        <!-- Mobile Tabs (Visible only on mobile) -->
-        <div class="lg:hidden flex border-b border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-950 overflow-x-auto shrink-0">
-           <button 
-              v-for="tab in tabs" 
-              :key="tab.name" 
-              @click="activeTab = tab.name"
-              class="flex-1 py-3 flex justify-center items-center gap-2 text-sm transition-colors border-b-2"
-              :class="activeTab === tab.name ? 'bg-white dark:bg-gray-900 text-blue-600 border-blue-600 font-medium' : 'text-gray-600 dark:text-gray-400 border-transparent hover:bg-gray-100 dark:hover:bg-gray-800'"
-           >
-              <svg width="18" height="18" viewBox="0 0 24 24"><path :d="tab.icon" /></svg>
-              <span>{{ tab.label }}</span>
-           </button>
         </div>
 
         <!-- Content Area -->
@@ -272,12 +289,12 @@
           <!-- History Tab -->
           <div v-show="activeTab === 'history'" class="h-full w-full flex flex-col lg:overflow-hidden">
              <div class="lg:h-full lg:overflow-hidden p-2 box-border bg-white dark:bg-gray-900 flex-1">
-                <HistoryPanel @view="handleViewHistory" />
+                <HistoryPanel ref="historyPanelRef" @view="handleViewHistory" />
              </div>
           </div>
           
           <!-- Help Tab -->
-          <div v-show="activeTab === 'help'" class="h-full w-full overflow-y-auto">
+          <div id="help-container" v-show="activeTab === 'help'" class="h-full w-full overflow-y-auto">
              <div class="p-5">
                <HelpPanel />
              </div>
@@ -289,7 +306,7 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted, nextTick, computed } from 'vue'
+import { ref, watch, onMounted, onBeforeUnmount, nextTick, computed } from 'vue'
 import axios from 'axios'
 import { MemoryJournal, MemoryChartBar, MemoryBook, MemoryClock, MemoryChevronRight, MemoryFilter } from '@pictogrammers/memory'
 import { useI18n } from './composables/useI18n'
@@ -307,9 +324,26 @@ const tabs = computed(() => [
 ])
 
 const code = ref('002701')
+const mobileTabsEl = ref(null)
+const mobileTabsCanScrollLeft = ref(false)
+const mobileTabsCanScrollRight = ref(false)
 const mobileSidebarCollapsed = ref(false)
 const showDesktopSidebar = ref(true)
+const activeTab = ref('analysis')
 const userManuallyHidden = ref(false)
+
+const updateMobileTabsHint = () => {
+  const el = mobileTabsEl.value
+  if (!el) {
+    mobileTabsCanScrollLeft.value = false
+    mobileTabsCanScrollRight.value = false
+    return
+  }
+  const maxScrollLeft = Math.max(0, el.scrollWidth - el.clientWidth)
+  const left = el.scrollLeft
+  mobileTabsCanScrollLeft.value = left > 2
+  mobileTabsCanScrollRight.value = left < (maxScrollLeft - 2)
+}
 
 const handleManualClose = () => {
   showDesktopSidebar.value = false
@@ -328,8 +362,8 @@ const triggerStep = ref(true)
 const biStrict = ref(false)
 const enableRollingLookback = ref(true)
 const dailyBlendModels = ref(false)
+const autype = ref('hfq')
 const loading = ref(false)
-const activeTab = ref('analysis')
 const hasRunAnalysis = ref(false)
 const hasRunIntraday = ref(false)
 const intradayFreq = ref('30m')
@@ -346,11 +380,20 @@ const chartRef = ref(null)
 
 const pretrainPanelRef = ref(null)
 const strategyPanelRef = ref(null)
+const historyPanelRef = ref(null)
 const strategyForm = ref({
   strategy_name: `Strategy-${new Date().getTime()}`,
   pool_id: '',
   model: 'xgboost',
   min_accuracy: 0.8,
+  min_recent_accuracy: null,
+  recent_accuracy_years: 1.0,
+  min_signal_score: null,
+  min_bsp_count: 0,
+  min_test_count: 0,
+  profit_threshold: 0.01,
+  auto_profit_quantile: 0.7,
+  profit_lookahead: 5,
   frequency: '1d',
   data_length_years: 1.0,
   enable_rolling_lookback: true
@@ -416,6 +459,15 @@ if (typeof window !== 'undefined') {
   if (savedDataLengthYears) {
     dataLengthYears.value = parseFloat(savedDataLengthYears)
   }
+  const savedAutype = localStorage.getItem('lastAutype')
+  if (savedAutype) {
+    const raw = String(savedAutype).trim().toLowerCase()
+    const nextAutype = raw
+    autype.value = ['hfq', 'qfq', 'none'].includes(nextAutype) ? nextAutype : 'hfq'
+    if (autype.value !== raw) {
+      localStorage.setItem('lastAutype', autype.value)
+    }
+  }
 }
 
 // Update slider constraints based on frequency
@@ -438,10 +490,14 @@ watch(intradayFreq, (newFreq) => {
     dataLengthStep.value = 0.1
     if (dataLengthYears.value > 5.0) dataLengthYears.value = 5.0
     if (dataLengthYears.value < 0.1) dataLengthYears.value = 0.1
-  } else {
-    // 1d, 1w, 1mo
+  } else if (['1w', '1mo'].includes(newFreq)) {
     dataLengthMin.value = 0.1
-    dataLengthMax.value = 8.0
+    dataLengthMax.value = 20.0
+    dataLengthStep.value = 0.1
+  } else {
+    // 1d
+    dataLengthMin.value = 0.1
+    dataLengthMax.value = 20.0
     dataLengthStep.value = 0.1
   }
 
@@ -535,12 +591,19 @@ onMounted(() => {
 
   // Apply initial sidebar state
   if (['history', 'help'].includes(activeTab.value)) {
-    showDesktopSidebar.value = false
+    showDesktopSidebar.value = true
   }
 
   nextTick(() => {
     isInitialized.value = true
+    updateMobileTabsHint()
   })
+
+  window.addEventListener('resize', updateMobileTabsHint, { passive: true })
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', updateMobileTabsHint)
 })
 
 // Watch changes and save to localStorage
@@ -557,12 +620,11 @@ watch(activeTab, (newVal) => {
 
   // Sidebar Visibility Logic
   if (['history', 'help'].includes(newVal)) {
+    showDesktopSidebar.value = true
+  } else if (userManuallyHidden.value) {
     showDesktopSidebar.value = false
   } else {
-    // Show pages: analysis, intraday, pretrain
-    if (!userManuallyHidden.value) {
-      showDesktopSidebar.value = true
-    }
+    showDesktopSidebar.value = true
   }
   
   // Refresh pretrained models list when entering analysis/intraday tabs
@@ -612,6 +674,11 @@ watch(triggerStep, (newVal) => {
 watch(biStrict, (newVal) => {
   if (!isInitialized.value) return
   localStorage.setItem('lastBiStrict', newVal)
+})
+
+watch(autype, (newVal) => {
+  if (!isInitialized.value) return
+  localStorage.setItem('lastAutype', String(newVal))
 })
 
 watch(enableRollingLookback, (newVal) => {
@@ -764,13 +831,17 @@ const getPretrainedAvailability = ({ isIntraday }) => {
         code: code.value,
         frequency: frequency,
         do_predict: firstPassPrediction,
+        autype: autype.value,
         trigger_step: triggerStep.value,
         bi_strict: biStrict.value,
         enable_rolling_lookback: enableRollingLookback.value,
+        profit_threshold: strategyForm.value.profit_threshold,
+        auto_profit_quantile: strategyForm.value.auto_profit_quantile,
+        profit_lookahead: strategyForm.value.profit_lookahead,
         data_src: dataSrc.value,
         model: model.value,
         force_refresh: forceRefresh,
-        data_length_years: isIntraday ? dataLengthYears.value : undefined,
+        data_length_years: dataLengthYears.value,
         use_pretrained: isIntraday
             ? (intradayBlendModels.value ? (intradayPretrainedChoice.value === 'none' ? false : true) : false)
             : (dailyBlendModels.value ? (dailyPretrainedChoice.value === 'none' ? false : true) : false),
@@ -854,8 +925,12 @@ const getPretrainedAvailability = ({ isIntraday }) => {
                code: code.value,
                frequency: '1d',
                do_predict: true,
+               autype: autype.value,
                trigger_step: triggerStep.value,
                bi_strict: biStrict.value,
+               profit_threshold: strategyForm.value.profit_threshold,
+               auto_profit_quantile: strategyForm.value.auto_profit_quantile,
+               profit_lookahead: strategyForm.value.profit_lookahead,
                data_src: dataSrc.value,
                model: model.value
            }
@@ -872,6 +947,13 @@ const getPretrainedAvailability = ({ isIntraday }) => {
           console.error("Background prediction failed", e)
       }
   }
+}
+
+const handleSearchHistory = (searchCode) => {
+  activeTab.value = 'history'
+  nextTick(() => {
+    historyPanelRef.value?.search(searchCode)
+  })
 }
 
 const handleViewHistory = async (item) => {

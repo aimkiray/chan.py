@@ -123,19 +123,73 @@ class CAkShare(CCommonStockApi):
                 
             last_date = None
             for _, row in df.iterrows():
-                data = [str(row[c]) for c in columns]
-                # Try to capture last date
-                # data[0] is time
+                time_raw = row.get(DATA_FIELD.FIELD_TIME)
+                time_str = str(time_raw)
+
                 try:
-                    dt_str = str(data[0])
-                    if len(dt_str) >= 10:
-                        current_dt = datetime.datetime.strptime(dt_str[:10], "%Y-%m-%d")
+                    if len(time_str) >= 10:
+                        current_dt = datetime.datetime.strptime(time_str[:10], "%Y-%m-%d")
                         if last_date is None or current_dt > last_date:
                             last_date = current_dt
-                except:
+                except Exception:
                     pass
-                    
-                yield CKLine_Unit(create_item_dict(data, columns))
+
+                try:
+                    t = parse_time_column(time_str[:19] if len(time_str) >= 19 else time_str[:10])
+                except Exception:
+                    continue
+
+                def to_float(v):
+                    if v is None:
+                        return None
+                    if isinstance(v, (int, float)):
+                        if pd.isna(v):
+                            return None
+                        return float(v)
+                    s = str(v)
+                    if not s or s == "nan" or s == "None":
+                        return None
+                    try:
+                        f = float(s)
+                        if pd.isna(f):
+                            return None
+                        return float(f)
+                    except Exception:
+                        return None
+
+                o = to_float(row.get(DATA_FIELD.FIELD_OPEN))
+                h = to_float(row.get(DATA_FIELD.FIELD_HIGH))
+                l = to_float(row.get(DATA_FIELD.FIELD_LOW))
+                c = to_float(row.get(DATA_FIELD.FIELD_CLOSE))
+                if c is None or c <= 0:
+                    continue
+                if o is None or o <= 0:
+                    o = c
+                if h is None or h <= 0:
+                    h = c
+                if l is None or l <= 0:
+                    l = c
+                h = max(h, o, c)
+                l = min(l, o, c)
+
+                vol = to_float(row.get(DATA_FIELD.FIELD_VOLUME)) or 0.0
+                amt = to_float(row.get(DATA_FIELD.FIELD_TURNOVER)) or 0.0
+
+                item = {
+                    DATA_FIELD.FIELD_TIME: t,
+                    DATA_FIELD.FIELD_OPEN: float(o),
+                    DATA_FIELD.FIELD_HIGH: float(h),
+                    DATA_FIELD.FIELD_LOW: float(l),
+                    DATA_FIELD.FIELD_CLOSE: float(c),
+                    DATA_FIELD.FIELD_VOLUME: float(vol),
+                    DATA_FIELD.FIELD_TURNOVER: float(amt),
+                }
+                if not kltype_lt_day(self.k_type):
+                    tr = to_float(row.get(DATA_FIELD.FIELD_TURNRATE))
+                    if tr is not None:
+                        item[DATA_FIELD.FIELD_TURNRATE] = float(tr)
+
+                yield CKLine_Unit(item)
                 
             # Check for Real-time tick (Call Auction or Trading Session or missing today)
             now = datetime.datetime.now()

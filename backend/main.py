@@ -42,7 +42,7 @@ from backend.serialization import serialize_chan_data
 from backend.storage import StorageManager, StrategyRun
 from backend.strategy_runner import StrategyRunner
 from Plot.PlotMeta import CChanPlotMeta
-from Common.CEnum import KL_TYPE, DATA_SRC
+from Common.CEnum import KL_TYPE, DATA_SRC, AUTYPE
 
 app = FastAPI()
 storage = StorageManager()
@@ -296,6 +296,7 @@ class AnalyzeRequest(BaseModel):
     data_src: str = "clickhouse"
     model: str = "xgboost"
     do_predict: bool = False
+    autype: str = "hfq"
     force_refresh: bool = False
     data_length_mode: str = "default" # "default" or "max"
     data_length_years: Optional[float] = None
@@ -303,6 +304,9 @@ class AnalyzeRequest(BaseModel):
     pretrained_model_key: Optional[str] = None
     blend_models: Optional[bool] = None
     enable_rolling_lookback: bool = True # Enable/Disable long-term context features
+    profit_threshold: Optional[float] = 0.01
+    auto_profit_quantile: float = 0.7
+    profit_lookahead: int = 5
 
 class PretrainRequest(BaseModel):
     codes: list[str]
@@ -312,7 +316,11 @@ class PretrainRequest(BaseModel):
     data_length_mode: str = "max"
     data_length_years: Optional[float] = None
     force_refresh: bool = False
+    autype: str = "hfq"
     pool_name: Optional[str] = None
+    profit_threshold: Optional[float] = 0.01
+    auto_profit_quantile: float = 0.7
+    profit_lookahead: int = 5
 
 class UpdatePretrainedModelNameRequest(BaseModel):
     name: Optional[str] = None
@@ -323,7 +331,11 @@ async def create_pretrain_job(req: PretrainRequest):
         "codes": sorted([normalize_code(str(c).strip()) for c in (req.codes or []) if str(c).strip()]),
         "data_length_mode": req.data_length_mode,
         "data_length_years": req.data_length_years,
-        "pool_name": req.pool_name
+        "autype": str(req.autype or "").strip().lower() or "hfq",
+        "pool_name": req.pool_name,
+        "profit_threshold": req.profit_threshold,
+        "auto_profit_quantile": req.auto_profit_quantile,
+        "profit_lookahead": req.profit_lookahead,
     }
     # Removed database duplicate check to allow re-training with new unique keys
     # if not req.force_refresh and storage.is_duplicate_pretrain(req.model, req.frequency, req.data_src, params):
@@ -349,6 +361,7 @@ async def create_pretrain_job(req: PretrainRequest):
                 "data_length_mode": req.data_length_mode,
                 "data_length_years": req.data_length_years,
                 "force_refresh": req.force_refresh,
+                "autype": str(req.autype or "").strip().lower() or "hfq",
             },
             "created_at": now,
             "updated_at": now,
@@ -386,6 +399,15 @@ async def create_pretrain_job(req: PretrainRequest):
             data_src_type = src_map.get(req.data_src, DATA_SRC.BAO_STOCK)
 
             begin_time = _calc_pretrain_begin_time(req, level)
+            raw_autype = str(getattr(req, "autype", "hfq") or "hfq").strip().lower()
+            autype_map = {
+                "qfq": AUTYPE.QFQ,
+                "hfq": AUTYPE.HFQ,
+                "none": AUTYPE.NONE,
+            }
+            autype = autype_map.get(raw_autype)
+            if autype is None:
+                autype = AUTYPE.HFQ
 
             def progress_cb(p):
                 if not isinstance(p, dict):
@@ -415,6 +437,10 @@ async def create_pretrain_job(req: PretrainRequest):
                 calibrate_method="isotonic",
                 progress_cb=progress_cb,
                 pool_name=req.pool_name,
+                profit_threshold=req.profit_threshold,
+                auto_profit_quantile=req.auto_profit_quantile,
+                profit_lookahead=req.profit_lookahead,
+                autype=autype,
             )
             if not path:
                 detail = None
@@ -782,6 +808,15 @@ async def analyze_stock(req: AnalyzeRequest):
             "clickhouse": DATA_SRC.CLICK_HOUSE,
         }
         data_src = src_map.get(req.data_src, DATA_SRC.BAO_STOCK)
+        raw_autype = str(getattr(req, "autype", "hfq") or "hfq").strip().lower()
+        autype_map = {
+            "qfq": AUTYPE.QFQ,
+            "hfq": AUTYPE.HFQ,
+            "none": AUTYPE.NONE,
+        }
+        autype = autype_map.get(raw_autype)
+        if autype is None:
+            raise HTTPException(status_code=400, detail="invalid autype, expect qfq/hfq/none")
 
         # 1. Calculate Time Range First
         import datetime
@@ -823,7 +858,7 @@ async def analyze_stock(req: AnalyzeRequest):
         try:
             # Only fetch the latest time (lightweight)
             # Use short lookback for efficiency
-            latest_data_time = get_latest_data_time(req.code, level, data_src)
+            latest_data_time = get_latest_data_time(req.code, level, data_src, autype=autype)
         except Exception as e:
              print(f"Error fetching latest time: {e}")
 
@@ -834,8 +869,14 @@ async def analyze_stock(req: AnalyzeRequest):
             "data_src": req.data_src,
             "do_predict": req.do_predict,
             "data_length_mode": req.data_length_mode,
-            "data_length_years": req.data_length_years
+            "data_length_years": req.data_length_years,
+            "profit_threshold": req.profit_threshold,
+            "auto_profit_quantile": req.auto_profit_quantile,
+            "profit_lookahead": req.profit_lookahead,
+            "autype": autype.name,
         }
+        use_online_latest = bool(data_src == DATA_SRC.CLICK_HOUSE)
+        params["use_online_latest"] = use_online_latest
         if req.use_pretrained is not None:
             params["use_pretrained"] = req.use_pretrained
         if req.pretrained_model_key is not None:
@@ -878,7 +919,8 @@ async def analyze_stock(req: AnalyzeRequest):
                 begin_time,
                 None,
                 data_src,
-                use_online_latest=(data_src == DATA_SRC.CLICK_HOUSE),
+                autype=autype,
+                use_online_latest=use_online_latest,
             )
         except Exception as e:
             print(f"Fetch data error: {e}")
@@ -899,7 +941,8 @@ async def analyze_stock(req: AnalyzeRequest):
             preloaded_data=kl_list, 
             do_predict=req.do_predict,
             begin_time=begin_time,
-            enable_rolling_lookback=req.enable_rolling_lookback
+            enable_rolling_lookback=req.enable_rolling_lookback,
+            autype=autype,
         )
         
         if not chan or not last_snapshot:
@@ -941,12 +984,19 @@ async def analyze_stock(req: AnalyzeRequest):
 
                 if not pretrained_bundle:
                     try:
-                        pretrained_bundle = load_pretrained_model_bundle(req.model, req.frequency, req.data_src)
+                        pretrained_bundle = load_pretrained_model_bundle(req.model, req.frequency, req.data_src, autype=autype)
                     except Exception:
                         pretrained_bundle = None
 
             if should_blend:
-                online_bst, online_feature_meta, online_accuracy = train_time_split_backtest(bsp_dict, model_type=req.model, calibrate_method="isotonic")
+                online_bst, online_feature_meta, online_accuracy = train_time_split_backtest(
+                    bsp_dict,
+                    model_type=req.model,
+                    calibrate_method="isotonic",
+                    profit_threshold=req.profit_threshold,
+                    auto_profit_quantile=req.auto_profit_quantile,
+                    profit_lookahead=req.profit_lookahead,
+                )
                 if online_accuracy is not None:
                     online_accuracy["pretrained"] = False
                     online_accuracy["mode"] = "online"
@@ -957,7 +1007,22 @@ async def analyze_stock(req: AnalyzeRequest):
                 if pretrained_bundle and pretrained_bundle.get("model") and pretrained_bundle.get("feature_meta"):
                     pretrained_bst = pretrained_bundle["model"]
                     pretrained_feature_meta = pretrained_bundle["feature_meta"]
-                    pretrained_accuracy = evaluate_fixed_model_time_split(bsp_dict, pretrained_bst, pretrained_feature_meta, test_ratio=0.2, threshold=0.5)
+                    pt = req.profit_threshold
+                    try:
+                        if pt is None and isinstance(pretrained_bundle.get("meta"), dict):
+                            pt = pretrained_bundle["meta"].get("profit_threshold", None)
+                    except Exception:
+                        pt = req.profit_threshold
+                    pretrained_accuracy = evaluate_fixed_model_time_split(
+                        bsp_dict,
+                        pretrained_bst,
+                        pretrained_feature_meta,
+                        test_ratio=0.2,
+                        threshold=0.5,
+                        profit_threshold=pt,
+                        auto_profit_quantile=req.auto_profit_quantile,
+                        profit_lookahead=req.profit_lookahead,
+                    )
                     pretrained_accuracy["pretrained"] = True
                     pretrained_accuracy["mode"] = "pretrained"
                     pretrained_accuracy["pretrained_key"] = pretrained_bundle.get("key")
@@ -996,7 +1061,14 @@ async def analyze_stock(req: AnalyzeRequest):
                     feature_meta = online_feature_meta
                     accuracy_info = online_accuracy
             else:
-                bst, feature_meta, accuracy_info = train_time_split_backtest(bsp_dict, model_type=req.model, calibrate_method="isotonic")
+                bst, feature_meta, accuracy_info = train_time_split_backtest(
+                    bsp_dict,
+                    model_type=req.model,
+                    calibrate_method="isotonic",
+                    profit_threshold=req.profit_threshold,
+                    auto_profit_quantile=req.auto_profit_quantile,
+                    profit_lookahead=req.profit_lookahead,
+                )
                 if accuracy_info is not None:
                     accuracy_info["pretrained"] = False
                     accuracy_info["mode"] = "online"
@@ -1112,6 +1184,16 @@ async def pretrain_model(req: PretrainRequest):
         }
         data_src_type = src_map.get(req.data_src, DATA_SRC.BAO_STOCK)
 
+        raw_autype = str(getattr(req, "autype", "hfq") or "hfq").strip().lower()
+        autype_map = {
+            "qfq": AUTYPE.QFQ,
+            "hfq": AUTYPE.HFQ,
+            "none": AUTYPE.NONE,
+        }
+        autype = autype_map.get(raw_autype)
+        if autype is None:
+            autype = AUTYPE.HFQ
+
         import datetime
         days = 365
         if req.data_length_years is not None:
@@ -1146,6 +1228,10 @@ async def pretrain_model(req: PretrainRequest):
             frequency=req.frequency,
             data_src=req.data_src,
             calibrate_method="isotonic",
+            profit_threshold=req.profit_threshold,
+            auto_profit_quantile=req.auto_profit_quantile,
+            profit_lookahead=req.profit_lookahead,
+            autype=autype,
         )
         if not path:
             raise HTTPException(status_code=400, detail=result.get("detail", "pretrain failed"))
@@ -1203,7 +1289,14 @@ class StrategyRequest(BaseModel):
     scope: str = "hs300"
     pool_id: Optional[str] = None
     model: str = "xgboost"
+    autype: str = "hfq"
     min_accuracy: float = 0.8
+    min_recent_accuracy: Optional[float] = None
+    recent_accuracy_years: float = 1.0
+    min_signal_score: Optional[float] = None
+    profit_threshold: Optional[float] = 0.01
+    auto_profit_quantile: float = 0.7
+    profit_lookahead: int = 5
     frequency: str = "1d"
     data_length_years: float = 1.0
     chan_config: Optional[Dict[str, Any]] = None

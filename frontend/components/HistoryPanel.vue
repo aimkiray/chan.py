@@ -76,6 +76,7 @@ const toast = useToast()
 const page = ref(1)
 const pageSize = ref(10)
 const total = ref(0)
+const searchQuery = ref('')
 
 const columns = computed(() => [
   { key: 'code', label: t('history.code'), sortable: true },
@@ -94,7 +95,8 @@ const fetchHistory = async () => {
     const res = await axios.get('/api/history', {
         params: {
             page: page.value,
-            page_size: pageSize.value
+            page_size: pageSize.value,
+            code: searchQuery.value
         }
     })
     
@@ -202,5 +204,11 @@ onMounted(() => {
   fetchHistory()
 })
 
-defineExpose({ refresh: fetchHistory })
+const search = (code) => {
+    searchQuery.value = code
+    page.value = 1
+    fetchHistory()
+}
+
+defineExpose({ refresh: fetchHistory, search })
 </script>

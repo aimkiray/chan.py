@@ -11,7 +11,7 @@
       <div class="bg-gray-50 dark:bg-gray-800 rounded p-4 mb-4 flex justify-between items-center">
         <div>
           <div class="text-sm text-gray-500 dark:text-gray-400 mb-1">{{ t('analysis.latestPrice') }}</div>
-          <div class="text-2xl font-bold text-gray-900 dark:text-white">{{ latestClose }}</div>
+          <div class="text-2xl font-bold text-gray-900 dark:text-white">{{ latestCloseText }}</div>
         </div>
         <div class="text-right">
           <div class="text-sm text-emerald-500">{{ latestDate }}</div>
@@ -182,6 +182,11 @@ const props = defineProps({
   loading: Boolean
 })
 
+const latestCloseText = computed(() => {
+  const n = Number(props.latestClose)
+  return Number.isFinite(n) ? n.toFixed(2) : '--'
+})
+
 const timeDiffLabel = computed(() => {
   if (['1s', '1m', '5m', '15m', '30m', '60m'].includes(props.frequency)) {
     return t('analysis.timeDiff')
@@ -265,20 +270,20 @@ const formatSignalType = (type, isBuy) => {
   if (!type) return '--'
   
   const lowerType = type.toLowerCase()
-  if (lowerType.includes('1buy')) return isBuy ? '一买 (1B)' : '一卖 (1S)'
-  if (lowerType.includes('2buy')) return isBuy ? '二买 (2B)' : '二卖 (2S)'
-  if (lowerType.includes('3buy')) return isBuy ? '三买 (3B)' : '三卖 (3S)'
-  if (lowerType.includes('l2buy')) return isBuy ? '类二买 (L2B)' : '类二卖 (L2S)'
-  if (lowerType.includes('l3buy')) return isBuy ? '类三买 (L3B)' : '类三卖 (L3S)'
+  if (lowerType.includes('1buy')) return isBuy ? t('analysis.signalType.buy1') : t('analysis.signalType.sell1')
+  if (lowerType.includes('2buy')) return isBuy ? t('analysis.signalType.buy2') : t('analysis.signalType.sell2')
+  if (lowerType.includes('3buy')) return isBuy ? t('analysis.signalType.buy3') : t('analysis.signalType.sell3')
+  if (lowerType.includes('l2buy')) return isBuy ? t('analysis.signalType.buyL2') : t('analysis.signalType.sellL2')
+  if (lowerType.includes('l3buy')) return isBuy ? t('analysis.signalType.buyL3') : t('analysis.signalType.sellL3')
   
-  if (lowerType === '3a') return isBuy ? '三买A (3B-A)' : '三卖A (3S-A)'
-  if (lowerType === '3b') return isBuy ? '三买B (3B-B)' : '三卖B (3S-B)'
+  if (lowerType === '3a') return isBuy ? t('analysis.signalType.buy3a') : t('analysis.signalType.sell3a')
+  if (lowerType === '3b') return isBuy ? t('analysis.signalType.buy3b') : t('analysis.signalType.sell3b')
   
-  if (lowerType.includes('1sell')) return '一卖 (1S)'
-  if (lowerType.includes('2sell')) return '二卖 (2S)'
-  if (lowerType.includes('3sell')) return '三卖 (3S)'
-  if (lowerType.includes('l2sell')) return '类二卖 (L2S)'
-  if (lowerType.includes('l3sell')) return '类三卖 (L3S)'
+  if (lowerType.includes('1sell')) return t('analysis.signalType.sell1')
+  if (lowerType.includes('2sell')) return t('analysis.signalType.sell2')
+  if (lowerType.includes('3sell')) return t('analysis.signalType.sell3')
+  if (lowerType.includes('l2sell')) return t('analysis.signalType.sellL2')
+  if (lowerType.includes('l3sell')) return t('analysis.signalType.sellL3')
   
   return type.toUpperCase()
 }

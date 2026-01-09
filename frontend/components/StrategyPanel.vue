@@ -208,6 +208,14 @@
                 <template #accuracy-data="{ row }">
                   <span :class="row.accuracy >= 0.8 ? 'text-green-600 dark:text-green-400 font-bold' : ''">{{ (row.accuracy * 100).toFixed(1) }}%</span>
                 </template>
+                <template #recent_accuracy-data="{ row }">
+                  <span v-if="row.recent_accuracy === null || row.recent_accuracy === undefined || row.recent_accuracy === ''">-</span>
+                  <span v-else :class="row.recent_accuracy >= 0.7 ? 'text-green-600 dark:text-green-400 font-bold' : ''">{{ (row.recent_accuracy * 100).toFixed(1) }}%</span>
+                </template>
+                <template #signal_score-data="{ row }">
+                  <span v-if="row.signal_score === null || row.signal_score === undefined || row.signal_score === ''">-</span>
+                  <span v-else :class="row.signal_score >= 0.8 ? 'text-green-600 dark:text-green-400 font-bold' : ''">{{ (row.signal_score * 100).toFixed(1) }}%</span>
+                </template>
               </UTable>
             </div>
 
@@ -288,6 +296,8 @@ const columns = [
   { key: 'code', label: t('sidebar.stockCode') },
   { key: 'name', label: 'Name' },
   { key: 'accuracy', label: t('analysis.accuracy') },
+  { key: 'recent_accuracy', label: t('strategy.recentAccuracy') },
+  { key: 'signal_score', label: t('strategy.signalScore') },
   { key: 'signal_type', label: 'Signal' },
   { key: 'latest_date', label: t('analysis.signalDate') }
 ]
@@ -352,7 +362,7 @@ const runStrategy = async () => {
     const pid = String(props.form.pool_id || '').trim() || String(props.form.scope || '').trim() || 'HS300'
     const poolLabel = poolMap.value[pid] || pid
     const freqRaw = String(props.form.frequency || '').trim() || '1d'
-    const freqLabel = ({ '1d': '日线', '30m': '30分钟', '60m': '60分钟', '5m': '5分钟' }[freqRaw] || freqRaw)
+    const freqLabel = ({ '1d': '日线', '1w': '周线', '1mo': '月线', '60m': '60分钟', '30m': '30分钟', '15m': '15分钟', '5m': '5分钟', '1m': '1分钟' }[freqRaw] || freqRaw)
 
     const modelRaw = String(props.form.model || '').trim() || 'xgboost'
     const modelLabel = ({ xgboost: 'XGB', lightgbm: 'LGBM', mlp: 'MLP' }[modelRaw] || modelRaw)
@@ -384,20 +394,28 @@ const runStrategy = async () => {
     ].filter(Boolean)
 
     const strategyName = userName && !isDefaultName ? userName : nameParts.join(' | ')
+    const chanConfig = {
+      bi_strict: props.chanConfig.bi_strict,
+      trigger_step: props.chanConfig.trigger_step,
+      bsp2_follow_1: props.chanConfig.bsp2_follow_1,
+      bsp3_follow_1: props.chanConfig.bsp3_follow_1,
+      bs_type: props.chanConfig.bs_type,
+      macd_algo: props.chanConfig.macd_algo,
+      min_zs_cnt: props.chanConfig.min_zs_cnt,
+      gap_as_kl: props.chanConfig.gap_as_kl,
+      bi_allow_sub_peak: props.chanConfig.bi_allow_sub_peak
+    }
+    const divergenceRate = Number(props.chanConfig.divergence_rate)
+    if (Number.isFinite(divergenceRate)) chanConfig.divergence_rate = divergenceRate
+    const maxBs2Rate = Number(props.chanConfig.max_bs2_rate)
+    if (Number.isFinite(maxBs2Rate)) chanConfig.max_bs2_rate = maxBs2Rate
+    const zsAlgo = String(props.chanConfig.zs_algo || '').trim()
+    if (zsAlgo) chanConfig.zs_algo = zsAlgo
+
     const params = {
       ...props.form,
       strategy_name: strategyName,
-      chan_config: {
-          bi_strict: props.chanConfig.bi_strict,
-          trigger_step: props.chanConfig.trigger_step,
-          bsp2_follow_1: props.chanConfig.bsp2_follow_1,
-          bsp3_follow_1: props.chanConfig.bsp3_follow_1,
-          bs_type: props.chanConfig.bs_type,
-          macd_algo: props.chanConfig.macd_algo,
-          min_zs_cnt: props.chanConfig.min_zs_cnt,
-          gap_as_kl: props.chanConfig.gap_as_kl,
-          bi_allow_sub_peak: props.chanConfig.bi_allow_sub_peak
-      },
+      chan_config: chanConfig,
       require_signal: props.chanConfig.require_signal,
       signal_lookback: props.chanConfig.signal_lookback,
       signal_direction: props.chanConfig.signal_direction
@@ -418,7 +436,37 @@ defineExpose({ runStrategy })
 
 const formatParams = (params) => {
   if (!params) return ''
-  return `Pool: ${params.pool_id || 'HS300'}, Model: ${params.model}, MinAcc: ${params.min_accuracy}`
+  const parts = [
+    `Pool: ${params.pool_id || 'HS300'}`,
+    `Model: ${params.model}`,
+    `MinAcc: ${params.min_accuracy}`,
+  ]
+  if (params.min_recent_accuracy !== null && params.min_recent_accuracy !== undefined && params.min_recent_accuracy !== '') {
+    parts.push(`MinRecentAcc: ${params.min_recent_accuracy}`)
+  }
+  if (params.recent_accuracy_years !== null && params.recent_accuracy_years !== undefined && params.recent_accuracy_years !== '') {
+    parts.push(`RecentWindow: ${params.recent_accuracy_years}`)
+  }
+  if (params.min_signal_score !== null && params.min_signal_score !== undefined && params.min_signal_score !== '') {
+    parts.push(`MinScore: ${params.min_signal_score}`)
+  }
+  if (params.profit_threshold === null || params.profit_threshold === undefined || params.profit_threshold === '') {
+    parts.push(`ProfitThr: auto@${params.auto_profit_quantile ?? 0.7}`)
+  } else {
+    parts.push(`ProfitThr: ${params.profit_threshold}`)
+  }
+  if (params.profit_lookahead !== null && params.profit_lookahead !== undefined && params.profit_lookahead !== '') {
+    parts.push(`Lookahead: ${params.profit_lookahead}`)
+  }
+  if (params.min_bsp_count !== null && params.min_bsp_count !== undefined && params.min_bsp_count !== '') {
+    const v = Number(params.min_bsp_count)
+    if (Number.isFinite(v) && v > 0) parts.push(`MinSamples: ${v}`)
+  }
+  if (params.min_test_count !== null && params.min_test_count !== undefined && params.min_test_count !== '') {
+    const v = Number(params.min_test_count)
+    if (Number.isFinite(v) && v > 0) parts.push(`MinTest: ${v}`)
+  }
+  return parts.join(', ')
 }
 
 // Removed fetchPools - sidebar handles pool fetching/selection now (or app.vue)

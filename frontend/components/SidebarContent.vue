@@ -7,7 +7,8 @@
         @click="$emit('toggle')"
       >
         <div class="flex items-center gap-2">
-          {{ t('sidebar.params') }}
+          <svg v-if="activeTab === 'help'" width="16" height="16" viewBox="0 0 24 24" class="text-gray-500"><path :d="MemoryBook" /></svg>
+          {{ activeTab === 'help' ? t('help.tocTitle') : t('sidebar.params') }}
         </div>
         
         <!-- Toggle Button -->
@@ -33,6 +34,22 @@
               </UTooltip>
             </div>
             <UInput v-model="proxyCode" :placeholder="t('sidebar.codePlaceholder')" class="w-full" />
+          </div>
+
+          <div>
+            <div class="flex items-center gap-1 mb-2">
+              <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('sidebar.autype') }}</label>
+              <UTooltip :text="t('sidebar.autypeHint')" :popper="{ placement: 'right' }">
+                <UIcon name="i-heroicons-exclamation-circle" class="w-4 h-4 text-gray-400 hover:text-gray-600 cursor-help" />
+              </UTooltip>
+            </div>
+            <USelectMenu
+              v-model="proxyAutype"
+              :options="autypeOptions"
+              value-attribute="value"
+              option-attribute="label"
+              class="w-full"
+            />
           </div>
 
           <!-- Intraday Specific Configs -->
@@ -70,7 +87,7 @@
                 </div>
                 <USelectMenu
                    v-model="proxyDataSrc"
-                   :options="['clickhouse', 'baostock', 'akshare']"
+                   :options="dataSrcOptions"
                    value-attribute="value"
                    option-attribute="label"
                    class="w-full"
@@ -79,7 +96,7 @@
                       {{ t('app.dataSrcOptions.' + proxyDataSrc) }}
                    </template>
                    <template #option="{ option }">
-                      {{ t('app.dataSrcOptions.' + option) }}
+                      {{ option.label }}
                    </template>
                 </USelectMenu>
              </div>
@@ -94,7 +111,7 @@
                 </div>
                 <USelectMenu
                    v-model="proxyModel"
-                   :options="['xgboost', 'lightgbm', 'mlp']"
+                   :options="modelOptions"
                    value-attribute="value"
                    option-attribute="label"
                    class="w-full"
@@ -103,7 +120,7 @@
                       {{ t('app.modelOptions.' + proxyModel) }}
                    </template>
                    <template #option="{ option }">
-                      {{ t('app.modelOptions.' + option) }}
+                      {{ option.label }}
                    </template>
                 </USelectMenu>
              </div>
@@ -156,7 +173,7 @@
           <div class="pt-4 border-t border-gray-100 dark:border-gray-800">
             <div class="pt-2">
               <UButton size="xs" variant="ghost" color="gray" block @click="showAdvancedAnalysis = !showAdvancedAnalysis" :icon="showAdvancedAnalysis ? 'i-heroicons-chevron-up' : 'i-heroicons-chevron-down'">
-                {{ showAdvancedAnalysis ? '收起高级配置' : '展开高级配置' }}
+                {{ showAdvancedAnalysis ? t('sidebar.collapseAdvanced') : t('sidebar.expandAdvanced') }}
               </UButton>
             </div>
 
@@ -211,6 +228,58 @@
           
           <UButton block color="primary" :loading="loading" @click="$emit('analyze')">
             {{ loading ? t('sidebar.analyzing') : t('sidebar.analyze') }}
+          </UButton>
+      </div>
+
+      <!-- Help TOC -->
+      <div v-else-if="activeTab === 'help' && (!collapsed || mode === 'desktop')" class="space-y-1 overflow-y-auto pr-1">
+        <div v-for="section in tocStructure" :key="section.id" class="space-y-1">
+          <!-- Level 1 -->
+          <button
+            @click="jumpTo(section.id)"
+            class="w-full text-left text-sm font-semibold px-2 py-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-800 dark:text-gray-200 transition-colors"
+          >
+            {{ t(section.labelKey) }}
+          </button>
+
+          <!-- Level 2 -->
+          <div v-if="section.children" class="ml-2 pl-2 border-l border-gray-200 dark:border-gray-800 space-y-1">
+            <div v-for="child in section.children" :key="child.id">
+              <button
+                @click="jumpTo(child.id)"
+                class="w-full text-left text-xs px-2 py-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
+              >
+                {{ t(child.labelKey) }}
+              </button>
+              
+              <!-- Level 3 (if any) -->
+              <div v-if="child.children" class="ml-2 pl-2 border-l border-gray-200 dark:border-gray-800 mt-1 space-y-1">
+                <button
+                  v-for="subChild in child.children"
+                  :key="subChild.id"
+                  @click="jumpTo(subChild.id)"
+                  class="w-full text-left text-[10px] px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-500 dark:text-gray-500 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
+                >
+                  {{ t(subChild.labelKey) }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- History Tab Configs -->
+      <div v-if="activeTab === 'history' && (!collapsed || mode === 'desktop')" class="space-y-3">
+          <!-- Stock Code -->
+          <div>
+            <div class="flex items-center gap-1 mb-2">
+              <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('sidebar.stockCode') }}</label>
+            </div>
+            <UInput v-model="proxyCode" :placeholder="t('history.searchPlaceholder')" class="w-full" />
+          </div>
+
+          <UButton block color="primary" icon="i-heroicons-magnifying-glass" :loading="loading" @click="$emit('searchHistory', proxyCode)">
+            {{ t('history.search') }}
           </UButton>
       </div>
 
@@ -373,17 +442,66 @@
           <!-- Advanced Toggle -->
           <div class="pt-2">
              <UButton size="xs" variant="ghost" color="gray" block @click="showAdvancedStrategy = !showAdvancedStrategy" :icon="showAdvancedStrategy ? 'i-heroicons-chevron-up' : 'i-heroicons-chevron-down'">
-                {{ showAdvancedStrategy ? '收起高级配置' : '展开高级配置' }}
+                {{ showAdvancedStrategy ? t('sidebar.collapseAdvanced') : t('sidebar.expandAdvanced') }}
              </UButton>
           </div>
 
           <!-- Advanced Configs -->
           <div v-if="showAdvancedStrategy" class="space-y-3 pt-2 border-t border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-800/50 p-2 rounded">
+              <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ strategyAdvancedLabels.minRecentAccuracy }}</label>
+                <UInput type="number" v-model="proxyStrategyForm.min_recent_accuracy" step="0.05" min="0" max="1" class="w-full" />
+              </div>
+
+              <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ strategyAdvancedLabels.recentAccuracyYears }}</label>
+                <UInput type="number" v-model="proxyStrategyForm.recent_accuracy_years" step="0.1" min="0.1" max="10" class="w-full" />
+              </div>
+
+              <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ strategyAdvancedLabels.profitThreshold }}</label>
+                <UInput type="number" v-model="proxyStrategyForm.profit_threshold" step="0.005" min="0" max="1" class="w-full" />
+              </div>
+
+              <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ strategyAdvancedLabels.autoProfitQuantile }}</label>
+                <UInput type="number" v-model="proxyStrategyForm.auto_profit_quantile" step="0.05" min="0" max="1" class="w-full" />
+              </div>
+
+              <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ strategyAdvancedLabels.profitLookahead }}</label>
+                <UInput type="number" v-model="proxyStrategyForm.profit_lookahead" step="1" min="0" max="250" class="w-full" />
+              </div>
+
+              <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ strategyAdvancedLabels.minBspCount }}</label>
+                <UInput type="number" v-model="proxyStrategyForm.min_bsp_count" step="1" min="0" max="1000000" class="w-full" />
+              </div>
+
+              <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ strategyAdvancedLabels.minTestCount }}</label>
+                <UInput type="number" v-model="proxyStrategyForm.min_test_count" step="1" min="0" max="1000000" class="w-full" />
+              </div>
               
               <!-- MACD Algo -->
               <div>
                  <label class="block text-xs font-medium text-gray-500 mb-1">{{ t('sidebar.macdAlgo') }}</label>
                  <USelectMenu v-model="proxyStrategyChanConfig.macd_algo" size="xs" :options="['peak', 'area', 'slope', 'diff']" />
+              </div>
+
+              <div>
+                <label class="block text-xs font-medium text-gray-500 mb-1">{{ strategyAdvancedLabels.zsAlgo }}</label>
+                <USelectMenu v-model="proxyStrategyChanConfig.zs_algo" size="xs" :options="['normal', 'over_seg', 'auto']" class="w-full" />
+              </div>
+
+              <div>
+                <label class="block text-xs font-medium text-gray-500 mb-1">{{ strategyAdvancedLabels.divergenceRate }}</label>
+                <UInput type="number" v-model="proxyStrategyChanConfig.divergence_rate" step="0.1" min="0" max="1000000000" class="w-full" />
+              </div>
+
+              <div>
+                <label class="block text-xs font-medium text-gray-500 mb-1">{{ strategyAdvancedLabels.maxBs2Rate }}</label>
+                <UInput type="number" v-model="proxyStrategyChanConfig.max_bs2_rate" step="0.01" min="0" max="1" class="w-full" />
               </div>
 
               <!-- Rolling Lookback -->
@@ -415,6 +533,10 @@
                       <label class="text-xs text-gray-500">{{ t('sidebar.direction') }}</label>
                       <USelectMenu v-model="proxyStrategyChanConfig.signal_direction" size="2xs" :options="strategySignalDirectionOptions" value-attribute="value" option-attribute="label" />
                   </div>
+                  <div>
+                      <label class="text-xs text-gray-500">{{ t('strategy.minSignalScore') }}</label>
+                      <UInput type="number" v-model="proxyStrategyForm.min_signal_score" size="2xs" step="0.05" min="0" max="1" class="w-full" />
+                  </div>
               </div>
           </div>
 
@@ -432,47 +554,112 @@
 <script setup>
 import { computed, ref, onMounted, watch } from 'vue'
 import axios from 'axios'
-import { MemoryChevronDown, MemoryChevronLeft } from '@pictogrammers/memory'
+import { MemoryBook, MemoryChevronDown, MemoryChevronLeft } from '@pictogrammers/memory'
 import { useI18n } from '../composables/useI18n'
 
-const { t, currentLang } = useI18n()
+const { t } = useI18n()
 
-const yearUnit = computed(() => currentLang.value === 'zh' ? '年' : 'y')
-const strategyFrequencyOptions = computed(() => {
-  if (currentLang.value === 'zh') {
-    return [
-      { label: '日线', value: '1d' },
-      { label: '60分钟', value: '60m' },
-      { label: '30分钟', value: '30m' },
-      { label: '5分钟', value: '5m' }
+// Define the structure of the help documentation
+const tocStructure = [
+  {
+    id: 'intro',
+    labelKey: 'help.intro.title',
+  },
+  {
+    id: 'chan',
+    labelKey: 'help.chan.title',
+    children: [
+      { id: 'chan-fractal', labelKey: 'help.chan.fractal.title' },
+      { id: 'chan-bi', labelKey: 'help.chan.bi.title' },
+      { id: 'chan-seg', labelKey: 'help.chan.seg.title' },
+      { id: 'chan-pivot', labelKey: 'help.chan.pivot.title' }
     ]
+  },
+  {
+    id: 'bs',
+    labelKey: 'help.bs.title',
+    children: [
+      { id: 'bs-type', labelKey: 'help.bs.type.title' },
+      { id: 'bs-visual', labelKey: 'help.bs.visual.title' }
+    ]
+  },
+  {
+    id: 'ai',
+    labelKey: 'help.ai.title'
+  },
+  {
+    id: 'ui',
+    labelKey: 'help.ui.title',
+    children: [
+      { id: 'ui-sidebar', labelKey: 'help.ui.sidebar.title' },
+      { id: 'ui-chart', labelKey: 'help.ui.chart.title' }
+    ]
+  },
+  {
+    id: 'strategy',
+    labelKey: 'help.strategy.title',
+    children: [
+      { id: 'strategy-basic', labelKey: 'help.strategy.basic.title' },
+      { id: 'strategy-advanced', labelKey: 'help.strategy.advanced.title' },
+      { id: 'strategy-presets', labelKey: 'help.strategy.presets.title' },
+      { id: 'strategy-examples', labelKey: 'help.strategy.examples.title' }
+    ]
+  },
+  {
+    id: 'pretrain',
+    labelKey: 'help.pretrain.title'
   }
-  return [
-    { label: 'Daily', value: '1d' },
-    { label: '60m', value: '60m' },
-    { label: '30m', value: '30m' },
-    { label: '5m', value: '5m' }
-  ]
-})
+]
 
-const strategySignalDirectionOptions = computed(() => {
-  if (currentLang.value === 'zh') {
-    return [
-      { label: '买入', value: 'buy' },
-      { label: '卖出', value: 'sell' },
-      { label: '全部', value: 'both' }
-    ]
+const jumpTo = (id) => {
+  if (typeof document === 'undefined') return
+  const container = document.getElementById('help-container')
+  const el = document.getElementById(id)
+  if (!container || !el) return
+
+  const containerRect = container.getBoundingClientRect().top
+  const elementRect = el.getBoundingClientRect().top
+  const offset = elementRect - containerRect + container.scrollTop - 20
+
+  container.scrollTo({
+    top: offset,
+    behavior: 'smooth'
+  })
+}
+
+const yearUnit = computed(() => t('common.yearShort'))
+const strategyFrequencyOptions = computed(() => [
+  { label: t('periods.1d'), value: '1d' },
+  { label: t('periods.60m'), value: '60m' },
+  { label: t('periods.30m'), value: '30m' },
+  { label: t('periods.5m'), value: '5m' }
+])
+
+const strategySignalDirectionOptions = computed(() => [
+  { label: t('common.buy'), value: 'buy' },
+  { label: t('common.sell'), value: 'sell' },
+  { label: t('common.all'), value: 'both' }
+])
+
+const strategyAdvancedLabels = computed(() => {
+  return {
+    minRecentAccuracy: t('strategy.minRecentAccuracy'),
+    recentAccuracyYears: t('strategy.recentAccuracyYears'),
+    minBspCount: t('strategy.minBspCount'),
+    minTestCount: t('strategy.minTestCount'),
+    profitThreshold: t('strategy.profitThreshold'),
+    autoProfitQuantile: t('strategy.autoProfitQuantile'),
+    profitLookahead: t('strategy.profitLookahead'),
+    divergenceRate: t('strategy.divergenceRate'),
+    maxBs2Rate: t('strategy.maxBs2Rate'),
+    zsAlgo: t('strategy.zsAlgo')
   }
-  return [
-    { label: 'Buy', value: 'buy' },
-    { label: 'Sell', value: 'sell' },
-    { label: 'All', value: 'both' }
-  ]
 })
 
 const props = defineProps({
   activeTab: { type: String, default: 'analysis' },
   code: String,
+  autype: { type: String, default: 'qfq' },
   triggerStep: Boolean,
   biStrict: Boolean,
   loading: Boolean,
@@ -509,7 +696,7 @@ const props = defineProps({
 })
 
 const emit = defineEmits([
-  'update:code', 'update:triggerStep', 'update:biStrict', 'update:blend', 
+  'update:code', 'update:autype', 'update:triggerStep', 'update:biStrict', 'update:blend', 
   'update:dataSrc', 'update:model', 'update:intradayFreq', 'update:dataLengthYears',
   'update:pretrainedChoice', 'update:intradayBlend', 'update:enableRollingLookback',
   'update:strategyForm', 'update:strategyChanConfig', 'update:pretrainConfig',
@@ -519,6 +706,11 @@ const emit = defineEmits([
 const proxyCode = computed({
   get: () => props.code,
   set: (val) => emit('update:code', val)
+})
+
+const proxyAutype = computed({
+  get: () => props.autype,
+  set: (val) => emit('update:autype', val)
 })
 
 const proxyTriggerStep = computed({
@@ -586,7 +778,30 @@ const proxyPretrainConfig = computed({
   set: (val) => emit('update:pretrainConfig', val)
 })
 
+watch(
+  () => props.autype,
+  (val) => {
+    const nextAutype = String(val || '').trim() || 'hfq'
+
+    const curPretrain = proxyPretrainConfig.value || {}
+    if (curPretrain.autype !== nextAutype) {
+      proxyPretrainConfig.value = { ...curPretrain, autype: nextAutype }
+    }
+
+    const curStrategy = proxyStrategyForm.value || {}
+    if (curStrategy.autype !== nextAutype) {
+      proxyStrategyForm.value = { ...curStrategy, autype: nextAutype }
+    }
+  },
+  { immediate: true }
+)
+
 const showAdvancedAnalysis = ref(false)
+
+const autypeOptions = computed(() => [
+  { label: t('sidebar.autypeQfq'), value: 'qfq' },
+  { label: t('sidebar.autypeHfq'), value: 'hfq' }
+])
 const showAdvancedStrategy = ref(false)
 const selectedPreset = ref('custom')
 
@@ -614,6 +829,32 @@ const presets = computed(() => [
       bs_type: '1,2,3a,3b'
     }
   },
+  {
+    label: t('sidebar.presetPractical'),
+    value: 'practical_dual',
+    config: {
+      model: 'xgboost',
+      bi_strict: true,
+      bsp2_follow_1: true,
+      bsp3_follow_1: true,
+      min_zs_cnt: 1,
+      bs_type: '1,2,3a,3b',
+      enable_rolling_lookback: true,
+      data_length_years: 5.0,
+      min_accuracy: 0.6,
+      min_recent_accuracy: 0.7,
+      recent_accuracy_years: 1.0,
+      require_signal: true,
+      signal_lookback: 5,
+      signal_direction: 'buy',
+      min_signal_score: 0.8,
+      min_bsp_count: 90,
+      min_test_count: 20,
+      profit_threshold: null,
+      auto_profit_quantile: 0.7,
+      profit_lookahead: 5
+    }
+  },
   { label: t('sidebar.presetConservative'), value: 'conservative', config: { min_accuracy: 0.85, bi_strict: true, model: 'xgboost', require_signal: false } },
   { label: t('sidebar.presetAggressive'), value: 'aggressive', config: { min_accuracy: 0.6, bi_strict: false, model: 'xgboost', require_signal: false } }
 ])
@@ -623,14 +864,28 @@ const applyPreset = () => {
     const p = (presets.value || []).find(x => x.value === selectedPreset.value)
     if (p && p.config) {
         if (p.config.min_accuracy !== undefined) proxyStrategyForm.value.min_accuracy = p.config.min_accuracy
+        if (p.config.min_recent_accuracy !== undefined) proxyStrategyForm.value.min_recent_accuracy = p.config.min_recent_accuracy
+        if (p.config.recent_accuracy_years !== undefined) proxyStrategyForm.value.recent_accuracy_years = p.config.recent_accuracy_years
+        if (p.config.min_signal_score !== undefined) proxyStrategyForm.value.min_signal_score = p.config.min_signal_score
+        if (p.config.min_bsp_count !== undefined) proxyStrategyForm.value.min_bsp_count = p.config.min_bsp_count
+        if (p.config.min_test_count !== undefined) proxyStrategyForm.value.min_test_count = p.config.min_test_count
+        if (p.config.profit_threshold !== undefined) proxyStrategyForm.value.profit_threshold = p.config.profit_threshold
+        if (p.config.auto_profit_quantile !== undefined) proxyStrategyForm.value.auto_profit_quantile = p.config.auto_profit_quantile
+        if (p.config.profit_lookahead !== undefined) proxyStrategyForm.value.profit_lookahead = p.config.profit_lookahead
         if (p.config.model !== undefined) proxyStrategyForm.value.model = p.config.model
+        if (p.config.data_length_years !== undefined) proxyStrategyForm.value.data_length_years = p.config.data_length_years
         if (p.config.enable_rolling_lookback !== undefined) proxyStrategyForm.value.enable_rolling_lookback = p.config.enable_rolling_lookback
         if (p.config.bi_strict !== undefined) proxyStrategyChanConfig.value.bi_strict = p.config.bi_strict
         if (p.config.require_signal !== undefined) proxyStrategyChanConfig.value.require_signal = p.config.require_signal
         if (p.config.signal_direction !== undefined) proxyStrategyChanConfig.value.signal_direction = p.config.signal_direction
+        if (p.config.signal_lookback !== undefined) proxyStrategyChanConfig.value.signal_lookback = p.config.signal_lookback
         if (p.config.bs_type !== undefined) proxyStrategyChanConfig.value.bs_type = p.config.bs_type
         if (p.config.macd_algo !== undefined) proxyStrategyChanConfig.value.macd_algo = p.config.macd_algo
         if (p.config.min_zs_cnt !== undefined) proxyStrategyChanConfig.value.min_zs_cnt = p.config.min_zs_cnt
+        if (p.config.bsp2_follow_1 !== undefined) proxyStrategyChanConfig.value.bsp2_follow_1 = p.config.bsp2_follow_1
+        if (p.config.bsp3_follow_1 !== undefined) proxyStrategyChanConfig.value.bsp3_follow_1 = p.config.bsp3_follow_1
+        if (p.config.gap_as_kl !== undefined) proxyStrategyChanConfig.value.gap_as_kl = p.config.gap_as_kl
+        if (p.config.bi_allow_sub_peak !== undefined) proxyStrategyChanConfig.value.bi_allow_sub_peak = p.config.bi_allow_sub_peak
     }
 }
 

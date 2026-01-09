@@ -278,7 +278,13 @@ onMounted(() => {
           trigger: 'axis',
           confine: true,
           axisPointer: {
-              type: 'cross'
+              type: 'cross',
+              label: {
+                formatter: (p) => {
+                  const n = Number(p?.value)
+                  return Number.isFinite(n) ? n.toFixed(2) : String(p?.value ?? '')
+                }
+              }
           },
           formatter: (params) => {
             const list = Array.isArray(params) ? params : [params].filter(Boolean)
@@ -379,7 +385,13 @@ onMounted(() => {
       yAxis: {
           scale: true,
           axisLine: { lineStyle: { color: '#888' } },
-          axisLabel: { color: '#666' },
+          axisLabel: {
+            color: '#666',
+            formatter: (v) => {
+              const n = Number(v)
+              return Number.isFinite(n) ? n.toFixed(2) : String(v)
+            }
+          },
           splitArea: {
               show: true
           }

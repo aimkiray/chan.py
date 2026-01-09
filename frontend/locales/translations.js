@@ -47,11 +47,21 @@ export const translations = {
       downloadError: "下载失败",
       strategy: "策略选股"
     },
+    common: {
+      buy: "买入",
+      sell: "卖出",
+      all: "全部",
+      yearShort: "年"
+    },
     sidebar: {
       params: "参数设置",
       stockCode: "股票代码",
       codePlaceholder: "如 002701 或 600000",
       codeHint: "支持自动识别沪深 (如 002701, 600000)",
+      autype: "复权类型",
+      autypeHint: "图表展示与训练/回测将使用同一复权数据。",
+      autypeQfq: "前复权 (QFQ)",
+      autypeHfq: "后复权 (HFQ)",
       stepCalc: "逐步计算 (模拟实盘)",
       stepHint: "开启后将模拟真实交易环境，逐根 K 线加载并计算。",
       strictBi: "严格笔模式",
@@ -67,8 +77,9 @@ export const translations = {
       lookback: "回溯K线",
       direction: "方向",
       presetCustom: "自定义",
-      presetDealer: "庄股",
-      presetQuantControl: "量化控盘",
+      presetDealer: "超高准确率",
+      presetQuantControl: "近期买点确认",
+      presetPractical: "双过滤实操",
       presetConservative: "稳健高胜率",
       presetAggressive: "激进机会",
       analyze: "开始分析",
@@ -76,6 +87,8 @@ export const translations = {
       download: "下载历史数据",
       downloading: "下载中...",
       expandSidebar: "展开侧边栏",
+      expandAdvanced: "展开高级配置",
+      collapseAdvanced: "收起高级配置",
       blendHint: "混合预训练模型与在线训练结果（加权平均）",
       periodHint: "选择K线数据的时间粒度",
       dataSrcHint: "选择行情数据的来源渠道",
@@ -102,6 +115,22 @@ export const translations = {
       calibrationBins: "分桶胜率 / 预测均值 (测试集)",
       buy: "买入",
       sell: "卖出",
+      signalType: {
+        buy1: "一买 (1B)",
+        sell1: "一卖 (1S)",
+        buy2: "二买 (2B)",
+        sell2: "二卖 (2S)",
+        buy3: "三买 (3B)",
+        sell3: "三卖 (3S)",
+        buyL2: "类二买 (L2B)",
+        sellL2: "类二卖 (L2S)",
+        buyL3: "类三买 (L3B)",
+        sellL3: "类三卖 (L3S)",
+        buy3a: "三买A (3B-A)",
+        sell3a: "三卖A (3S-A)",
+        buy3b: "三买B (3B-B)",
+        sell3b: "三卖B (3S-B)"
+      },
       minutes: "分钟",
       hours: "小时",
       modelSource: "模型来源",
@@ -117,6 +146,19 @@ export const translations = {
       scope: "选股范围",
       model: "模型",
       minAccuracy: "最低准确率",
+      minRecentAccuracy: "最近准确率下限",
+      recentAccuracyYears: "最近准确率窗口(年)",
+      minSignalScore: "最新信号概率下限",
+      minBspCount: "最小样本量",
+      minTestCount: "最小测试样本量",
+      profitThreshold: "收益阈值(标签)",
+      autoProfitQuantile: "自适应分位数",
+      profitLookahead: "盈利观察窗口(K线数)",
+      divergenceRate: "背驰倍率阈值",
+      maxBs2Rate: "二买回撤比例上限",
+      zsAlgo: "中枢算法",
+      recentAccuracy: "最近准确率",
+      signalScore: "最新信号概率",
       run: "执行策略",
       history: "运行记录",
       listTitle: "运行记录",
@@ -191,7 +233,9 @@ export const translations = {
       accuracy: "准确率",
       action: "操作",
       viewChart: "查看图表",
-      download: "下载历史数据"
+      download: "下载历史数据",
+      search: "搜索",
+      searchPlaceholder: "输入股票代码筛选"
     },
     pretrain: {
       title: "离线预训练",
@@ -303,62 +347,133 @@ export const translations = {
       }
     },
     help: {
-      title: "缠论量化分析 - 使用指南",
-      section1: {
-        title: "1. 核心概念详解",
-        intro: "缠论是一套基于市场走势结构的几何分析理论。本系统自动识别以下核心组件：",
+      title: "使用指南",
+      tocTitle: "目录",
+      intro: {
+        title: "1. 简介",
+        content: "本系统是一款深度结合<strong>缠论技术分析</strong>与<strong>机器学习(XGBoost)</strong>的量化辅助工具。它不仅仅是一个看盘软件，更是一个能够自动识别走势结构、捕捉买卖点，并利用AI模型对信号质量进行评分的智能决策系统。<br/><br/>核心理念是：<strong>用缠论定结构，用AI辨真伪。</strong>系统致力于解决缠论'千人千缠'的主观性问题，通过算法标准化的严格笔、线段定义，叠加机器学习模型对历史高胜率模式的学习，为您提供更客观、更具参考价值的交易信号。"
+      },
+
+      // 2. 缠论基础
+      chan: {
+        title: "2. 缠论核心概念",
+        intro: "缠论是一套基于市场走势结构的几何分析理论。本系统实现了对缠论核心组件的严格数学定义与自动画线，帮助用户快速看清市场结构。",
         fractal: {
           title: "A. 分型 (Fractal)",
-          top: "<strong>顶分型</strong>: 类似 '∧' 形状，由三根K线组成，中间K线高点最高，低点最高。",
-          bottom: "<strong>底分型</strong>: 类似 '∨' 形状，由三根K线组成，中间K线低点最低，高点最低。",
-          meaning: "<em>意义</em>: 分型是走势转折的雏形。"
+          top: "<strong>顶分型</strong>: 类似 '∧' 形状，由三根经过包含处理后的K线组成，中间K线高点最高，低点最高。它是上涨趋势结束的潜在信号。",
+          bottom: "<strong>底分型</strong>: 类似 '∨' 形状，由三根经过包含处理后的K线组成，中间K线低点最低，高点最低。它是下跌趋势结束的潜在信号。",
+          note: "注：分型是走势转折的最小单元，所有的笔、线段都始于分型。系统会自动处理K线的包含关系。"
         },
         bi: {
           title: "B. 笔 (Bi)",
-          def: "<strong>定义</strong>: 连接相邻的顶分型和底分型的连线。",
-          comp: "<strong>构成</strong>: 必须由顶分型+底分型（或反之）构成，且中间必须包含一定数量的K线。",
-          strict: "<strong>严格笔</strong>: 要求顶底分型之间至少有<strong>3根</strong>非包含关系的K线。开启'严格笔'模式能过滤掉微小的震荡，使走势结构更清晰。",
-          visual: "<em>图示</em>: 图表中用 <strong>黑色线</strong> 表示。实线为已确认的笔，虚线为未完成的笔。"
+          def: "<strong>定义</strong>: 连接相邻的顶分型和底分型的直线，代表一段最基础的上涨或下跌趋势。",
+          strictTitle: "严格笔模式",
+          strictDesc: "系统默认开启'严格笔'，要求顶底分型之间至少有3根非包含关系的K线（即中间不共用K线）。这能有效过滤杂波，使结构更稳定，减少骗线。"
         },
         seg: {
           title: "C. 线段 (Segment)",
-          def: "<strong>定义</strong>: 由连续的三笔（或更多）且有重叠的笔构成。",
-          visual: "<em>图示</em>: 图表中用 <strong>绿色线</strong> 表示。代表比'笔'更高一级的走势。"
+          def: "<strong>定义</strong>: 由至少三笔连续且有重叠的笔构成。线段是比'笔'更高一级别的走势组件，用于构建中枢。线段的破坏标志着更大级别走势的转折。"
         },
-        center: {
+        pivot: {
           title: "D. 中枢 (Center/Pivot)",
-          def: "<strong>定义</strong>: 某级别走势类型中，被至少三个连续次级别走势类型所重叠的部分。",
-          visual: "<em>图示</em>: 图表中用 <strong>橙色矩形框</strong> 表示。",
-          meaning: "<em>意义</em>: 中枢是多空双方力量的平衡区，所有的买卖点都围绕中枢产生。"
+          def: "<strong>定义</strong>: 某级别走势类型中，被至少三个连续次级别走势类型所重叠的部分。图表中用<strong>橙色矩形</strong>表示。<br/>中枢是多空力量的平衡区，也是买卖点判断的核心参照物。价格在中枢上方的震荡通常视为强势，下方则为弱势。"
         }
       },
-      section2: {
-        title: "2. 买卖点类型 (Type)",
-        intro: "在分析结果中，您会看到不同类型的买卖点信号，它们具有不同的市场含义：",
+
+      // 3. 买卖点
+      bs: {
+        title: "3. 买卖点定义",
         table: {
-          type: "类型",
+          type: "买卖点类型",
           name: "名称",
-          desc: "详细解释",
-          risk: "风险/收益",
-          t1: { type: "1类 (1B/1S)", name: "趋势转折", desc: "在下跌趋势末端，因力度衰竭（背驰）而产生的转折点。通常是行情的最低点。", risk: "风险较高，收益最大" },
-          t2: { type: "2类 (2B/2S)", name: "回撤确认", desc: "1类买点出现后，价格第一次回调不创新低（或微创新低但力度更弱）。是对趋势反转的确认。", risk: "风险中等，胜率较高" },
-          t3: { type: "3类 (3B/3S)", name: "中枢破坏", desc: "价格强势突破中枢后，回调不进入中枢内部。意味着行情进入主升浪（或主跌浪）。", risk: "风险较低，爆发力强" },
-          t2s: { type: "类二买 (2s)", name: "强力回撤", desc: "针对大级别中枢的强力底分型或次级别回撤，形态上接近二买。", risk: "-" }
+          desc: "市场含义与操作建议",
+          t1: { name: "一买/一卖 (1B/1S)", desc: "趋势背驰点。这是原趋势力竭的转折点，往往对应行情的最低/最高点。风险较高，但潜在收益最大。需要底分型确认。" },
+          t2: { name: "二买/二卖 (2B/2S)", desc: "次级别回撤确认点。在一买出现后，价格回调不创新低（二买）或反弹不创新高（二卖）。确认趋势反转，胜率较高，是较稳健的建仓点。" },
+          t3: { name: "三买/三卖 (3B/3S)", desc: "中枢破坏点。价格强势突破中枢后，回踩不进中枢（三买）或反抽不回中枢（三卖）。预示主升/主跌浪，爆发力强，适合顺势加仓。" },
+          l2: { name: "类二买/卖 (L2)", desc: "在中枢震荡中出现的强分型结构，形态上类似二买但级别较小，适合短线博弈。" }
+        },
+        visual: {
+          title: "图表标记",
+          desc: "在K线图上，买点标记为红色向上箭头，卖点标记为绿色向下箭头。箭头旁的数字代表买卖点类型（如 B1 代表一买）。系统会自动过滤掉不符合定义的无效信号。"
         }
       },
-      section3: {
-        title: "3. AI 信号评分",
-        intro: "本项目结合了 <strong>XGBoost</strong> 机器学习模型。",
-        desc1: "系统会提取买卖点出现时的特征（如MACD力度、成交量变化、K线形态、均线位置等）。",
-        desc2: "将其输入模型，预测该信号未来盈利的概率。",
-        score: "<strong>Confidence Score (置信度)</strong>: 分数越高 (0~100%)，表示模型认为该信号越可靠。建议结合评分 > 50% 的信号进行参考。"
+
+      // 4. AI 分析
+      ai: {
+        title: "4. AI 信号评分系统",
+        intro: "传统缠论存在'千人千缠'的问题。本系统引入 XGBoost/LightGBM 等机器学习模型，基于历史大数据对每一个缠论信号进行客观评分，辅助您去伪存真。",
+        feature: "<strong>多维特征提取</strong>: 系统在信号出现时，自动提取MACD力度、成交量变化、K线形态、均线乖离率、以及缠论结构特征（如背驰力度）等数十维特征。",
+        model: "<strong>XGBoost 模型</strong>: 使用历史数据训练模型，学习哪些特征组合下的买卖点更容易盈利。模型会自动适应不同股票的股性。",
+        score: "<strong>Confidence Score (置信度)</strong>: 0~100% 的概率值。<br/>- <strong>>50%</strong>: 模型认为有盈利潜力。<br/>- <strong>>80%</strong>: 高确定性机会，建议重点关注。<br/>- <strong><50%</strong>: 信号质量较差，建议观望。"
       },
-      section4: {
-        title: "4. 参数说明",
-        step: "<strong>逐步计算 (Trigger Step)</strong>: 模拟真实盘中环境，一根根K线推进计算。",
-        stepDesc: "<em>开启</em>: 能避免“未来函数”，看到当时真实的信号状态（可能会有信号消失的情况）。<br/><em>关闭</em>: 直接使用全量数据计算，速度快，但可能包含未来修正后的结果。",
-        strict: "<strong>严格笔 (Strict Bi)</strong>:",
-        strictDesc: "<em>开启</em>: 过滤杂波，适合看大趋势。<br/><em>关闭</em>: 反应灵敏，适合捕捉短线波动。"
+
+      // 5. 界面指南
+      ui: {
+        title: "5. 界面功能指南",
+        sidebar: {
+          title: "A. 侧边栏配置",
+          stock: "<strong>股票代码</strong>: 支持输入代码（如 600000）或名称拼音。支持自动识别沪深后缀。",
+          stockDesc: "输入后按回车或点击分析按钮。可使用'逐步计算'功能模拟历史实盘。",
+          period: "<strong>K线周期</strong>: 支持 1分钟 到 月线 等多周期。短周期信号多但噪杂，长周期信号稳但滞后。",
+          periodDesc: "建议：日线做波段，30分钟做短线。不同周期下的信号是独立的。",
+          model: "<strong>模型选择</strong>: 默认推荐 XGBoost。也可选择 LightGBM 或 MLP（神经网络）。",
+          modelDesc: "不同模型对同一信号的评分可能不同，可作为交叉验证。",
+          pretrained: "<strong>预训练模型</strong>: 开启后优先使用离线训练好的高精度模型，速度快且效果更稳。",
+          pretrainedDesc: "若无匹配预训练模型，会自动降级为在线实时训练。建议定期更新预训练模型。"
+        },
+        chart: {
+          title: "B. 主图表交互",
+          kline: "<strong>K线图</strong>: 红涨绿跌，鼠标悬停可查看开高低收数据。支持缩放和平移。",
+          bi: "<strong>笔 (黑线)</strong>: 实线为已完成的笔，虚线为正在生成的笔（未确认）。",
+          seg: "<strong>线段 (绿线)</strong>: 更高级别的走势连接，展示大级别的方向。",
+          center: "<strong>中枢 (橙框)</strong>: 价格密集成交区，框的上下沿即中枢区间。中枢的延伸和扩展是判断趋势延续的重要依据。"
+        }
+      },
+
+      // 6. 策略选股
+      strategy: {
+        title: "6. 策略选股详解",
+        intro: "策略选股功能允许您根据特定的缠论结构和AI评分，从全市场或指定股票池中筛选出符合条件的标的。这是发现潜在机会的强大工具。",
+        
+        presets: {
+          title: "A. 预设策略 (推荐)",
+          dealer: "<strong>超高准确率 (Dealer)</strong>: 极度保守策略。要求准确率>90%，严格笔，且必须有高分信号。适合寻找极高确定性的机会，但筛选出的股票数量较少。",
+          quantControl: "<strong>近期买点确认</strong>: 侧重买点时效性。筛选近期（5天内）出现过买点，且模型评分较高的股票。适合寻找刚启动的个股。",
+          practical: "<strong>双过滤实操</strong>: 均衡策略。结合了准确率要求和信号评分，既保证了胜率，又有一定的出票量。适合日常使用。",
+          conservative: "<strong>稳健高胜率</strong>: 侧重历史胜率。筛选历史回测准确率高的股票，对最新信号评分要求适中。适合稳健型投资者。",
+          aggressive: "<strong>激进机会</strong>: 侧重信号爆发力。放宽了准确率要求，但要求最新信号评分极高。适合捕捉妖股或短线爆发机会。"
+        },
+
+        basic: {
+          title: "B. 基础配置",
+          scope: "<strong>选股范围</strong>: 可选择全市场（耗时较长）或自定义股票池（推荐，需先在预训练页面配置）。",
+          accuracy: "<strong>最低准确率</strong>: 筛选出的股票在历史回测中的胜率必须高于此值（如 0.8 表示 80%）。",
+          len: "<strong>数据范围</strong>: 用于计算指标和回测的历史数据长度，建议至少 3-5 年。"
+        },
+
+        advanced: {
+          title: "C. 高级配置",
+          recentAcc: "<strong>最近准确率下限</strong>: 仅考核最近 N 年的准确率，更能反映股票近期的股性。",
+          profit: "<strong>收益阈值</strong>: 定义什么样的涨幅算'准确'。默认 0.02 (2%)。即信号发出后涨幅超过 2% 视为预测正确。",
+          rolling: "<strong>滚动回溯</strong>: 开启后，模拟真实的时间推进进行回测，避免未来函数，结果更真实。",
+          strict: "<strong>严格笔模式</strong>: 开启后使用更严格的笔定义，减少杂波。",
+          signal: "<strong>仅近期信号</strong>: 勾选后，只显示最近 N 天内出现过买卖点的股票。"
+        },
+
+        examples: {
+          title: "D. 配置示例",
+          ex1: "<strong>场景1：寻找底部启动的稳健股</strong><br/>配置：预设选择'稳健高胜率'，方向选择'买入'，信号类型选择'一买(1B)'和'二买(2B)'。这能筛选出形态好且胜率高的底部个股。",
+          ex2: "<strong>场景2：捕捉主升浪</strong><br/>配置：预设选择'激进机会'，方向选择'买入'，信号类型选择'三买(3B)'。三买通常意味着突破中枢后的加速上涨。",
+          ex3: "<strong>场景3：每日复盘筛选</strong><br/>配置：预设选择'近期买点确认'，勾选'仅近期信号'，设置时间范围为最近 1 天。快速找出当天发出买点的股票。"
+        }
+      },
+
+      // 7. 预训练
+      pretrain: {
+        title: "7. 离线预训练",
+        intro: "预训练功能允许您利用闲暇时间，对大量股票进行离线训练。训练好的模型会保存到本地，在日常分析时直接加载，极大提高分析速度。",
+        pool: "<strong>股票池管理</strong>: 您可以创建不同的股票池（如'沪深300'、'自选股'）。支持从 ClickHouse 导入或手动输入代码。",
+        force: "<strong>强制重新训练</strong>: 默认情况下，如果已存在相同配置的模型，系统会跳过训练。勾选此项可强制覆盖旧模型。"
       }
     }
   },
@@ -408,11 +523,21 @@ export const translations = {
       downloadSuccess: "Download Successful",
       downloadError: "Download Failed"
     },
+    common: {
+      buy: "Buy",
+      sell: "Sell",
+      all: "All",
+      yearShort: "y"
+    },
     sidebar: {
       params: "Settings",
       stockCode: "Stock Code",
       codePlaceholder: "e.g. 002701 or 600000",
       codeHint: "Supports SH/SZ auto-detection",
+      autype: "Adjustment",
+      autypeHint: "Chart and training/backtest use the same adjustment.",
+      autypeQfq: "Forward-adjusted (QFQ)",
+      autypeHfq: "Backward-adjusted (HFQ)",
       stepCalc: "Step Calculation (Sim)",
       stepHint: "Simulates real-time trading environment by loading K-lines one by one.",
       strictBi: "Strict Bi Mode",
@@ -428,8 +553,9 @@ export const translations = {
       lookback: "Lookback",
       direction: "Dir",
       presetCustom: "Custom",
-      presetDealer: "Dealer Stock",
-      presetQuantControl: "Quant Control",
+      presetDealer: "Ultra High Accuracy",
+      presetQuantControl: "Recent Buy Signal",
+      presetPractical: "Dual Filter Practical",
       presetConservative: "Conservative",
       presetAggressive: "Aggressive",
       analyze: "Analyze",
@@ -437,6 +563,8 @@ export const translations = {
       download: "Download Data",
       downloading: "Downloading...",
       expandSidebar: "Expand Sidebar",
+      expandAdvanced: "Show advanced",
+      collapseAdvanced: "Hide advanced",
       blendHint: "Blend pretrained model with online training results (weighted average)",
       periodHint: "Select the time granularity of K-line data",
       dataSrcHint: "Select the source of market data",
@@ -463,14 +591,43 @@ export const translations = {
       calibrationBins: "Binned Win Rate / Avg Pred (Test)",
       buy: "BUY",
       sell: "SELL",
+      signalType: {
+        buy1: "Buy 1 (1B)",
+        sell1: "Sell 1 (1S)",
+        buy2: "Buy 2 (2B)",
+        sell2: "Sell 2 (2S)",
+        buy3: "Buy 3 (3B)",
+        sell3: "Sell 3 (3S)",
+        buyL2: "L2 Buy (L2B)",
+        sellL2: "L2 Sell (L2S)",
+        buyL3: "L3 Buy (L3B)",
+        sellL3: "L3 Sell (L3S)",
+        buy3a: "Buy 3A (3B-A)",
+        sell3a: "Sell 3A (3S-A)",
+        buy3b: "Buy 3B (3B-B)",
+        sell3b: "Sell 3B (3S-B)"
+      },
       minutes: "min",
       hours: "hrs"
     },
     strategy: {
-      title: "Stock Screener",
-      scope: "Universe",
+      title: "Strategy",
+      scope: "Scope",
       model: "Model",
       minAccuracy: "Min Accuracy",
+      minRecentAccuracy: "Min Recent Accuracy",
+      recentAccuracyYears: "Recent Window (Years)",
+      minSignalScore: "Min Signal Prob",
+      minBspCount: "Min Samples",
+      minTestCount: "Min Test Samples",
+      profitThreshold: "Profit Threshold (Label)",
+      autoProfitQuantile: "Auto Quantile",
+      profitLookahead: "Profit Lookahead (Bars)",
+      divergenceRate: "Divergence Rate",
+      maxBs2Rate: "Max BS2 Rate",
+      zsAlgo: "ZS Algo",
+      recentAccuracy: "Recent Accuracy",
+      signalScore: "Signal Prob",
       run: "Run",
       history: "Runs",
       listTitle: "Runs",
@@ -545,7 +702,9 @@ export const translations = {
       accuracy: "Accuracy",
       action: "Action",
       viewChart: "View Chart",
-      download: "Download History"
+      download: "Download CSV",
+      search: "Search",
+      searchPlaceholder: "Filter by stock code"
     },
     pretrain: {
       title: "Offline Pretraining",
@@ -644,6 +803,7 @@ export const translations = {
     },
     help: {
       title: "Chan Quant Analysis - User Guide",
+      tocTitle: "Contents",
       section1: {
         title: "1. Core Concepts",
         intro: "Chan Theory is a geometric analysis theory based on market trend structures. This system automatically identifies:",
@@ -698,7 +858,97 @@ export const translations = {
         step: "<strong>Step Calculation</strong>: Simulates real-time trading.",
         stepDesc: "<em>On</em>: Avoids 'future function', sees state as it was.<br/><em>Off</em>: Uses full data, faster but may include future corrections.",
         strict: "<strong>Strict Bi</strong>",
-        strictDesc: "<em>On</em>: Filters noise, good for big trends.<br/><em>Off</em>: More sensitive, good for short-term."
+        strictDesc: "<em>On</em>: Filters noise, good for big trends.<br/><em>Off</em>: More sensitive, good for short-term.",
+        rolling: "<strong>Rolling Lookback</strong>: Trains/predicts with a rolling window to better simulate live trading.",
+        rollingDesc: "Uses recent history for each run; more realistic but slower.",
+        blend: "<strong>Blend Pretrained</strong>: Blends pretrained model with online training (weighted).",
+        blendDesc: "Good for stability + adaptability. Falls back to online training if no matching pretrained model."
+      },
+      section5: {
+        title: "5. Tabs Overview",
+        intro: "Use the top tabs to switch workflows. Most parameters are configured in the left sidebar.",
+        tabs: {
+          analysis: "<strong>{label}</strong>: Main analysis entry. Shows structures, signals and AI scores.",
+          intraday: "<strong>{label}</strong>: Multi-timeframe / intraday analysis with source/model/pretrained options.",
+          pretrain: "<strong>{label}</strong>: Offline batch training and saving pretrained models for later reuse.",
+          strategy: "<strong>{label}</strong>: Scan a stock pool with filters and output matches. Includes presets.",
+          history: "<strong>{label}</strong>: Review past analysis records and charts.",
+          help: "<strong>{label}</strong>: User guide and explanations."
+        }
+      },
+      section6: {
+        title: "6. Sidebar Settings (Analysis/Pro)",
+        intro: "Analysis and Pro share basic settings. Pro additionally provides timeframe, data source and pretrained selection.",
+        items: {
+          stockCode: "<strong>{label}</strong>: Stock code input (e.g. 600000 / 002701).",
+          period: "<strong>{label}</strong>: Timeframe selection. Smaller timeframe = more signals and more noise.",
+          dataSrc: "<strong>{label}</strong>: Market data source.",
+          model: "<strong>{label}</strong>: ML model selection (XGBoost/LightGBM/MLP).",
+          pretrained: "<strong>{label}</strong>: Pretrained model selection (auto-match by config).",
+          dataLength: "<strong>{label}</strong>: Historical data length (years) used for training/calculation.",
+          refresh: "<strong>{label}</strong>: Refresh market data (Pro) / fetch latest.",
+          analyze: "<strong>{label}</strong>: Run analysis and generate results."
+        }
+      },
+      section7: {
+        title: "7. Pretrain: Purpose & Settings",
+        intro: "Pretrain runs offline batch training and saves models. Later runs prefer matched pretrained models.",
+        items: {
+          pool: "<strong>{label}</strong>: Select stock pool (from stock_constituent). ClickHouse only.",
+          codes: "<strong>{label}</strong>: Manual code list (newline/space/comma separated).",
+          frequency: "<strong>{label}</strong>: K-line timeframe for training.",
+          dataSrc: "<strong>{label}</strong>: Data source for training.",
+          model: "<strong>{label}</strong>: Model type for training.",
+          dataLength: "<strong>{label}</strong>: Data range policy (max/years).",
+          forceRefresh: "<strong>{label}</strong>: Force retrain and ignore duplicates.",
+          run: "<strong>{label}</strong>: Submit a pretrain job (queued/running/success/fail)."
+        }
+      },
+      section8: {
+        title: "8. Strategy: Settings, Presets & Examples",
+        intro: "Strategy scans a pool and outputs matched stocks. Start from presets and fine-tune.",
+        basicTitle: "A. Basic Settings",
+        basic: {
+          presets: "<strong>{label}</strong>: Apply a parameter bundle (overwrites some fields).",
+          scope: "<strong>{label}</strong>: Stock universe/pool.",
+          model: "<strong>{label}</strong>: Model algorithm for scanning.",
+          frequency: "<strong>{label}</strong>: Timeframe (Daily/60m/30m/5m).",
+          minAccuracy: "<strong>{label}</strong>: Min backtest accuracy. Higher = fewer but steadier signals.",
+          dataLength: "<strong>{label}</strong>: Historical data length (years)."
+        },
+        advancedTitle: "B. Advanced (Show advanced)",
+        advanced: {
+          minRecentAccuracy: "<strong>{label}</strong>: Min accuracy within the recent window.",
+          recentAccuracyYears: "<strong>{label}</strong>: Recent window length (years).",
+          profitThreshold: "<strong>{label}</strong>: Label profit threshold.",
+          autoProfitQuantile: "<strong>{label}</strong>: Quantile for auto profit threshold.",
+          profitLookahead: "<strong>{label}</strong>: Bars to look ahead for labeling.",
+          macdAlgo: "<strong>{label}</strong>: MACD feature algorithm.",
+          rollingFeature: "<strong>{label}</strong>: Enable longer-horizon features.",
+          strictBi: "<strong>{label}</strong>: Reduce noise with strict Bi.",
+          gapAsKl: "<strong>{label}</strong>: Treat gaps as KL structure.",
+          signalOnly: "<strong>{label}</strong>: Require recent signals for better actionability.",
+          lookback: "<strong>{label}</strong>: Lookback bars for recent signal search.",
+          direction: "<strong>{label}</strong>: Signal direction (buy/sell/both).",
+          minSignalScore: "<strong>{label}</strong>: Min probability for the latest signal."
+        },
+        presetsTitle: "C. Presets",
+        presetsIntro: "Preset summaries (may evolve with versions):",
+        presets: {
+          custom: "<strong>{name}</strong>: No preset, fully custom.",
+          dealer: "<strong>{name}</strong>: Very conservative. min_accuracy=0.90, strict Bi on, XGBoost, rolling lookback on.",
+          quantControl: "<strong>{name}</strong>: Recent buy confirmation. min_accuracy=0.85, strict Bi on, require recent buy signals.",
+          practical: "<strong>{name}</strong>: Practical dual-filter. 5y data, recent window filter, recent signal filter and high signal score.",
+          conservative: "<strong>{name}</strong>: Conservative. min_accuracy=0.85, strict Bi on, XGBoost.",
+          aggressive: "<strong>{name}</strong>: Aggressive. min_accuracy=0.60, strict Bi off, more signals."
+        },
+        examplesTitle: "D. Examples",
+        examplesIntro: "Examples show the tuning mindset:",
+        examples: {
+          ex1: "<strong>Example 1</strong>: Start from a preset, then relax thresholds if too few results.",
+          ex2: "<strong>Example 2</strong>: Conservative swing: higher accuracy + rolling lookback + recent window filter.",
+          ex3: "<strong>Example 3</strong>: Short-term: 30m/60m + recent-signal-only + moderate accuracy threshold."
+        }
       }
     }
   }

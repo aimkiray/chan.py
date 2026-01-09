@@ -990,6 +990,7 @@ const runPretrain = async () => {
       data_length_mode: props.config.dataLengthMode === 'years' ? 'default' : 'max',
       data_length_years: props.config.dataLengthMode === 'years' ? Number(props.config.dataLengthYears) : null,
       force_refresh: !!props.config.forceRefresh,
+      autype: props.config.autype || 'hfq',
       pool_name: props.config.poolName || null
     }
 
