@@ -318,6 +318,43 @@ class AnalyzeRequest(BaseModel):
     trade_cost: float = 0.0
     topk_frac: float = 0.2
     quantile_bin_count: int = 5
+    calibrate_method: str = "none"
+    xgb_max_depth: Optional[int] = None
+    xgb_reg_alpha: Optional[float] = None
+    xgb_reg_lambda: Optional[float] = None
+    lgb_max_depth: Optional[int] = None
+    lgb_reg_alpha: Optional[float] = None
+    lgb_reg_lambda: Optional[float] = None
+
+class ValidateRequest(BaseModel):
+    codes: List[str]
+    frequency: str = "1d"
+    data_src: str = "clickhouse"
+    model: str = "xgboost"
+    autype: str = "hfq"
+    data_length_mode: str = "default"
+    data_length_years: Optional[float] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    enable_rolling_lookback: bool = True
+    profit_threshold: Optional[float] = 0.01
+    auto_profit_quantile: float = 0.7
+    profit_lookahead: int = 5
+    backtest_mode: str = "auto"
+    walk_forward_max_folds: int = 20
+    walk_forward_test_window: Optional[int] = None
+    walk_forward_val_window: Optional[int] = None
+    walk_forward_step: Optional[int] = None
+    trade_cost: float = 0.0
+    topk_frac: float = 0.2
+    quantile_bin_count: int = 5
+    calibrate_method: str = "none"
+    xgb_max_depth: Optional[int] = None
+    xgb_reg_alpha: Optional[float] = None
+    xgb_reg_lambda: Optional[float] = None
+    lgb_max_depth: Optional[int] = None
+    lgb_reg_alpha: Optional[float] = None
+    lgb_reg_lambda: Optional[float] = None
 
 class PretrainRequest(BaseModel):
     codes: list[str]
@@ -1042,7 +1079,7 @@ async def analyze_stock(req: AnalyzeRequest):
                 online_bst, online_feature_meta, online_accuracy = train_time_split_backtest(
                     bsp_dict,
                     model_type=req.model,
-                    calibrate_method="none",
+                    calibrate_method=req.calibrate_method,
                     profit_threshold=req.profit_threshold,
                     auto_profit_quantile=req.auto_profit_quantile,
                     profit_lookahead=req.profit_lookahead,
@@ -1054,6 +1091,12 @@ async def analyze_stock(req: AnalyzeRequest):
                     trade_cost=req.trade_cost,
                     topk_frac=req.topk_frac,
                     quantile_bin_count=req.quantile_bin_count,
+                    xgb_max_depth=req.xgb_max_depth,
+                    xgb_reg_alpha=req.xgb_reg_alpha,
+                    xgb_reg_lambda=req.xgb_reg_lambda,
+                    lgb_max_depth=req.lgb_max_depth,
+                    lgb_reg_alpha=req.lgb_reg_alpha,
+                    lgb_reg_lambda=req.lgb_reg_lambda,
                 )
                 if online_accuracy is not None:
                     online_accuracy["pretrained"] = False
@@ -1125,7 +1168,7 @@ async def analyze_stock(req: AnalyzeRequest):
                 bst, feature_meta, accuracy_info = train_time_split_backtest(
                     bsp_dict,
                     model_type=req.model,
-                    calibrate_method="none",
+                    calibrate_method=req.calibrate_method,
                     profit_threshold=req.profit_threshold,
                     auto_profit_quantile=req.auto_profit_quantile,
                     profit_lookahead=req.profit_lookahead,
@@ -1137,6 +1180,12 @@ async def analyze_stock(req: AnalyzeRequest):
                     trade_cost=req.trade_cost,
                     topk_frac=req.topk_frac,
                     quantile_bin_count=req.quantile_bin_count,
+                    xgb_max_depth=req.xgb_max_depth,
+                    xgb_reg_alpha=req.xgb_reg_alpha,
+                    xgb_reg_lambda=req.xgb_reg_lambda,
+                    lgb_max_depth=req.lgb_max_depth,
+                    lgb_reg_alpha=req.lgb_reg_alpha,
+                    lgb_reg_lambda=req.lgb_reg_lambda,
                 )
                 if accuracy_info is not None:
                     accuracy_info["pretrained"] = False
@@ -1225,6 +1274,186 @@ async def analyze_stock(req: AnalyzeRequest):
             
         return result_data
         
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/validate")
+async def validate_codes(req: ValidateRequest):
+    try:
+        codes = []
+        for c in (req.codes or []):
+            s = str(c or "").strip()
+            if not s:
+                continue
+            try:
+                codes.append(normalize_code(s))
+            except Exception:
+                codes.append(s)
+        codes = sorted(list(dict.fromkeys(codes)))
+        if not codes:
+            raise HTTPException(status_code=400, detail="codes is empty")
+
+        freq_map = {
+            "1d": KL_TYPE.K_DAY,
+            "30m": KL_TYPE.K_30M,
+            "5m": KL_TYPE.K_5M,
+            "15m": KL_TYPE.K_15M,
+            "60m": KL_TYPE.K_60M,
+            "1m": KL_TYPE.K_1M,
+            "1w": KL_TYPE.K_WEEK,
+            "1mo": KL_TYPE.K_MON,
+        }
+        level = freq_map.get(req.frequency, KL_TYPE.K_DAY)
+
+        src_map = {
+            "baostock": DATA_SRC.BAO_STOCK,
+            "akshare": DATA_SRC.AK_SHARE,
+            "ccxt": DATA_SRC.CCXT,
+            "csv": DATA_SRC.CSV,
+            "clickhouse": DATA_SRC.CLICK_HOUSE,
+        }
+        data_src = src_map.get(req.data_src, DATA_SRC.BAO_STOCK)
+
+        raw_autype = str(getattr(req, "autype", "hfq") or "hfq").strip().lower()
+        autype_map = {
+            "qfq": AUTYPE.QFQ,
+            "hfq": AUTYPE.HFQ,
+            "none": AUTYPE.NONE,
+        }
+        autype = autype_map.get(raw_autype)
+        if autype is None:
+            raise HTTPException(status_code=400, detail="invalid autype, expect qfq/hfq/none")
+
+        import datetime
+        begin_time = None
+        end_time = None
+        if req.start_date:
+            begin_time = req.start_date
+        if req.end_date:
+            end_time = req.end_date
+        if not begin_time:
+            days = 365
+            if req.data_length_years is not None:
+                days = int(365 * req.data_length_years)
+            elif req.data_length_mode == "max":
+                if level == KL_TYPE.K_1M:
+                    days = 365
+                elif level == KL_TYPE.K_5M:
+                    days = 365 * 2
+                elif level == KL_TYPE.K_15M:
+                    days = 365 * 5
+                elif level in [KL_TYPE.K_30M, KL_TYPE.K_60M, KL_TYPE.K_DAY, KL_TYPE.K_WEEK, KL_TYPE.K_MON]:
+                    days = 365 * 10
+            else:
+                if level == KL_TYPE.K_1M:
+                    days = 180
+                elif level == KL_TYPE.K_5M:
+                    days = 540
+                elif level == KL_TYPE.K_15M:
+                    days = 900
+                elif level in [KL_TYPE.K_30M, KL_TYPE.K_60M, KL_TYPE.K_DAY, KL_TYPE.K_WEEK, KL_TYPE.K_MON]:
+                    days = 1800
+            days = max(days, 30)
+            begin_time = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+
+        use_online_latest = bool(data_src == DATA_SRC.CLICK_HOUSE)
+        results = []
+        for code in codes:
+            item = {"code": code, "status": "error"}
+            try:
+                kl_list = fetch_stock_data(
+                    code,
+                    level,
+                    begin_time,
+                    end_time,
+                    data_src,
+                    autype=autype,
+                    use_online_latest=use_online_latest,
+                )
+                if not kl_list:
+                    item["detail"] = "no_data"
+                    results.append(item)
+                    continue
+
+                _, bsp_dict, _, _ = get_chan_data(
+                    code,
+                    True,
+                    True,
+                    level,
+                    data_src,
+                    preloaded_data=kl_list,
+                    do_predict=True,
+                    begin_time=begin_time,
+                    end_time=end_time,
+                    enable_rolling_lookback=req.enable_rolling_lookback,
+                    autype=autype,
+                )
+                if not bsp_dict:
+                    item["detail"] = "no_bsp"
+                    results.append(item)
+                    continue
+
+                _, _, accuracy_info = train_time_split_backtest(
+                    bsp_dict,
+                    model_type=req.model,
+                    calibrate_method=req.calibrate_method,
+                    profit_threshold=req.profit_threshold,
+                    auto_profit_quantile=req.auto_profit_quantile,
+                    profit_lookahead=req.profit_lookahead,
+                    backtest_mode=req.backtest_mode,
+                    walk_forward_max_folds=req.walk_forward_max_folds,
+                    walk_forward_test_window=req.walk_forward_test_window,
+                    walk_forward_val_window=req.walk_forward_val_window,
+                    walk_forward_step=req.walk_forward_step,
+                    trade_cost=req.trade_cost,
+                    topk_frac=req.topk_frac,
+                    quantile_bin_count=req.quantile_bin_count,
+                    xgb_max_depth=req.xgb_max_depth,
+                    xgb_reg_alpha=req.xgb_reg_alpha,
+                    xgb_reg_lambda=req.xgb_reg_lambda,
+                    lgb_max_depth=req.lgb_max_depth,
+                    lgb_reg_alpha=req.lgb_reg_alpha,
+                    lgb_reg_lambda=req.lgb_reg_lambda,
+                )
+                keep = [
+                    "method",
+                    "train_count",
+                    "val_count",
+                    "test_count",
+                    "valid_count",
+                    "total_count",
+                    "accuracy",
+                    "roc_auc",
+                    "pr_auc",
+                    "brier_score",
+                    "ece",
+                    "logloss",
+                    "selected_features",
+                    "feature_importance_full",
+                    "feature_importance",
+                    "warning",
+                ]
+                slim = {k: accuracy_info.get(k) for k in keep if isinstance(accuracy_info, dict) and k in accuracy_info}
+                item["status"] = "success"
+                item["accuracy"] = slim
+            except Exception as e:
+                item["detail"] = str(e)
+            results.append(item)
+
+        return {
+            "status": "success",
+            "begin_time": begin_time,
+            "end_time": end_time,
+            "frequency": req.frequency,
+            "data_src": req.data_src,
+            "model": req.model,
+            "autype": autype.name,
+            "results": results,
+        }
     except HTTPException as e:
         raise e
     except Exception as e:

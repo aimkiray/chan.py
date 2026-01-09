@@ -7,6 +7,7 @@ import hashlib
 import pickle
 import gzip
 import uuid
+import math
 from typing import Dict, TypedDict, Optional
 import urllib.request
 import urllib.parse
@@ -1304,7 +1305,24 @@ def build_training_data(bsp_dict, feature_meta=None, profit_threshold: Optional[
         except Exception:
             profit = 0.0
         label = 1 if float(profit) > used_profit_threshold else 0
-        feat_vec = [info['feature'].get(k, -9999999) for k in feature_meta]
+        fill_zero_features = {"bsp2s_break_bi_amp", "bsp2_break_bi_amp", "divergence_rate"}
+        feat_vec = []
+        for k in feature_meta:
+            raw_v = info["feature"].get(k, -9999999)
+            try:
+                v = float(raw_v)
+            except Exception:
+                v = float(-9999999)
+            try:
+                finite = bool(np.isfinite(v))
+            except Exception:
+                finite = False
+            if (not finite) or v == float(-9999999):
+                if str(k) in fill_zero_features:
+                    v = 0.0
+                else:
+                    v = float(-9999999)
+            feat_vec.append(v)
         X.append(feat_vec)
         y.append(label)
 
@@ -1336,7 +1354,24 @@ def build_training_data_from_infos(infos, feature_meta, profit_threshold: Option
         except Exception:
             profit = 0.0
         label = 1 if float(profit) > used_profit_threshold else 0
-        feat_vec = [info['feature'].get(k, -9999999) for k in feature_meta]
+        fill_zero_features = {"bsp2s_break_bi_amp", "bsp2_break_bi_amp", "divergence_rate"}
+        feat_vec = []
+        for k in feature_meta:
+            raw_v = info["feature"].get(k, -9999999)
+            try:
+                v = float(raw_v)
+            except Exception:
+                v = float(-9999999)
+            try:
+                finite = bool(np.isfinite(v))
+            except Exception:
+                finite = False
+            if (not finite) or v == float(-9999999):
+                if str(k) in fill_zero_features:
+                    v = 0.0
+                else:
+                    v = float(-9999999)
+            feat_vec.append(v)
         X.append(feat_vec)
         y.append(label)
 
@@ -1536,34 +1571,83 @@ def _scale_pos_weight_from_y(y):
         return 1.0
     return float(neg) / float(pos)
 
-def build_estimator(model_type="xgboost", n_jobs=-1, scale_pos_weight=1.0, use_scale_pos_weight: bool = False, xgb_max_depth: Optional[int] = None, xgb_reg_alpha: Optional[float] = None, xgb_reg_lambda: Optional[float] = None, xgb_subsample: Optional[float] = None, xgb_colsample_bytree: Optional[float] = None, lgb_max_depth: Optional[int] = None, lgb_reg_alpha: Optional[float] = None, lgb_reg_lambda: Optional[float] = None):
+def build_estimator(model_type="xgboost", n_jobs=-1, scale_pos_weight=1.0, use_scale_pos_weight: bool = False, xgb_max_depth: Optional[int] = None, xgb_reg_alpha: Optional[float] = None, xgb_reg_lambda: Optional[float] = None, xgb_subsample: Optional[float] = None, xgb_colsample_bytree: Optional[float] = None, lgb_max_depth: Optional[int] = None, lgb_reg_alpha: Optional[float] = None, lgb_reg_lambda: Optional[float] = None, monotone_constraints=None):
     if model_type == "xgboost":
-        md = 5 if xgb_max_depth is None else int(xgb_max_depth)
+        xgb_learning_rate = _env_float("MLCHAN_XGB_LEARNING_RATE", None)
+        xgb_n_estimators = _env_int("MLCHAN_XGB_N_ESTIMATORS", None)
+        xgb_min_child_weight = _env_float("MLCHAN_XGB_MIN_CHILD_WEIGHT", None)
+        if xgb_max_depth is None:
+            xgb_max_depth = _env_int("MLCHAN_XGB_MAX_DEPTH", None)
+        if xgb_reg_alpha is None:
+            xgb_reg_alpha = _env_float("MLCHAN_XGB_REG_ALPHA", None)
+        if xgb_reg_lambda is None:
+            xgb_reg_lambda = _env_float("MLCHAN_XGB_REG_LAMBDA", None)
+        if xgb_subsample is None:
+            xgb_subsample = _env_float("MLCHAN_XGB_SUBSAMPLE", None)
+        if xgb_colsample_bytree is None:
+            xgb_colsample_bytree = _env_float("MLCHAN_XGB_COLSAMPLE_BYTREE", None)
+
+        lr = 0.01 if xgb_learning_rate is None else float(xgb_learning_rate)
+        ne = 500 if xgb_n_estimators is None else int(xgb_n_estimators)
+        md = 3 if xgb_max_depth is None else int(xgb_max_depth)
         ra = 0.0 if xgb_reg_alpha is None else float(xgb_reg_alpha)
-        rl = 1.0 if xgb_reg_lambda is None else float(xgb_reg_lambda)
+        rl = 10.0 if xgb_reg_lambda is None else float(xgb_reg_lambda)
         ss = 1.0 if xgb_subsample is None else float(xgb_subsample)
         cs = 1.0 if xgb_colsample_bytree is None else float(xgb_colsample_bytree)
-        spw = float(scale_pos_weight) if bool(use_scale_pos_weight) else 1.0
-        return xgb.XGBClassifier(
-            n_estimators=100,
-            learning_rate=0.1,
+        params = dict(
+            n_estimators=ne,
+            learning_rate=lr,
             max_depth=md,
             eval_metric='logloss',
             n_jobs=n_jobs,
             missing=-9999999,
             random_state=42,
-            scale_pos_weight=spw,
             reg_alpha=ra,
             reg_lambda=rl,
             subsample=ss,
             colsample_bytree=cs,
         )
+        if xgb_min_child_weight is not None:
+            params["min_child_weight"] = float(xgb_min_child_weight)
+        if monotone_constraints is not None:
+            mc = monotone_constraints
+            if isinstance(mc, (list, tuple)):
+                try:
+                    params["monotone_constraints"] = "(" + ",".join(str(int(x)) for x in mc) + ")"
+                except Exception:
+                    params["monotone_constraints"] = mc
+            else:
+                params["monotone_constraints"] = mc
+        try:
+            return xgb.XGBClassifier(**params)
+        except TypeError:
+            params.pop("monotone_constraints", None)
+            return xgb.XGBClassifier(**params)
     if model_type == "lightgbm":
-        md = 5 if lgb_max_depth is None else int(lgb_max_depth)
+        lgb_learning_rate = _env_float("MLCHAN_LGB_LEARNING_RATE", None)
+        lgb_n_estimators = _env_int("MLCHAN_LGB_N_ESTIMATORS", None)
+        if lgb_max_depth is None:
+            lgb_max_depth = _env_int("MLCHAN_LGB_MAX_DEPTH", None)
+        if lgb_reg_alpha is None:
+            lgb_reg_alpha = _env_float("MLCHAN_LGB_REG_ALPHA", None)
+        if lgb_reg_lambda is None:
+            lgb_reg_lambda = _env_float("MLCHAN_LGB_REG_LAMBDA", None)
+        lr = 0.01 if lgb_learning_rate is None else float(lgb_learning_rate)
+        ne = 500 if lgb_n_estimators is None else int(lgb_n_estimators)
+        md = 3 if lgb_max_depth is None else int(lgb_max_depth)
         ra = 0.0 if lgb_reg_alpha is None else float(lgb_reg_alpha)
-        rl = 0.0 if lgb_reg_lambda is None else float(lgb_reg_lambda)
-        spw = float(scale_pos_weight) if bool(use_scale_pos_weight) else 1.0
-        return lgb.LGBMClassifier(n_estimators=100, learning_rate=0.1, max_depth=md, verbosity=-1, n_jobs=n_jobs, scale_pos_weight=spw, reg_alpha=ra, reg_lambda=rl)
+        rl = 10.0 if lgb_reg_lambda is None else float(lgb_reg_lambda)
+        params = dict(n_estimators=ne, learning_rate=lr, max_depth=md, verbosity=-1, n_jobs=n_jobs, reg_alpha=ra, reg_lambda=rl)
+        if monotone_constraints is not None:
+            mc = monotone_constraints
+            if isinstance(mc, tuple):
+                mc = list(mc)
+            params["monotone_constraints"] = mc
+        try:
+            return lgb.LGBMClassifier(**params)
+        except TypeError:
+            params.pop("monotone_constraints", None)
+            return lgb.LGBMClassifier(**params)
     if model_type == "mlp":
         return Pipeline([
             ('imputer', SimpleImputer(missing_values=-9999999, strategy='mean')),
@@ -1576,13 +1660,395 @@ def build_estimator(model_type="xgboost", n_jobs=-1, scale_pos_weight=1.0, use_s
                 random_state=42
             ))
         ])
-    spw = float(scale_pos_weight) if bool(use_scale_pos_weight) else 1.0
     md = 5 if xgb_max_depth is None else int(xgb_max_depth)
     ra = 0.0 if xgb_reg_alpha is None else float(xgb_reg_alpha)
     rl = 1.0 if xgb_reg_lambda is None else float(xgb_reg_lambda)
     ss = 1.0 if xgb_subsample is None else float(xgb_subsample)
     cs = 1.0 if xgb_colsample_bytree is None else float(xgb_colsample_bytree)
-    return xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=md, eval_metric='logloss', scale_pos_weight=spw, reg_alpha=ra, reg_lambda=rl, subsample=ss, colsample_bytree=cs)
+    params = dict(n_estimators=100, learning_rate=0.1, max_depth=md, eval_metric='logloss', reg_alpha=ra, reg_lambda=rl, subsample=ss, colsample_bytree=cs)
+    if monotone_constraints is not None:
+        mc = monotone_constraints
+        if isinstance(mc, (list, tuple)):
+            try:
+                params["monotone_constraints"] = "(" + ",".join(str(int(x)) for x in mc) + ")"
+            except Exception:
+                params["monotone_constraints"] = mc
+        else:
+            params["monotone_constraints"] = mc
+    try:
+        return xgb.XGBClassifier(**params)
+    except TypeError:
+        params.pop("monotone_constraints", None)
+        return xgb.XGBClassifier(**params)
+
+
+def _ic_filter_feature_meta(X_train, y_train, feature_meta, abs_ic_threshold: float = 0.02, top_n: int = 8, min_n: int = 50):
+    if not X_train or not y_train or not feature_meta:
+        return list(feature_meta or []), None
+    try:
+        th = float(abs_ic_threshold)
+    except Exception:
+        th = 0.02
+    try:
+        tn = int(top_n)
+    except Exception:
+        tn = 8
+    tn = max(2, tn)
+    table = compute_feature_ic_table(X_train, y_train, feature_meta, min_n=min_n)
+    if not table:
+        return list(feature_meta or []), None
+    strong = [r for r in table if float(r.get("abs_ic", 0.0) or 0.0) > th]
+    if not strong:
+        return list(feature_meta or []), None
+    strong = strong[:tn]
+    meta = [str(r.get("feature")) for r in strong if r.get("feature")]
+    if len(meta) < 2:
+        return list(feature_meta or []), None
+    sign_map = {}
+    for r in strong:
+        f = r.get("feature")
+        if not f:
+            continue
+        try:
+            ic = float(r.get("ic", 0.0) or 0.0)
+        except Exception:
+            ic = 0.0
+        if ic > 0:
+            sign_map[str(f)] = 1
+        elif ic < 0:
+            sign_map[str(f)] = -1
+        else:
+            sign_map[str(f)] = 0
+    return meta, sign_map
+
+def _env_csv_list(key: str, default: str = ""):
+    raw = os.environ.get(key, default)
+    parts = []
+    for x in str(raw or "").split(","):
+        s = str(x or "").strip()
+        if not s:
+            continue
+        parts.append(s)
+    dedup = []
+    seen = set()
+    for s in parts:
+        if s in seen:
+            continue
+        seen.add(s)
+        dedup.append(s)
+    return dedup
+
+def _env_float(key: str, default: Optional[float] = None) -> Optional[float]:
+    raw = os.environ.get(key, None)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+def _env_int(key: str, default: Optional[int] = None) -> Optional[int]:
+    raw = os.environ.get(key, None)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(float(raw))
+    except Exception:
+        return default
+
+def _apply_drop_features(feature_meta, drop_features):
+    if not feature_meta or not drop_features:
+        return list(feature_meta or []), False
+    drop_set = set(str(x) for x in (drop_features or []) if str(x))
+    if not drop_set:
+        return list(feature_meta or []), False
+    kept = [f for f in (feature_meta or []) if str(f) not in drop_set]
+    if len(kept) < 2:
+        return list(feature_meta or []), False
+    if len(kept) == len(feature_meta or []):
+        return list(feature_meta or []), False
+    return kept, True
+
+def _monotone_mode():
+    raw = os.environ.get("MLCHAN_MONOTONE_MODE", "fixed+ic")
+    s = str(raw or "").strip().lower()
+    if s in ["none", "off", "0", "false", "no"]:
+        return "none"
+    if s in ["ic", "auto", "sign", "sign_map"]:
+        return "ic"
+    if s in ["fixed+ic", "fixed_ic", "hybrid", "mix"]:
+        return "fixed+ic"
+    return "fixed"
+
+def _build_monotone_constraints(feature_meta, sign_map=None):
+    if not feature_meta:
+        return None
+    mode = _monotone_mode()
+    if mode == "none":
+        return None
+
+    fixed = {
+        "volatility_250": 1,
+        "zs_height": 1,
+        "bsp1_bi_amp": -1,
+        "bsp2_bi_amp": 1,
+        "bi_last_amp_r": 1,
+        "bsp2s_retrace_rate": -1,
+        "seg_last_dir": 1,
+        "bsp3_zs_height": 1,
+    }
+    out = []
+    has_nonzero = False
+    for f in (feature_meta or []):
+        key = str(f)
+        v = None
+        if mode in ["fixed", "fixed+ic"]:
+            v = fixed.get(key, None)
+        if v is None and mode in ["ic", "fixed+ic"] and isinstance(sign_map, dict):
+            v = sign_map.get(key, 0)
+        if v is None:
+            v = 0
+        try:
+            iv = int(v)
+        except Exception:
+            iv = 0
+        if iv != 0:
+            has_nonzero = True
+        out.append(iv)
+    if not has_nonzero:
+        return None
+    return tuple(out)
+
+def _winsorize_enabled() -> bool:
+    raw = os.environ.get("MLCHAN_WINSORIZE", "1")
+    s = str(raw or "").strip().lower()
+    return s not in ["0", "false", "no", "off", "disabled", "disable"]
+
+def _winsorize_params():
+    lo = os.environ.get("MLCHAN_WINSORIZE_LO", "0.01")
+    hi = os.environ.get("MLCHAN_WINSORIZE_HI", "0.99")
+    mn = os.environ.get("MLCHAN_WINSORIZE_MIN_N", "50")
+    try:
+        lo_q = float(lo)
+    except Exception:
+        lo_q = 0.01
+    try:
+        hi_q = float(hi)
+    except Exception:
+        hi_q = 0.99
+    try:
+        min_n = int(float(mn))
+    except Exception:
+        min_n = 50
+    lo_q = max(0.0, min(0.25, lo_q))
+    hi_q = max(0.75, min(1.0, hi_q))
+    min_n = max(10, min_n)
+    return float(lo_q), float(hi_q), int(min_n)
+
+def _winsorize_fit_bounds(X_train, missing_value: float = -9999999.0):
+    if not X_train:
+        return None
+    try:
+        arr = np.asarray(X_train, dtype=float)
+    except Exception:
+        return None
+    if arr.ndim != 2 or arr.shape[0] <= 0 or arr.shape[1] <= 0:
+        return None
+    lo_q, hi_q, min_n = _winsorize_params()
+    lows = [None for _ in range(int(arr.shape[1]))]
+    highs = [None for _ in range(int(arr.shape[1]))]
+    for j in range(int(arr.shape[1])):
+        col = arr[:, j]
+        try:
+            mask = np.isfinite(col) & (col != float(missing_value))
+        except Exception:
+            continue
+        vals = col[mask]
+        if vals is None or int(getattr(vals, "size", 0) or 0) < int(min_n):
+            continue
+        try:
+            lo_v = float(np.quantile(vals, lo_q))
+            hi_v = float(np.quantile(vals, hi_q))
+        except Exception:
+            continue
+        if not (np.isfinite(lo_v) and np.isfinite(hi_v)):
+            continue
+        if float(hi_v) < float(lo_v):
+            continue
+        lows[j] = float(lo_v)
+        highs[j] = float(hi_v)
+    if not any(v is not None for v in lows) and not any(v is not None for v in highs):
+        return None
+    return lows, highs
+
+def _winsorize_apply_bounds(X, bounds, missing_value: float = -9999999.0):
+    if not X or not bounds:
+        return X
+    lows, highs = bounds
+    out = []
+    for row in (X or []):
+        nr = list(row or [])
+        m = min(len(nr), len(lows), len(highs))
+        for j in range(m):
+            try:
+                v = float(nr[j])
+            except Exception:
+                continue
+            if (not np.isfinite(v)) or float(v) == float(missing_value):
+                continue
+            lo = lows[j]
+            hi = highs[j]
+            if lo is not None and v < float(lo):
+                nr[j] = float(lo)
+            elif hi is not None and v > float(hi):
+                nr[j] = float(hi)
+        out.append(nr)
+    return out
+
+def _rank_transform_enabled() -> bool:
+    raw = os.environ.get("MLCHAN_RANK_TRANSFORM", "1")
+    s = str(raw or "").strip().lower()
+    return s not in ["0", "false", "no", "off", "disabled", "disable"]
+
+def _rank_transform_min_n() -> int:
+    raw = os.environ.get("MLCHAN_RANK_MIN_N", "30")
+    try:
+        v = int(float(raw))
+    except Exception:
+        v = 30
+    return max(5, v)
+
+def _rank_transform_feature_list():
+    return _env_csv_list("MLCHAN_RANK_FEATURES", "")
+
+def _rank_transform_fit_sorted_cols(X_train, feature_meta=None, missing_value: float = -9999999.0):
+    if not X_train:
+        return None
+    try:
+        arr = np.asarray(X_train, dtype=float)
+    except Exception:
+        return None
+    if arr.ndim != 2 or arr.shape[0] <= 0 or arr.shape[1] <= 0:
+        return None
+    min_n = _rank_transform_min_n()
+    only_features = _rank_transform_feature_list()
+    only_set = set(str(x) for x in (only_features or []) if str(x))
+    idx_allow = None
+    if only_set and feature_meta:
+        idx_allow = set()
+        for j, name in enumerate(feature_meta or []):
+            if str(name) in only_set:
+                idx_allow.add(int(j))
+    sorted_cols = {}
+    for j in range(int(arr.shape[1])):
+        if idx_allow is not None and int(j) not in idx_allow:
+            continue
+        col = arr[:, j]
+        try:
+            mask = np.isfinite(col) & (col != float(missing_value))
+        except Exception:
+            continue
+        vals = col[mask]
+        if vals is None or int(getattr(vals, "size", 0) or 0) < int(min_n):
+            continue
+        try:
+            sv = np.sort(vals)
+        except Exception:
+            continue
+        if sv is None or int(getattr(sv, "size", 0) or 0) <= 0:
+            continue
+        sorted_cols[int(j)] = sv
+    if not sorted_cols:
+        return None
+    return sorted_cols
+
+def _rank_transform_apply_sorted_cols(X, sorted_cols, missing_value: float = -9999999.0):
+    if not X or not sorted_cols:
+        return X
+    out = []
+    for row in (X or []):
+        nr = list(row or [])
+        for j, sv in (sorted_cols or {}).items():
+            if j < 0 or j >= len(nr):
+                continue
+            try:
+                v = float(nr[j])
+            except Exception:
+                continue
+            if (not np.isfinite(v)) or float(v) == float(missing_value):
+                continue
+            try:
+                n = int(getattr(sv, "size", 0) or 0)
+            except Exception:
+                n = 0
+            if n <= 0:
+                continue
+            try:
+                left = int(np.searchsorted(sv, v, side="left"))
+                right = int(np.searchsorted(sv, v, side="right"))
+            except Exception:
+                continue
+            avg_rank = (float(left + 1) + float(right)) / 2.0
+            pct = avg_rank / float(n)
+            if pct < 0.0:
+                pct = 0.0
+            if pct > 1.0:
+                pct = 1.0
+            nr[j] = float(pct)
+        out.append(nr)
+    return out
+
+def _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=None, missing_value: float = -9999999.0):
+    if not _rank_transform_enabled():
+        return X_train, X_val, X_test, None
+    sorted_cols = _rank_transform_fit_sorted_cols(X_train, feature_meta=feature_meta, missing_value=missing_value)
+    if not sorted_cols:
+        return X_train, X_val, X_test, None
+    X_train2 = _rank_transform_apply_sorted_cols(X_train, sorted_cols, missing_value=missing_value)
+    X_val2 = _rank_transform_apply_sorted_cols(X_val, sorted_cols, missing_value=missing_value) if X_val else X_val
+    X_test2 = _rank_transform_apply_sorted_cols(X_test, sorted_cols, missing_value=missing_value) if X_test else X_test
+    return X_train2, X_val2, X_test2, sorted_cols
+
+def _maybe_winsorize_splits(X_train, X_val, X_test, missing_value: float = -9999999.0):
+    if not _winsorize_enabled():
+        return X_train, X_val, X_test, None
+    bounds = _winsorize_fit_bounds(X_train, missing_value=missing_value)
+    if not bounds:
+        return X_train, X_val, X_test, None
+    X_train2 = _winsorize_apply_bounds(X_train, bounds, missing_value=missing_value)
+    X_val2 = _winsorize_apply_bounds(X_val, bounds, missing_value=missing_value) if X_val else X_val
+    X_test2 = _winsorize_apply_bounds(X_test, bounds, missing_value=missing_value) if X_test else X_test
+    return X_train2, X_val2, X_test2, bounds
+
+def _force_feature_list():
+    return _env_csv_list("MLCHAN_FORCE_FEATURES", "seg_last_dir,bsp3_zs_height")
+
+def _only_feature_list():
+    return _env_csv_list("MLCHAN_ONLY_FEATURES", "")
+
+def _merge_forced_features(selected, forced, max_n: int):
+    if max_n <= 0:
+        return []
+    forced_set = set(str(x) for x in (forced or []) if str(x))
+    out = []
+    seen = set()
+    for f in (forced or []):
+        s = str(f)
+        if not s or s in seen:
+            continue
+        out.append(s)
+        seen.add(s)
+        if len(out) >= max_n:
+            return out[:max_n]
+    for f in (selected or []):
+        s = str(f)
+        if not s or s in seen or (forced_set and s in forced_set and s in seen):
+            continue
+        out.append(s)
+        seen.add(s)
+        if len(out) >= max_n:
+            break
+    return out[:max_n]
 
 def _min_val_fraction() -> float:
     raw = os.environ.get("MLCHAN_VAL_FRACTION", "0.2")
@@ -1729,7 +2195,7 @@ def _prune_correlated_features(X, feature_names, importance_map, corr_threshold:
     return out
 
 
-def train_model_from_xy(X_train, y_train, model_type="xgboost", n_jobs=-1, use_scale_pos_weight: bool = False, xgb_max_depth: Optional[int] = None, xgb_reg_alpha: Optional[float] = None, xgb_reg_lambda: Optional[float] = None, xgb_subsample: Optional[float] = None, xgb_colsample_bytree: Optional[float] = None, lgb_max_depth: Optional[int] = None, lgb_reg_alpha: Optional[float] = None, lgb_reg_lambda: Optional[float] = None, X_val=None, y_val=None):
+def train_model_from_xy(X_train, y_train, model_type="xgboost", n_jobs=-1, use_scale_pos_weight: bool = False, xgb_max_depth: Optional[int] = None, xgb_reg_alpha: Optional[float] = None, xgb_reg_lambda: Optional[float] = None, xgb_subsample: Optional[float] = None, xgb_colsample_bytree: Optional[float] = None, lgb_max_depth: Optional[int] = None, lgb_reg_alpha: Optional[float] = None, lgb_reg_lambda: Optional[float] = None, X_val=None, y_val=None, monotone_constraints=None):
     if not X_train:
         return None
     if len(set(y_train)) < 2:
@@ -1754,6 +2220,7 @@ def train_model_from_xy(X_train, y_train, model_type="xgboost", n_jobs=-1, use_s
         lgb_max_depth=lgb_max_depth,
         lgb_reg_alpha=lgb_reg_alpha,
         lgb_reg_lambda=lgb_reg_lambda,
+        monotone_constraints=monotone_constraints,
     )
     used_X_train = X_train
     used_y_train = y_train
@@ -1788,6 +2255,8 @@ def train_model_with_feature_selection(
     X_val=None,
     y_val=None,
 ):
+    X_train, X_val, _, _ = _maybe_rank_transform_splits(X_train, X_val, None, feature_meta=feature_meta)
+    X_train, X_val, _, _ = _maybe_winsorize_splits(X_train, X_val, None)
     if not feature_meta:
         m = train_model_from_xy(
             X_train,
@@ -1908,6 +2377,61 @@ def _clip01(p: float, eps: float = 1e-15) -> float:
     if pv > 1.0 - eps:
         return 1.0 - eps
     return pv
+
+def _sigmoid(x: float) -> float:
+    try:
+        xv = float(x)
+    except Exception:
+        xv = 0.0
+    if xv >= 0:
+        z = math.exp(-xv)
+        return 1.0 / (1.0 + z)
+    z = math.exp(xv)
+    return z / (1.0 + z)
+
+def _logit(p: float) -> float:
+    pv = _clip01(p)
+    return float(math.log(pv / (1.0 - pv)))
+
+def _temperature_scale_prob(p: float, temperature: float) -> float:
+    try:
+        t = float(temperature)
+    except Exception:
+        t = 1.0
+    if t <= 1e-6:
+        t = 1.0
+    return float(_sigmoid(_logit(p) / t))
+
+def _temperature_scale_probs(probs, temperature: float):
+    return [float(_temperature_scale_prob(p, temperature)) for p in (probs or [])]
+
+def _best_temperature_for_probs(y, probs):
+    if not y or not probs:
+        return 1.0
+    candidates = [0.5, 0.67, 0.8, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0]
+    best_t = 1.0
+    best_brier = None
+    for t in candidates:
+        ps = _temperature_scale_probs(probs, t)
+        b = _brier_from_probs(y, ps)
+        if best_brier is None or float(b) < float(best_brier):
+            best_brier = float(b)
+            best_t = float(t)
+    return float(best_t)
+
+class TemperatureScaledModel:
+    def __init__(self, base_model, temperature: float):
+        self.base_model = base_model
+        self.temperature = float(temperature)
+
+    def predict_proba(self, X):
+        base_probs = predict_proba_1(self.base_model, X)
+        scaled = _temperature_scale_probs(base_probs, self.temperature)
+        return [[float(1.0 - p), float(p)] for p in scaled]
+
+    def predict(self, X):
+        probs = predict_proba_1(self, X)
+        return [1 if float(p) >= 0.5 else 0 for p in (probs or [])]
 
 def _brier_from_probs(y, probs) -> float:
     if not y or not probs:
@@ -2353,7 +2877,13 @@ def _normalize_calibrate_method(raw):
     if s in ["sigmoid", "platt"]:
         return "sigmoid"
     if s == "isotonic":
-        return "sigmoid"
+        return "isotonic"
+    if s in ["temperature", "temp", "t"]:
+        en = os.environ.get("MLCHAN_ENABLE_TEMPERATURE", "0")
+        es = str(en or "").strip().lower()
+        if es in ["1", "true", "yes", "on", "enable", "enabled"]:
+            return "temperature"
+        return None
     return None
 
 def _walk_forward_eval_infos(
@@ -2401,6 +2931,10 @@ def _walk_forward_eval_infos(
     test_window = max(int(min_test), test_window, 1)
 
     used_calibrate_method_req = _normalize_calibrate_method(calibrate_method)
+    forced_features = _force_feature_list()
+    only_features = _only_feature_list()
+    if only_features:
+        forced_features = []
 
     provided_val_window = walk_forward_val_window is not None
     if walk_forward_val_window is None:
@@ -2453,6 +2987,11 @@ def _walk_forward_eval_infos(
             start_train_end = max(start_train_end, idx_years)
     start_train_end = max(start_train_end, 100)
 
+    max_train_end = int(n) - int(val_window) - int(test_window)
+    if max_train_end < int(start_train_end):
+        start_train_end = int(max_train_end)
+    start_train_end = max(int(start_train_end), int(min_train), 1)
+
     if start_train_end + val_window + test_window > n:
         return None, {
             "status": "error",
@@ -2470,6 +3009,8 @@ def _walk_forward_eval_infos(
     last_meta = []
     last_fold_train_X = None
     last_fold_train_y = None
+    last_fold_test_X = None
+    last_fold_test_y = None
     last_fold_feature_meta = None
 
     train_end = int(start_train_end)
@@ -2487,6 +3028,8 @@ def _walk_forward_eval_infos(
         test_infos = infos[test_start:test_end]
 
         feature_meta = _feature_meta_from_infos(train_infos)
+        if only_features:
+            feature_meta = list(only_features or [])
         if not feature_meta:
             train_end += step
             used_folds += 1
@@ -2506,30 +3049,104 @@ def _walk_forward_eval_infos(
             used_folds += 1
             continue
 
+        monotone_constraints = None
+        if model_type in ["xgboost", "lightgbm"]:
+            if only_features:
+                sign_map = {}
+                table = compute_feature_ic_table(X_train, y_train, feature_meta, min_n=50)
+                for r in (table or []):
+                    f = r.get("feature")
+                    if not f:
+                        continue
+                    try:
+                        ic = float(r.get("ic", 0.0) or 0.0)
+                    except Exception:
+                        ic = 0.0
+                    if ic > 0:
+                        sign_map[str(f)] = 1
+                    elif ic < 0:
+                        sign_map[str(f)] = -1
+                    else:
+                        sign_map[str(f)] = 0
+                monotone_constraints = _build_monotone_constraints(feature_meta, sign_map=sign_map)
+            else:
+                abs_th = _env_float("MLCHAN_IC_ABS_THRESHOLD", 0.02)
+                ic_top_n = _env_int("MLCHAN_IC_TOP_N", 8)
+                ic_min_n = _env_int("MLCHAN_IC_MIN_N", 50)
+                filtered_meta, sign_map = _ic_filter_feature_meta(X_train, y_train, feature_meta, abs_ic_threshold=abs_th, top_n=ic_top_n, min_n=ic_min_n)
+                if filtered_meta and len(filtered_meta) >= 2 and filtered_meta != list(feature_meta or []):
+                    feature_meta = list(filtered_meta)
+                    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                drop_features = _env_csv_list("MLCHAN_DROP_FEATURES", "zs_last_is_sure")
+                feature_meta2, changed = _apply_drop_features(feature_meta, drop_features)
+                if changed:
+                    feature_meta = list(feature_meta2)
+                    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                if forced_features:
+                    merged = _merge_forced_features(feature_meta, forced_features, max_n=max(2, int(len(feature_meta or [])) + int(len(forced_features or []))))
+                    if merged and merged != list(feature_meta or []):
+                        feature_meta = list(merged)
+                        X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                        X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                        X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                monotone_constraints = _build_monotone_constraints(feature_meta, sign_map=sign_map)
+
+        X_train, X_val, X_test, rank_cols = _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=feature_meta)
+        X_train, X_val, X_test, winsor_bounds = _maybe_winsorize_splits(X_train, X_val, X_test)
+
         selected_features = []
         feature_sel_meta = {"selected_features": [], "dropped_by_importance": 0, "dropped_by_corr": 0}
         model = None
-        try:
-            model, feature_meta2, feature_sel_meta = train_model_with_feature_selection(
-                X_train,
-                y_train,
-                feature_meta,
-                model_type=model_type,
-                n_jobs=n_jobs,
-                use_scale_pos_weight=use_scale_pos_weight,
-                xgb_max_depth=xgb_max_depth,
-                xgb_reg_alpha=xgb_reg_alpha,
-                xgb_reg_lambda=xgb_reg_lambda,
-                lgb_max_depth=lgb_max_depth,
-                lgb_reg_alpha=lgb_reg_alpha,
-                lgb_reg_lambda=lgb_reg_lambda,
-                X_val=X_val,
-                y_val=y_val,
-            )
-        except Exception:
-            model = None
-            feature_meta2 = None
-            feature_sel_meta = {"selected_features": [], "dropped_by_importance": 0, "dropped_by_corr": 0}
+        if model_type in ["xgboost", "lightgbm"]:
+            try:
+                model = train_model_from_xy(
+                    X_train,
+                    y_train,
+                    model_type=model_type,
+                    n_jobs=n_jobs,
+                    use_scale_pos_weight=use_scale_pos_weight,
+                    xgb_max_depth=xgb_max_depth,
+                    xgb_reg_alpha=xgb_reg_alpha,
+                    xgb_reg_lambda=xgb_reg_lambda,
+                    lgb_max_depth=lgb_max_depth,
+                    lgb_reg_alpha=lgb_reg_alpha,
+                    lgb_reg_lambda=lgb_reg_lambda,
+                    X_val=X_val,
+                    y_val=y_val,
+                    monotone_constraints=monotone_constraints,
+                )
+                feature_meta2 = list(feature_meta or [])
+                feature_sel_meta = {"selected_features": list(feature_meta2), "dropped_by_importance": 0, "dropped_by_corr": 0}
+            except Exception:
+                model = None
+                feature_meta2 = None
+                feature_sel_meta = {"selected_features": [], "dropped_by_importance": 0, "dropped_by_corr": 0}
+        else:
+            try:
+                model, feature_meta2, feature_sel_meta = train_model_with_feature_selection(
+                    X_train,
+                    y_train,
+                    feature_meta,
+                    model_type=model_type,
+                    n_jobs=n_jobs,
+                    use_scale_pos_weight=use_scale_pos_weight,
+                    xgb_max_depth=xgb_max_depth,
+                    xgb_reg_alpha=xgb_reg_alpha,
+                    xgb_reg_lambda=xgb_reg_lambda,
+                    lgb_max_depth=lgb_max_depth,
+                    lgb_reg_alpha=lgb_reg_alpha,
+                    lgb_reg_lambda=lgb_reg_lambda,
+                    X_val=X_val,
+                    y_val=y_val,
+                )
+            except Exception:
+                model = None
+                feature_meta2 = None
+                feature_sel_meta = {"selected_features": [], "dropped_by_importance": 0, "dropped_by_corr": 0}
         if not model:
             train_end += step
             used_folds += 1
@@ -2546,20 +3163,30 @@ def _walk_forward_eval_infos(
             used_folds += 1
             continue
 
+        X_train, X_val, X_test, rank_cols = _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=feature_meta)
+        X_train, X_val, X_test, winsor_bounds = _maybe_winsorize_splits(X_train, X_val, X_test)
+
         score_model = model
         calibrated = False
         used_calibrate_method = None
         if used_calibrate_method_req is not None and val_window > 0 and X_val and y_val and len(set(y_val)) >= 2 and not isinstance(model, SingleClassModel):
             chosen_method = used_calibrate_method_req
             try:
-                try:
-                    cal = CalibratedClassifierCV(estimator=model, method=chosen_method, cv="prefit")
-                except TypeError:
-                    cal = CalibratedClassifierCV(base_estimator=model, method=chosen_method, cv="prefit")
-                cal.fit(X_val, y_val)
-                score_model = cal
-                calibrated = True
-                used_calibrate_method = chosen_method
+                if chosen_method == "temperature":
+                    probs_val = predict_proba_1(model, X_val)
+                    t = _best_temperature_for_probs(y_val, probs_val)
+                    score_model = TemperatureScaledModel(model, t)
+                    calibrated = True
+                    used_calibrate_method = f"temperature_t{float(t):.4g}"
+                else:
+                    try:
+                        cal = CalibratedClassifierCV(estimator=model, method=chosen_method, cv="prefit")
+                    except TypeError:
+                        cal = CalibratedClassifierCV(base_estimator=model, method=chosen_method, cv="prefit")
+                    cal.fit(X_val, y_val)
+                    score_model = cal
+                    calibrated = True
+                    used_calibrate_method = chosen_method
             except Exception:
                 score_model = model
                 calibrated = False
@@ -2578,13 +3205,15 @@ def _walk_forward_eval_infos(
         neg_c, pos_c = _binary_class_counts(y_train)
         train_pos_rate = (float(pos_c) / float(neg_c + pos_c)) if (neg_c + pos_c) > 0 else 0.0
         prior_probs = [float(train_pos_rate) for _ in range(total)]
-        fold_ic = compute_feature_ic_report(X_train, y_train, feature_meta, include_table=False, top_n=10)
+        fold_ic = compute_feature_ic_report(X_test, y_test, feature_meta, include_table=False, top_n=10)
         fold_logreg_probs = _logistic_regression_baseline_probs(X_train, y_train, X_test)
         logreg_ok = bool(fold_logreg_probs) and len(fold_logreg_probs) >= total
         if not logreg_ok:
             fold_logreg_probs = list(prior_probs)
         last_fold_train_X = X_train
         last_fold_train_y = y_train
+        last_fold_test_X = X_test
+        last_fold_test_y = y_test
         last_fold_feature_meta = list(feature_meta or [])
 
         for i in range(total):
@@ -2606,6 +3235,8 @@ def _walk_forward_eval_infos(
             "train_count": len(X_train),
             "val_count": len(X_val),
             "test_count": len(X_test),
+            "rank_transformed": bool(rank_cols),
+            "winsorized": bool(winsor_bounds),
             "calibrated": bool(calibrated),
             "calibrate_method": used_calibrate_method,
             "selected_features": list(selected_features or []),
@@ -2651,8 +3282,8 @@ def _walk_forward_eval_infos(
     lr_correct, lr_total, lr_acc = _accuracy_from_probs(y_all, p_logreg_all, threshold=threshold)
 
     last_fold_ic = None
-    if last_fold_train_X and last_fold_train_y and last_fold_feature_meta:
-        last_fold_ic = compute_feature_ic_report(last_fold_train_X, last_fold_train_y, last_fold_feature_meta, include_table=True, top_n=20)
+    if last_fold_test_X and last_fold_test_y and last_fold_feature_meta:
+        last_fold_ic = compute_feature_ic_report(last_fold_test_X, last_fold_test_y, last_fold_feature_meta, include_table=True, top_n=20)
 
     try:
         tk_frac = float(topk_frac)
@@ -2738,10 +3369,13 @@ def _walk_forward_eval_infos(
         "total_count": int(total_count),
         "accuracy": float(acc),
         "method": "walk_forward",
+        "calibrate_method_requested": str(calibrate_method),
+        "calibrate_method_effective": (str(used_calibrate_method_req) if used_calibrate_method_req is not None else None),
         "train_count": int(folds[-1]["train_count"]) if folds else 0,
         "val_count": int(folds[-1]["val_count"]) if folds else 0,
         "test_count": int(folds[-1]["test_count"]) if folds else 0,
         "oos_test_count": int(len(y_all)),
+        "winsorized": (bool((folds[-1] or {}).get("winsorized")) if folds else False),
         "brier_score": brier_val,
         "logloss": logloss_val,
         "roc_auc": roc_auc_val,
@@ -2847,9 +3481,11 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
         pass
 
     n = len(infos)
-    if str(model_type or "").strip().lower() in ["xgboost", "lightgbm"]:
-        use_scale_pos_weight = True
     calibrate_method_req = _normalize_calibrate_method(calibrate_method)
+    forced_features = _force_feature_list()
+    only_features = _only_feature_list()
+    if only_features:
+        forced_features = []
     try:
         val_ratio = float(val_ratio)
     except Exception:
@@ -2933,11 +3569,61 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
         )
 
         feature_meta = build_feature_meta(bsp_dict)
+        if only_features:
+            feature_meta = list(only_features or [])
         if profit_threshold is None:
             used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead)
         else:
             used_profit_threshold = float(profit_threshold)
         X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+
+        monotone_constraints = None
+        monotone_sign_map = None
+        winsor_bounds_all = None
+        if str(model_type or "").strip().lower() in ["xgboost", "lightgbm"] and X_all and y_all and feature_meta and len(set(y_all)) >= 2:
+            if only_features:
+                sign_map = {}
+                table = compute_feature_ic_table(X_all, y_all, feature_meta, min_n=50)
+                for r in (table or []):
+                    f = r.get("feature")
+                    if not f:
+                        continue
+                    try:
+                        ic = float(r.get("ic", 0.0) or 0.0)
+                    except Exception:
+                        ic = 0.0
+                    if ic > 0:
+                        sign_map[str(f)] = 1
+                    elif ic < 0:
+                        sign_map[str(f)] = -1
+                    else:
+                        sign_map[str(f)] = 0
+                monotone_constraints = _build_monotone_constraints(feature_meta, sign_map=sign_map)
+                monotone_sign_map = dict(sign_map)
+            else:
+                abs_th = _env_float("MLCHAN_IC_ABS_THRESHOLD", 0.02)
+                ic_top_n = _env_int("MLCHAN_IC_TOP_N", 8)
+                ic_min_n = _env_int("MLCHAN_IC_MIN_N", 50)
+                filtered_meta, sign_map = _ic_filter_feature_meta(X_all, y_all, feature_meta, abs_ic_threshold=abs_th, top_n=ic_top_n, min_n=ic_min_n)
+                if filtered_meta and len(filtered_meta) >= 2 and filtered_meta != list(feature_meta or []):
+                    feature_meta = list(filtered_meta)
+                    X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                drop_features = _env_csv_list("MLCHAN_DROP_FEATURES", "zs_last_is_sure")
+                feature_meta2, changed = _apply_drop_features(feature_meta, drop_features)
+                if changed:
+                    feature_meta = list(feature_meta2)
+                    X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                if forced_features:
+                    merged = _merge_forced_features(feature_meta, forced_features, max_n=max(2, int(len(feature_meta or [])) + int(len(forced_features or []))))
+                    if merged and merged != list(feature_meta or []):
+                        feature_meta = list(merged)
+                        X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                monotone_constraints = _build_monotone_constraints(feature_meta, sign_map=sign_map)
+                if isinstance(sign_map, dict):
+                    monotone_sign_map = dict(sign_map)
+
+        X_all, _, _, rank_cols_all = _maybe_rank_transform_splits(X_all, None, None, feature_meta=feature_meta)
+        X_all, _, _, winsor_bounds_all = _maybe_winsorize_splits(X_all, None, None)
 
         final_model = None
         if X_all and len(set(y_all)) >= 2:
@@ -2954,22 +3640,34 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
                     lgb_max_depth=lgb_max_depth,
                     lgb_reg_alpha=lgb_reg_alpha,
                     lgb_reg_lambda=lgb_reg_lambda,
+                    monotone_constraints=monotone_constraints,
                 )
             except Exception:
                 final_model = None
 
         selected_features = []
         feature_importance_full = []
-        if final_model and feature_meta:
+        if final_model and feature_meta and (not only_features):
             feature_importance_full = _get_feature_importance(final_model, feature_meta)
             topk = 5
+            if forced_features:
+                try:
+                    topk = max(int(topk), int(len(forced_features)) + 5)
+                except Exception:
+                    topk = 10
             if topk > 0 and len(feature_meta) > topk and feature_importance_full:
                 selected_features = [m.get("feature") for m in (feature_importance_full[:topk] or []) if isinstance(m, dict) and m.get("feature")]
+                if forced_features:
+                    selected_features = _merge_forced_features(selected_features, forced_features, max_n=int(topk))
                 if len(selected_features) >= 2:
                     feature_meta2 = list(selected_features)
                     X_all2, y_all2 = build_training_data_from_infos(infos, feature_meta2, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
                     if X_all2 and len(set(y_all2 or [])) >= 2:
                         try:
+                            monotone_constraints2 = None
+                            monotone_constraints2 = _build_monotone_constraints(feature_meta2, sign_map=monotone_sign_map)
+                            X_all2, _, _, rank_cols_all = _maybe_rank_transform_splits(X_all2, None, None, feature_meta=feature_meta2)
+                            X_all2, _, _, winsor_bounds_all = _maybe_winsorize_splits(X_all2, None, None)
                             model2 = train_model_from_xy(
                                 X_all2,
                                 y_all2,
@@ -2982,6 +3680,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
                                 lgb_max_depth=lgb_max_depth,
                                 lgb_reg_alpha=lgb_reg_alpha,
                                 lgb_reg_lambda=lgb_reg_lambda,
+                                monotone_constraints=monotone_constraints2,
                             )
                             if model2:
                                 final_model = model2
@@ -2996,29 +3695,68 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
         final_calibrated = False
         final_calibrate_method = None
         if calibrate_method_req is not None and final_model and not isinstance(final_model, SingleClassModel) and X_all and y_all and len(set(y_all)) >= 2:
-            n_splits = 3 if len(y_all) >= 120 else (2 if len(y_all) >= 60 else 0)
-            if n_splits >= 2:
-                chosen_method = calibrate_method_req
-                try:
-                    scale_pos_weight = 1.0
-                    if bool(use_scale_pos_weight) and model_type in ["xgboost", "lightgbm"] and y_all:
-                        neg_count, pos_count = _binary_class_counts(y_all)
-                        if pos_count > 0:
-                            scale_pos_weight = float(neg_count) / float(pos_count)
-                    est = build_estimator(model_type=model_type, n_jobs=n_jobs, scale_pos_weight=scale_pos_weight, use_scale_pos_weight=use_scale_pos_weight, xgb_max_depth=xgb_max_depth, xgb_reg_alpha=xgb_reg_alpha, xgb_reg_lambda=xgb_reg_lambda, lgb_max_depth=lgb_max_depth, lgb_reg_alpha=lgb_reg_alpha, lgb_reg_lambda=lgb_reg_lambda)
-                    tscv = TimeSeriesSplit(n_splits=n_splits)
+            if calibrate_method_req == "temperature":
+                X_tr, y_tr, X_va, y_va = _split_train_val_time_order(X_all, y_all, _min_val_fraction())
+                if X_tr and y_tr and X_va and y_va and len(set(y_tr)) >= 2 and len(set(y_va)) >= 2:
                     try:
-                        cal = CalibratedClassifierCV(estimator=est, method=chosen_method, cv=tscv)
-                    except TypeError:
-                        cal = CalibratedClassifierCV(base_estimator=est, method=chosen_method, cv=tscv)
-                    cal.fit(X_all, y_all)
-                    score_model = cal
-                    final_calibrated = True
-                    final_calibrate_method = f"{chosen_method}_cv_ts"
-                except Exception:
-                    score_model = final_model
-                    final_calibrated = False
-                    final_calibrate_method = None
+                        temp_model = train_model_from_xy(
+                            X_tr,
+                            y_tr,
+                            model_type=model_type,
+                            n_jobs=n_jobs,
+                            use_scale_pos_weight=use_scale_pos_weight,
+                            xgb_max_depth=xgb_max_depth,
+                            xgb_reg_alpha=xgb_reg_alpha,
+                            xgb_reg_lambda=xgb_reg_lambda,
+                            lgb_max_depth=lgb_max_depth,
+                            lgb_reg_alpha=lgb_reg_alpha,
+                            lgb_reg_lambda=lgb_reg_lambda,
+                            monotone_constraints=monotone_constraints,
+                        )
+                        probs_va = predict_proba_1(temp_model, X_va)
+                        t = _best_temperature_for_probs(y_va, probs_va)
+                        score_model = TemperatureScaledModel(final_model, t)
+                        final_calibrated = True
+                        final_calibrate_method = f"temperature_t{float(t):.4g}"
+                    except Exception:
+                        score_model = final_model
+                        final_calibrated = False
+                        final_calibrate_method = None
+                if (not final_calibrated) and final_model:
+                    try:
+                        probs_all = predict_proba_1(final_model, X_all)
+                        t = _best_temperature_for_probs(y_all, probs_all)
+                        score_model = TemperatureScaledModel(final_model, t)
+                        final_calibrated = True
+                        final_calibrate_method = f"temperature_t{float(t):.4g}_insample"
+                    except Exception:
+                        score_model = final_model
+                        final_calibrated = False
+                        final_calibrate_method = None
+            else:
+                n_splits = 3 if len(y_all) >= 120 else (2 if len(y_all) >= 60 else 0)
+                if n_splits >= 2:
+                    chosen_method = calibrate_method_req
+                    try:
+                        scale_pos_weight = 1.0
+                        if bool(use_scale_pos_weight) and model_type in ["xgboost", "lightgbm"] and y_all:
+                            neg_count, pos_count = _binary_class_counts(y_all)
+                            if pos_count > 0:
+                                scale_pos_weight = float(neg_count) / float(pos_count)
+                        est = build_estimator(model_type=model_type, n_jobs=n_jobs, scale_pos_weight=scale_pos_weight, use_scale_pos_weight=use_scale_pos_weight, xgb_max_depth=xgb_max_depth, xgb_reg_alpha=xgb_reg_alpha, xgb_reg_lambda=xgb_reg_lambda, lgb_max_depth=lgb_max_depth, lgb_reg_alpha=lgb_reg_alpha, lgb_reg_lambda=lgb_reg_lambda)
+                        tscv = TimeSeriesSplit(n_splits=n_splits)
+                        try:
+                            cal = CalibratedClassifierCV(estimator=est, method=chosen_method, cv=tscv)
+                        except TypeError:
+                            cal = CalibratedClassifierCV(base_estimator=est, method=chosen_method, cv=tscv)
+                        cal.fit(X_all, y_all)
+                        score_model = cal
+                        final_calibrated = True
+                        final_calibrate_method = f"{chosen_method}_cv_ts"
+                    except Exception:
+                        score_model = final_model
+                        final_calibrated = False
+                        final_calibrate_method = None
 
         if wf_info is None:
             info = {
@@ -3045,12 +3783,34 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             }
         else:
             info = dict(wf_info or {})
-            info["method"] = f"walk_forward_calibrated_{final_calibrate_method}" if final_calibrated and final_calibrate_method else ("walk_forward_calibrated" if final_calibrated else "walk_forward_uncalibrated")
+            fold_methods = []
+            try:
+                for f in (info.get("folds") or []):
+                    if not isinstance(f, dict):
+                        continue
+                    if bool(f.get("calibrated")) and f.get("calibrate_method"):
+                        fold_methods.append(str(f.get("calibrate_method")))
+            except Exception:
+                fold_methods = []
+            fold_method = fold_methods[0] if fold_methods else None
+            any_fold_calibrated = bool(fold_method)
+            if final_calibrated and final_calibrate_method:
+                info["method"] = f"walk_forward_calibrated_{final_calibrate_method}"
+            elif final_calibrated:
+                info["method"] = "walk_forward_calibrated"
+            elif any_fold_calibrated and fold_method:
+                info["method"] = f"walk_forward_calibrated_folds_{fold_method}"
+            elif any_fold_calibrated:
+                info["method"] = "walk_forward_calibrated_folds"
+            else:
+                info["method"] = "walk_forward_uncalibrated"
             info["final_model_calibrated"] = bool(final_calibrated)
             info["final_model_calibrate_method"] = final_calibrate_method
             info["profit_threshold"] = float(used_profit_threshold)
             info["profit_lookahead"] = int(profit_lookahead or 0)
             info["selected_features"] = list(selected_features or [])
+            info["rank_transformed"] = bool(rank_cols_all)
+            info["winsorized"] = bool(winsor_bounds_all)
             if feature_importance_full:
                 info["feature_importance_full"] = feature_importance_full
             
@@ -3091,6 +3851,8 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
     test_infos = infos[val_end:]
 
     feature_meta = build_feature_meta(bsp_dict)
+    if only_features:
+        feature_meta = list(only_features or [])
     if profit_threshold is None:
         used_profit_threshold = _auto_profit_threshold_from_infos(train_infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead)
     else:
@@ -3098,7 +3860,59 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
     X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
     X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
     X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
-    feature_ic_full = compute_feature_ic_report(X_train, y_train, feature_meta, include_table=True, top_n=20)
+    monotone_constraints = None
+    winsor_bounds = None
+    if model_type in ["xgboost", "lightgbm"]:
+        if only_features:
+            sign_map = {}
+            table = compute_feature_ic_table(X_train, y_train, feature_meta, min_n=50)
+            for r in (table or []):
+                f = r.get("feature")
+                if not f:
+                    continue
+                try:
+                    ic = float(r.get("ic", 0.0) or 0.0)
+                except Exception:
+                    ic = 0.0
+                if ic > 0:
+                    sign_map[str(f)] = 1
+                elif ic < 0:
+                    sign_map[str(f)] = -1
+                else:
+                    sign_map[str(f)] = 0
+            monotone_constraints = _build_monotone_constraints(feature_meta, sign_map=sign_map)
+        else:
+            abs_th = _env_float("MLCHAN_IC_ABS_THRESHOLD", 0.02)
+            ic_top_n = _env_int("MLCHAN_IC_TOP_N", 8)
+            ic_min_n = _env_int("MLCHAN_IC_MIN_N", 50)
+            filtered_meta, sign_map = _ic_filter_feature_meta(X_train, y_train, feature_meta, abs_ic_threshold=abs_th, top_n=ic_top_n, min_n=ic_min_n)
+            if filtered_meta and len(filtered_meta) >= 2 and filtered_meta != list(feature_meta or []):
+                feature_meta = list(filtered_meta)
+                X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+            drop_features = _env_csv_list("MLCHAN_DROP_FEATURES", "zs_last_is_sure")
+            feature_meta2, changed = _apply_drop_features(feature_meta, drop_features)
+            if changed:
+                feature_meta = list(feature_meta2)
+                X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+            if forced_features:
+                merged = _merge_forced_features(feature_meta, forced_features, max_n=max(2, int(len(feature_meta or [])) + int(len(forced_features or []))))
+                if merged and merged != list(feature_meta or []):
+                    feature_meta = list(merged)
+                    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+            monotone_constraints = _build_monotone_constraints(feature_meta, sign_map=sign_map)
+
+    X_train, X_val, X_test, rank_cols = _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=feature_meta)
+    X_train, X_val, X_test, winsor_bounds = _maybe_winsorize_splits(X_train, X_val, X_test)
+
+    feature_ic_train = compute_feature_ic_report(X_train, y_train, feature_meta, include_table=True, top_n=20)
+    feature_ic_val = compute_feature_ic_report(X_val, y_val, feature_meta, include_table=False, top_n=20)
+    feature_ic_test = compute_feature_ic_report(X_test, y_test, feature_meta, include_table=True, top_n=20)
 
     class_balance = {
         "train": _binary_balance_meta(y_train),
@@ -3129,42 +3943,71 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
     feature_importance_full = []
     feature_sel_meta = {"selected_features": [], "dropped_by_importance": 0, "dropped_by_corr": 0}
     model = None
-    try:
-        model, feature_meta2, feature_sel_meta = train_model_with_feature_selection(
-            X_train,
-            y_train,
-            feature_meta,
-            model_type=model_type,
-            n_jobs=n_jobs,
-            use_scale_pos_weight=use_scale_pos_weight,
-            xgb_max_depth=xgb_max_depth,
-            xgb_reg_alpha=xgb_reg_alpha,
-            xgb_reg_lambda=xgb_reg_lambda,
-            lgb_max_depth=lgb_max_depth,
-            lgb_reg_alpha=lgb_reg_alpha,
-            lgb_reg_lambda=lgb_reg_lambda,
-            X_val=X_val,
-            y_val=y_val,
-        )
-        if feature_meta2:
-            feature_meta = list(feature_meta2)
-            selected_features = list(feature_meta2)
-            X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
-            X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
-            X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
-            class_balance = {
-                "train": _binary_balance_meta(y_train),
-                "val": _binary_balance_meta(y_val),
-                "test": _binary_balance_meta(y_test),
-            }
-            if model_type in ["xgboost", "lightgbm"]:
-                scale_pos_weight = _scale_pos_weight_from_y(y_train)
-    except Exception:
-        model = None
-        feature_sel_meta = {"selected_features": [], "dropped_by_importance": 0, "dropped_by_corr": 0}
-    if model and feature_meta:
+    if model_type in ["xgboost", "lightgbm"]:
+        try:
+            model = train_model_from_xy(
+                X_train,
+                y_train,
+                model_type=model_type,
+                n_jobs=n_jobs,
+                use_scale_pos_weight=use_scale_pos_weight,
+                xgb_max_depth=xgb_max_depth,
+                xgb_reg_alpha=xgb_reg_alpha,
+                xgb_reg_lambda=xgb_reg_lambda,
+                lgb_max_depth=lgb_max_depth,
+                lgb_reg_alpha=lgb_reg_alpha,
+                lgb_reg_lambda=lgb_reg_lambda,
+                X_val=X_val,
+                y_val=y_val,
+                monotone_constraints=monotone_constraints,
+            )
+            feature_meta2 = list(feature_meta or [])
+            feature_sel_meta = {"selected_features": list(feature_meta2), "dropped_by_importance": 0, "dropped_by_corr": 0}
+            if feature_meta2:
+                selected_features = list(feature_meta2)
+        except Exception:
+            model = None
+            feature_sel_meta = {"selected_features": [], "dropped_by_importance": 0, "dropped_by_corr": 0}
+    else:
+        try:
+            model, feature_meta2, feature_sel_meta = train_model_with_feature_selection(
+                X_train,
+                y_train,
+                feature_meta,
+                model_type=model_type,
+                n_jobs=n_jobs,
+                use_scale_pos_weight=use_scale_pos_weight,
+                xgb_max_depth=xgb_max_depth,
+                xgb_reg_alpha=xgb_reg_alpha,
+                xgb_reg_lambda=xgb_reg_lambda,
+                lgb_max_depth=lgb_max_depth,
+                lgb_reg_alpha=lgb_reg_alpha,
+                lgb_reg_lambda=lgb_reg_lambda,
+                X_val=X_val,
+                y_val=y_val,
+            )
+            if feature_meta2:
+                feature_meta = list(feature_meta2)
+                selected_features = list(feature_meta2)
+                X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                X_train, X_val, X_test, rank_cols = _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=feature_meta)
+                X_train, X_val, X_test, winsor_bounds = _maybe_winsorize_splits(X_train, X_val, X_test)
+                class_balance = {
+                    "train": _binary_balance_meta(y_train),
+                    "val": _binary_balance_meta(y_val),
+                    "test": _binary_balance_meta(y_test),
+                }
+                if model_type in ["xgboost", "lightgbm"]:
+                    scale_pos_weight = _scale_pos_weight_from_y(y_train)
+        except Exception:
+            model = None
+            feature_sel_meta = {"selected_features": [], "dropped_by_importance": 0, "dropped_by_corr": 0}
+    if model and feature_meta and (not only_features):
         feature_importance_full = _get_feature_importance(model, feature_meta)
-    feature_ic_selected = compute_feature_ic_report(X_train, y_train, feature_meta, include_table=False, top_n=20)
+    feature_ic_selected_train = compute_feature_ic_report(X_train, y_train, feature_meta, include_table=False, top_n=20)
+    feature_ic_selected_test = compute_feature_ic_report(X_test, y_test, feature_meta, include_table=False, top_n=20)
 
     calibrated = False
     score_model = model
@@ -3179,14 +4022,21 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
         if calibrate_method_req is not None and X_val and y_val and len(set(y_val)) >= 2:
             try:
                 chosen_method = calibrate_method_req
-                try:
-                    cal = CalibratedClassifierCV(estimator=model, method=chosen_method, cv="prefit")
-                except TypeError:
-                    cal = CalibratedClassifierCV(base_estimator=model, method=chosen_method, cv="prefit")
-                cal.fit(X_val, y_val)
-                score_model = cal
-                calibrated = True
-                used_calibrate_method = chosen_method
+                if chosen_method == "temperature":
+                    probs_val = predict_proba_1(model, X_val)
+                    t = _best_temperature_for_probs(y_val, probs_val)
+                    score_model = TemperatureScaledModel(model, t)
+                    calibrated = True
+                    used_calibrate_method = f"temperature_t{float(t):.4g}"
+                else:
+                    try:
+                        cal = CalibratedClassifierCV(estimator=model, method=chosen_method, cv="prefit")
+                    except TypeError:
+                        cal = CalibratedClassifierCV(base_estimator=model, method=chosen_method, cv="prefit")
+                    cal.fit(X_val, y_val)
+                    score_model = cal
+                    calibrated = True
+                    used_calibrate_method = chosen_method
             except Exception:
                 score_model = model
                 calibrated = False
@@ -3302,9 +4152,13 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
         "total_count": total_count,
         "accuracy": acc,
         "method": f"time_split_calibrated_{used_calibrate_method}" if calibrated and used_calibrate_method else ("time_split_calibrated" if calibrated else "time_split_uncalibrated"),
+        "calibrate_method_requested": str(calibrate_method),
+        "calibrate_method_effective": (str(used_calibrate_method) if used_calibrate_method is not None else None),
         "train_count": len(X_train),
         "val_count": len(X_val),
         "test_count": len(X_test),
+        "rank_transformed": bool(rank_cols),
+        "winsorized": bool(winsor_bounds),
         "brier_score": brier_val,
         "warning": warning_msg,
         "logloss": logloss_val,
@@ -3322,8 +4176,11 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
         "bad_cases": bad_cases,
         "feature_importance": feat_imp,
         "feature_importance_full": feature_importance_full,
-        "feature_ic": feature_ic_full,
-        "feature_ic_selected": feature_ic_selected,
+        "feature_ic": feature_ic_test,
+        "feature_ic_train": feature_ic_train,
+        "feature_ic_val": feature_ic_val,
+        "feature_ic_selected": feature_ic_selected_test,
+        "feature_ic_selected_train": feature_ic_selected_train,
         "selected_features": selected_features,
         "class_balance": class_balance,
         "scale_pos_weight": (scale_pos_weight if bool(use_scale_pos_weight) else 1.0),
