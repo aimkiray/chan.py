@@ -795,6 +795,38 @@ class StorageManager:
         finally:
             session.close()
 
+    def batch_delete_results(self, result_ids):
+        session = self.Session()
+        try:
+            ids = []
+            for x in (result_ids or []):
+                try:
+                    ids.append(int(x))
+                except Exception:
+                    continue
+            ids = list(dict.fromkeys(ids))
+            if not ids:
+                return {"deleted": [], "failed": []}
+
+            deleted = []
+            failed = []
+            for rid in ids:
+                r = session.query(AnalysisResult).filter(AnalysisResult.id == rid).first()
+                if not r:
+                    failed.append({"result_id": rid, "reason": "not_found"})
+                    continue
+                session.delete(r)
+                deleted.append(rid)
+
+            session.commit()
+            return {"deleted": deleted, "failed": failed}
+        except Exception as e:
+            print(f"Failed to batch delete results: {e}")
+            session.rollback()
+            return {"deleted": [], "failed": [{"result_id": None, "reason": str(e)}]}
+        finally:
+            session.close()
+
     def get_result_by_id(self, result_id):
         session = self.Session()
         try:

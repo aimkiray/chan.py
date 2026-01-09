@@ -24,6 +24,7 @@ from backend.chan_service import (
     get_chan_data,
     predict_bsp,
     stragety_feature,
+    extract_state_features_from_cur_lv,
     get_stock_name,
     download_stock_history,
     fetch_stock_data,
@@ -300,6 +301,8 @@ class AnalyzeRequest(BaseModel):
     force_refresh: bool = False
     data_length_mode: str = "default" # "default" or "max"
     data_length_years: Optional[float] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
     use_pretrained: Optional[bool] = None
     pretrained_model_key: Optional[str] = None
     blend_models: Optional[bool] = None
@@ -307,6 +310,14 @@ class AnalyzeRequest(BaseModel):
     profit_threshold: Optional[float] = 0.01
     auto_profit_quantile: float = 0.7
     profit_lookahead: int = 5
+    backtest_mode: str = "auto"
+    walk_forward_max_folds: int = 20
+    walk_forward_test_window: Optional[int] = None
+    walk_forward_val_window: Optional[int] = None
+    walk_forward_step: Optional[int] = None
+    trade_cost: float = 0.0
+    topk_frac: float = 0.2
+    quantile_bin_count: int = 5
 
 class PretrainRequest(BaseModel):
     codes: list[str]
@@ -434,7 +445,7 @@ async def create_pretrain_job(req: PretrainRequest):
                 model_type=req.model,
                 frequency=req.frequency,
                 data_src=req.data_src,
-                calibrate_method="isotonic",
+                calibrate_method="none",
                 progress_cb=progress_cb,
                 pool_name=req.pool_name,
                 profit_threshold=req.profit_threshold,
@@ -768,6 +779,24 @@ async def delete_pretrained_model(key: str):
 async def get_history(code: Optional[str] = None, page: int = 1, page_size: int = 10):
     return storage.get_history(code, page, page_size)
 
+class BatchDeleteHistoryRequest(BaseModel):
+    result_ids: List[int] = []
+
+@app.post("/api/history/batch_delete")
+async def batch_delete_history(req: BatchDeleteHistoryRequest):
+    ids = []
+    for x in ((req.result_ids or []) if req is not None else []):
+        try:
+            ids.append(int(x))
+        except Exception:
+            continue
+    ids = list(dict.fromkeys(ids))
+    if not ids:
+        return {"status": "success", "deleted": [], "failed": []}
+
+    res = storage.batch_delete_results(ids)
+    return {"status": "success", "deleted": res.get("deleted") or [], "failed": res.get("failed") or []}
+
 @app.delete("/api/history/{result_id}")
 async def delete_history_item(result_id: int):
     success = storage.delete_result(result_id)
@@ -820,35 +849,45 @@ async def analyze_stock(req: AnalyzeRequest):
 
         # 1. Calculate Time Range First
         import datetime
-        days = 365 # Default safe fallback
         
-        if req.data_length_years is not None:
-            days = int(365 * req.data_length_years)
-        elif req.data_length_mode == "max":
-             # Max Ranges: 1m: 1 year, 5m: 2 years, 15m: 5 years, 30m+: 10 years
-            if level == KL_TYPE.K_1M:
-                days = 365 # 1 year
-            elif level == KL_TYPE.K_5M:
-                days = 365 * 2 # 2 years
-            elif level == KL_TYPE.K_15M:
-                days = 365 * 5 # 5 years
-            elif level in [KL_TYPE.K_30M, KL_TYPE.K_60M, KL_TYPE.K_DAY, KL_TYPE.K_WEEK, KL_TYPE.K_MON]:
-                 days = 365 * 10 # 10 years
-        else:
-            # Default Ranges: 1m: 0.5yr, 5m: 1.5yr, 15m: 2.5yr, 30m+: 5yr
-            if level == KL_TYPE.K_1M:
-                days = 180 # 0.5 year
-            elif level == KL_TYPE.K_5M:
-                days = 540 # 1.5 years
-            elif level == KL_TYPE.K_15M:
-                days = 900 # 2.5 years
-            elif level in [KL_TYPE.K_30M, KL_TYPE.K_60M, KL_TYPE.K_DAY, KL_TYPE.K_WEEK, KL_TYPE.K_MON]:
-                days = 1800 # 5 years
+        begin_time = None
+        end_time = None
+        
+        if req.start_date:
+            begin_time = req.start_date
+        if req.end_date:
+            end_time = req.end_date
 
-        # Ensure minimal days
-        days = max(days, 30)
-        
-        begin_time = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+        if not begin_time:
+            days = 365 # Default safe fallback
+            
+            if req.data_length_years is not None:
+                days = int(365 * req.data_length_years)
+            elif req.data_length_mode == "max":
+                 # Max Ranges: 1m: 1 year, 5m: 2 years, 15m: 5 years, 30m+: 10 years
+                if level == KL_TYPE.K_1M:
+                    days = 365 # 1 year
+                elif level == KL_TYPE.K_5M:
+                    days = 365 * 2 # 2 years
+                elif level == KL_TYPE.K_15M:
+                    days = 365 * 5 # 5 years
+                elif level in [KL_TYPE.K_30M, KL_TYPE.K_60M, KL_TYPE.K_DAY, KL_TYPE.K_WEEK, KL_TYPE.K_MON]:
+                     days = 365 * 10 # 10 years
+            else:
+                # Default Ranges: 1m: 0.5yr, 5m: 1.5yr, 15m: 2.5yr, 30m+: 5yr
+                if level == KL_TYPE.K_1M:
+                    days = 180 # 0.5 year
+                elif level == KL_TYPE.K_5M:
+                    days = 540 # 1.5 years
+                elif level == KL_TYPE.K_15M:
+                    days = 900 # 2.5 years
+                elif level in [KL_TYPE.K_30M, KL_TYPE.K_60M, KL_TYPE.K_DAY, KL_TYPE.K_WEEK, KL_TYPE.K_MON]:
+                    days = 1800 # 5 years
+
+            # Ensure minimal days
+            days = max(days, 30)
+            
+            begin_time = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
 
         # 2. Check Cache with latest data time
         # This avoids fetching full data if cache is valid
@@ -870,10 +909,20 @@ async def analyze_stock(req: AnalyzeRequest):
             "do_predict": req.do_predict,
             "data_length_mode": req.data_length_mode,
             "data_length_years": req.data_length_years,
+            "start_date": req.start_date,
+            "end_date": req.end_date,
             "profit_threshold": req.profit_threshold,
             "auto_profit_quantile": req.auto_profit_quantile,
             "profit_lookahead": req.profit_lookahead,
             "autype": autype.name,
+            "backtest_mode": req.backtest_mode,
+            "walk_forward_max_folds": req.walk_forward_max_folds,
+            "walk_forward_test_window": req.walk_forward_test_window,
+            "walk_forward_val_window": req.walk_forward_val_window,
+            "walk_forward_step": req.walk_forward_step,
+            "trade_cost": req.trade_cost,
+            "topk_frac": req.topk_frac,
+            "quantile_bin_count": req.quantile_bin_count,
         }
         use_online_latest = bool(data_src == DATA_SRC.CLICK_HOUSE)
         params["use_online_latest"] = use_online_latest
@@ -917,7 +966,7 @@ async def analyze_stock(req: AnalyzeRequest):
                 req.code,
                 level,
                 begin_time,
-                None,
+                end_time,
                 data_src,
                 autype=autype,
                 use_online_latest=use_online_latest,
@@ -941,6 +990,7 @@ async def analyze_stock(req: AnalyzeRequest):
             preloaded_data=kl_list, 
             do_predict=req.do_predict,
             begin_time=begin_time,
+            end_time=end_time,
             enable_rolling_lookback=req.enable_rolling_lookback,
             autype=autype,
         )
@@ -992,10 +1042,18 @@ async def analyze_stock(req: AnalyzeRequest):
                 online_bst, online_feature_meta, online_accuracy = train_time_split_backtest(
                     bsp_dict,
                     model_type=req.model,
-                    calibrate_method="isotonic",
+                    calibrate_method="none",
                     profit_threshold=req.profit_threshold,
                     auto_profit_quantile=req.auto_profit_quantile,
                     profit_lookahead=req.profit_lookahead,
+                    backtest_mode=req.backtest_mode,
+                    walk_forward_max_folds=req.walk_forward_max_folds,
+                    walk_forward_test_window=req.walk_forward_test_window,
+                    walk_forward_val_window=req.walk_forward_val_window,
+                    walk_forward_step=req.walk_forward_step,
+                    trade_cost=req.trade_cost,
+                    topk_frac=req.topk_frac,
+                    quantile_bin_count=req.quantile_bin_count,
                 )
                 if online_accuracy is not None:
                     online_accuracy["pretrained"] = False
@@ -1022,6 +1080,9 @@ async def analyze_stock(req: AnalyzeRequest):
                         profit_threshold=pt,
                         auto_profit_quantile=req.auto_profit_quantile,
                         profit_lookahead=req.profit_lookahead,
+                        trade_cost=req.trade_cost,
+                        topk_frac=req.topk_frac,
+                        quantile_bin_count=req.quantile_bin_count,
                     )
                     pretrained_accuracy["pretrained"] = True
                     pretrained_accuracy["mode"] = "pretrained"
@@ -1064,10 +1125,18 @@ async def analyze_stock(req: AnalyzeRequest):
                 bst, feature_meta, accuracy_info = train_time_split_backtest(
                     bsp_dict,
                     model_type=req.model,
-                    calibrate_method="isotonic",
+                    calibrate_method="none",
                     profit_threshold=req.profit_threshold,
                     auto_profit_quantile=req.auto_profit_quantile,
                     profit_lookahead=req.profit_lookahead,
+                    backtest_mode=req.backtest_mode,
+                    walk_forward_max_folds=req.walk_forward_max_folds,
+                    walk_forward_test_window=req.walk_forward_test_window,
+                    walk_forward_val_window=req.walk_forward_val_window,
+                    walk_forward_step=req.walk_forward_step,
+                    trade_cost=req.trade_cost,
+                    topk_frac=req.topk_frac,
+                    quantile_bin_count=req.quantile_bin_count,
                 )
                 if accuracy_info is not None:
                     accuracy_info["pretrained"] = False
@@ -1077,6 +1146,13 @@ async def analyze_stock(req: AnalyzeRequest):
                 bsp_list = last_snapshot.get_latest_bsp()
                 if bsp_list:
                     latest_bsp = bsp_list[0]
+                    try:
+                        cur_lv_chan = last_snapshot[0]
+                        state_feat = extract_state_features_from_cur_lv(cur_lv_chan, last_klu)
+                        if state_feat:
+                            latest_bsp.features.add_feat(state_feat)
+                    except Exception:
+                        pass
                     latest_bsp.features.add_feat(stragety_feature(last_klu))
                     score = predict_bsp(bst, latest_bsp, feature_meta)
                     if req.blend_models and accuracy_info and accuracy_info.get("mode") == "ensemble":
@@ -1227,7 +1303,7 @@ async def pretrain_model(req: PretrainRequest):
             model_type=req.model,
             frequency=req.frequency,
             data_src=req.data_src,
-            calibrate_method="isotonic",
+            calibrate_method="none",
             profit_threshold=req.profit_threshold,
             auto_profit_quantile=req.auto_profit_quantile,
             profit_lookahead=req.profit_lookahead,

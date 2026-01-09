@@ -134,6 +134,33 @@
         <span v-if="accuracy.test_count !== undefined">test={{ accuracy.test_count }}</span>
       </div>
 
+      <div v-if="accuracy.scale_pos_weight !== undefined" class="mt-2 text-center">
+        {{ t('analysis.scalePosWeight') }}:
+        <span class="font-medium ml-1">{{ Number(accuracy.scale_pos_weight).toFixed(4) }}</span>
+      </div>
+
+      <div v-if="accuracy.class_balance && accuracy.class_balance.train" class="mt-2 text-center">
+        {{ t('analysis.classBalanceTrain') }}:
+        <span class="font-medium ml-1">
+          pos={{ accuracy.class_balance.train.pos }}, neg={{ accuracy.class_balance.train.neg }}
+          ({{ (Number(accuracy.class_balance.train.pos_rate || 0) * 100).toFixed(1) }}%)
+        </span>
+      </div>
+      <div v-if="accuracy.class_balance && accuracy.class_balance.val" class="mt-1 text-center">
+        {{ t('analysis.classBalanceVal') }}:
+        <span class="font-medium ml-1">
+          pos={{ accuracy.class_balance.val.pos }}, neg={{ accuracy.class_balance.val.neg }}
+          ({{ (Number(accuracy.class_balance.val.pos_rate || 0) * 100).toFixed(1) }}%)
+        </span>
+      </div>
+      <div v-if="accuracy.class_balance && accuracy.class_balance.test" class="mt-1 text-center">
+        {{ t('analysis.classBalanceTest') }}:
+        <span class="font-medium ml-1">
+          pos={{ accuracy.class_balance.test.pos }}, neg={{ accuracy.class_balance.test.neg }}
+          ({{ (Number(accuracy.class_balance.test.pos_rate || 0) * 100).toFixed(1) }}%)
+        </span>
+      </div>
+
       <div v-if="showCalibrationBins && accuracy.calibration_bins && accuracy.calibration_bins.length" class="mt-3">
         <div class="text-center mb-2">{{ t('analysis.calibrationBins') }}</div>
         <div class="overflow-x-auto">
@@ -152,6 +179,68 @@
                 <td class="p-1 text-left tabular-nums">{{ b.count }}</td>
                 <td class="p-1 text-left tabular-nums">{{ (Number(b.avg_pred) * 100).toFixed(1) }}%</td>
                 <td class="p-1 text-left tabular-nums">{{ (Number(b.win_rate) * 100).toFixed(1) }}%</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div v-if="icTopAbs.length" class="mt-4">
+        <div class="text-center mb-2">{{ t('analysis.featureIC') }}</div>
+        <div class="text-center text-[11px] text-gray-500 mb-2">
+          {{ t('analysis.icMaxAbs') }}:
+          <span class="font-medium ml-1">{{ Number(featureIc?.max_abs_ic || 0).toFixed(4) }}</span>
+          <span class="mx-2">·</span>
+          {{ t('analysis.icKept') }}:
+          <span class="font-medium ml-1">{{ Number(featureIc?.kept_count || 0) }}</span>/<span>{{ Number(featureIc?.feature_count || 0) }}</span>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-[11px] border border-gray-100 dark:border-gray-800">
+            <thead class="bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-300">
+              <tr>
+                <th class="p-1 text-left">{{ t('analysis.feature') }}</th>
+                <th class="p-1 text-left">IC</th>
+                <th class="p-1 text-left">n</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(r, i) in icTopAbs" :key="i" class="border-t border-gray-100 dark:border-gray-800">
+                <td class="p-1 text-left font-mono break-all">{{ r.feature }}</td>
+                <td class="p-1 text-left tabular-nums">{{ Number(r.ic || 0).toFixed(4) }}</td>
+                <td class="p-1 text-left tabular-nums">{{ Number(r.n || 0) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div v-if="baselineRows.length" class="mt-4">
+        <div class="text-center mb-2">{{ t('analysis.baselines') }}</div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-[11px] border border-gray-100 dark:border-gray-800">
+            <thead class="bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-300">
+              <tr>
+                <th class="p-1 text-left">{{ t('analysis.model') }}</th>
+                <th class="p-1 text-left">{{ t('analysis.accuracy') }}</th>
+                <th class="p-1 text-left">{{ t('analysis.brier') }}</th>
+                <th class="p-1 text-left">{{ t('analysis.logloss') }}</th>
+                <th class="p-1 text-left">{{ t('analysis.rocAuc') }}</th>
+                <th class="p-1 text-left">{{ t('analysis.prAuc') }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="r in baselineRows" :key="r.key" class="border-t border-gray-100 dark:border-gray-800">
+                <td class="p-1 text-left">
+                  <div class="font-medium text-gray-700 dark:text-gray-300">{{ r.label }}</div>
+                  <div v-if="r.train_pos_rate !== undefined" class="text-[10px] text-gray-400">
+                    {{ t('analysis.trainPosRate') }}: {{ (Number(r.train_pos_rate || 0) * 100).toFixed(1) }}%
+                  </div>
+                </td>
+                <td class="p-1 text-left tabular-nums">{{ (Number(r.accuracy || 0) * 100).toFixed(1) }}%</td>
+                <td class="p-1 text-left tabular-nums">{{ Number(r.brier_score || 0).toFixed(4) }}</td>
+                <td class="p-1 text-left tabular-nums">{{ Number(r.logloss || 0).toFixed(4) }}</td>
+                <td class="p-1 text-left tabular-nums">{{ Number(r.roc_auc || 0).toFixed(4) }}</td>
+                <td class="p-1 text-left tabular-nums">{{ Number(r.pr_auc || 0).toFixed(4) }}</td>
               </tr>
             </tbody>
           </table>
@@ -180,6 +269,29 @@ const props = defineProps({
     default: true
   },
   loading: Boolean
+})
+
+const featureIc = computed(() => props?.accuracy?.feature_ic || null)
+const icTopAbs = computed(() => {
+  const rows = featureIc.value?.top_abs || []
+  return Array.isArray(rows) ? rows.slice(0, 5) : []
+})
+
+const baselineRows = computed(() => {
+  const baseline = props?.accuracy?.baseline || null
+  if (!baseline || typeof baseline !== 'object') return []
+
+  const rows = []
+  if (baseline.logistic_regression) {
+    rows.push({ key: 'logistic_regression', label: t('analysis.logisticRegression'), ...baseline.logistic_regression })
+  }
+  if (baseline.prior_from_train) {
+    rows.push({ key: 'prior_from_train', label: t('analysis.priorFromTrain'), ...baseline.prior_from_train })
+  }
+  if (baseline.always_negative) {
+    rows.push({ key: 'always_negative', label: t('analysis.alwaysNegative'), ...baseline.always_negative })
+  }
+  return rows
 })
 
 const latestCloseText = computed(() => {

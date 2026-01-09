@@ -305,6 +305,114 @@
 
                   <div class="text-gray-500">{{ t('analysis.ece') }}</div>
                   <div class="text-gray-800 dark:text-gray-200">{{ Number(detailResult.accuracy.ece || 0).toFixed(4) }}</div>
+
+                  <div v-if="detailResult.accuracy.scale_pos_weight !== undefined" class="text-gray-500">{{ t('analysis.scalePosWeight') }}</div>
+                  <div v-if="detailResult.accuracy.scale_pos_weight !== undefined" class="text-gray-800 dark:text-gray-200">{{ Number(detailResult.accuracy.scale_pos_weight || 0).toFixed(4) }}</div>
+
+                  <template v-if="detailResult.accuracy.class_balance && detailResult.accuracy.class_balance.train">
+                    <div class="text-gray-500">{{ t('analysis.classBalanceTrain') }}</div>
+                    <div class="text-gray-800 dark:text-gray-200">
+                      pos={{ detailResult.accuracy.class_balance.train.pos }}, neg={{ detailResult.accuracy.class_balance.train.neg }}
+                      ({{ (Number(detailResult.accuracy.class_balance.train.pos_rate || 0) * 100).toFixed(1) }}%)
+                    </div>
+                  </template>
+                  <template v-if="detailResult.accuracy.class_balance && detailResult.accuracy.class_balance.val">
+                    <div class="text-gray-500">{{ t('analysis.classBalanceVal') }}</div>
+                    <div class="text-gray-800 dark:text-gray-200">
+                      pos={{ detailResult.accuracy.class_balance.val.pos }}, neg={{ detailResult.accuracy.class_balance.val.neg }}
+                      ({{ (Number(detailResult.accuracy.class_balance.val.pos_rate || 0) * 100).toFixed(1) }}%)
+                    </div>
+                  </template>
+                  <template v-if="detailResult.accuracy.class_balance && detailResult.accuracy.class_balance.test">
+                    <div class="text-gray-500">{{ t('analysis.classBalanceTest') }}</div>
+                    <div class="text-gray-800 dark:text-gray-200">
+                      pos={{ detailResult.accuracy.class_balance.test.pos }}, neg={{ detailResult.accuracy.class_balance.test.neg }}
+                      ({{ (Number(detailResult.accuracy.class_balance.test.pos_rate || 0) * 100).toFixed(1) }}%)
+                    </div>
+                  </template>
+
+                  <div
+                    v-if="detailResult.accuracy.feature_ic && detailResult.accuracy.feature_ic.top_abs && detailResult.accuracy.feature_ic.top_abs.length"
+                    class="col-span-2 mt-2 border-t border-gray-100 dark:border-gray-800 pt-2"
+                  >
+                    <div class="text-gray-700 dark:text-gray-300 font-medium mb-2">{{ t('analysis.featureIC') }}</div>
+                    <div class="text-xs text-gray-500 mb-2">
+                      {{ t('analysis.icMaxAbs') }}: <span class="font-medium ml-1">{{ Number(detailResult.accuracy.feature_ic.max_abs_ic || 0).toFixed(4) }}</span>
+                      <span class="mx-2">·</span>
+                      {{ t('analysis.icKept') }}: <span class="font-medium ml-1">{{ Number(detailResult.accuracy.feature_ic.kept_count || 0) }}</span>/<span>{{ Number(detailResult.accuracy.feature_ic.feature_count || 0) }}</span>
+                    </div>
+                    <div class="overflow-x-auto">
+                      <table class="w-full text-[11px] border border-gray-100 dark:border-gray-800">
+                        <thead class="bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-300">
+                          <tr>
+                            <th class="p-1 text-left">{{ t('analysis.feature') }}</th>
+                            <th class="p-1 text-left">IC</th>
+                            <th class="p-1 text-left">n</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr
+                            v-for="(r, i) in detailResult.accuracy.feature_ic.top_abs.slice(0, 5)"
+                            :key="i"
+                            class="border-t border-gray-100 dark:border-gray-800"
+                          >
+                            <td class="p-1 text-left font-mono break-all">{{ r.feature }}</td>
+                            <td class="p-1 text-left tabular-nums">{{ Number(r.ic || 0).toFixed(4) }}</td>
+                            <td class="p-1 text-left tabular-nums">{{ Number(r.n || 0) }}</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div v-if="detailResult.accuracy.baseline" class="col-span-2 mt-2 border-t border-gray-100 dark:border-gray-800 pt-2">
+                    <div class="text-gray-700 dark:text-gray-300 font-medium mb-2">{{ t('analysis.baselines') }}</div>
+                    <div class="overflow-x-auto">
+                      <table class="w-full text-[11px] border border-gray-100 dark:border-gray-800">
+                        <thead class="bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-300">
+                          <tr>
+                            <th class="p-1 text-left">{{ t('analysis.model') }}</th>
+                            <th class="p-1 text-left">{{ t('analysis.accuracy') }}</th>
+                            <th class="p-1 text-left">{{ t('analysis.brier') }}</th>
+                            <th class="p-1 text-left">{{ t('analysis.logloss') }}</th>
+                            <th class="p-1 text-left">{{ t('analysis.rocAuc') }}</th>
+                            <th class="p-1 text-left">{{ t('analysis.prAuc') }}</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr v-if="detailResult.accuracy.baseline.logistic_regression" class="border-t border-gray-100 dark:border-gray-800">
+                            <td class="p-1 text-left font-medium text-gray-700 dark:text-gray-300">{{ t('analysis.logisticRegression') }}</td>
+                            <td class="p-1 text-left tabular-nums">{{ (Number(detailResult.accuracy.baseline.logistic_regression.accuracy || 0) * 100).toFixed(1) }}%</td>
+                            <td class="p-1 text-left tabular-nums">{{ Number(detailResult.accuracy.baseline.logistic_regression.brier_score || 0).toFixed(4) }}</td>
+                            <td class="p-1 text-left tabular-nums">{{ Number(detailResult.accuracy.baseline.logistic_regression.logloss || 0).toFixed(4) }}</td>
+                            <td class="p-1 text-left tabular-nums">{{ Number(detailResult.accuracy.baseline.logistic_regression.roc_auc || 0).toFixed(4) }}</td>
+                            <td class="p-1 text-left tabular-nums">{{ Number(detailResult.accuracy.baseline.logistic_regression.pr_auc || 0).toFixed(4) }}</td>
+                          </tr>
+                          <tr v-if="detailResult.accuracy.baseline.prior_from_train" class="border-t border-gray-100 dark:border-gray-800">
+                            <td class="p-1 text-left">
+                              <div class="font-medium text-gray-700 dark:text-gray-300">{{ t('analysis.priorFromTrain') }}</div>
+                              <div v-if="detailResult.accuracy.baseline.prior_from_train.train_pos_rate !== undefined" class="text-[10px] text-gray-400">
+                                {{ t('analysis.trainPosRate') }}: {{ (Number(detailResult.accuracy.baseline.prior_from_train.train_pos_rate || 0) * 100).toFixed(1) }}%
+                              </div>
+                            </td>
+                            <td class="p-1 text-left tabular-nums">{{ (Number(detailResult.accuracy.baseline.prior_from_train.accuracy || 0) * 100).toFixed(1) }}%</td>
+                            <td class="p-1 text-left tabular-nums">{{ Number(detailResult.accuracy.baseline.prior_from_train.brier_score || 0).toFixed(4) }}</td>
+                            <td class="p-1 text-left tabular-nums">{{ Number(detailResult.accuracy.baseline.prior_from_train.logloss || 0).toFixed(4) }}</td>
+                            <td class="p-1 text-left tabular-nums">{{ Number(detailResult.accuracy.baseline.prior_from_train.roc_auc || 0).toFixed(4) }}</td>
+                            <td class="p-1 text-left tabular-nums">{{ Number(detailResult.accuracy.baseline.prior_from_train.pr_auc || 0).toFixed(4) }}</td>
+                          </tr>
+                          <tr v-if="detailResult.accuracy.baseline.always_negative" class="border-t border-gray-100 dark:border-gray-800">
+                            <td class="p-1 text-left font-medium text-gray-700 dark:text-gray-300">{{ t('analysis.alwaysNegative') }}</td>
+                            <td class="p-1 text-left tabular-nums">{{ (Number(detailResult.accuracy.baseline.always_negative.accuracy || 0) * 100).toFixed(1) }}%</td>
+                            <td class="p-1 text-left tabular-nums">{{ Number(detailResult.accuracy.baseline.always_negative.brier_score || 0).toFixed(4) }}</td>
+                            <td class="p-1 text-left tabular-nums">{{ Number(detailResult.accuracy.baseline.always_negative.logloss || 0).toFixed(4) }}</td>
+                            <td class="p-1 text-left tabular-nums">{{ Number(detailResult.accuracy.baseline.always_negative.roc_auc || 0).toFixed(4) }}</td>
+                            <td class="p-1 text-left tabular-nums">{{ Number(detailResult.accuracy.baseline.always_negative.pr_auc || 0).toFixed(4) }}</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
                 </div>
               </div>
 

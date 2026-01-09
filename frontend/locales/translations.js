@@ -112,7 +112,24 @@ export const translations = {
       accuracy: "回测准确率 (时间切分)",
       brier: "Brier 分数",
       ece: "校准误差 (ECE)",
+      logloss: "LogLoss",
+      rocAuc: "ROC-AUC",
+      prAuc: "PR-AUC",
+      scalePosWeight: "scale_pos_weight",
+      classBalanceTrain: "训练集样本分布",
+      classBalanceVal: "验证集样本分布",
+      classBalanceTest: "测试集样本分布",
       calibrationBins: "分桶胜率 / 预测均值 (测试集)",
+      feature: "特征",
+      featureIC: "特征IC (Spearman)",
+      icMaxAbs: "最大|IC|",
+      icKept: "建议保留",
+      baselines: "基线对照",
+      model: "模型",
+      logisticRegression: "逻辑回归 (Baseline)",
+      priorFromTrain: "按训练集先验概率",
+      alwaysNegative: "永远预测0",
+      trainPosRate: "训练集正例比例",
       buy: "买入",
       sell: "卖出",
       signalType: {
@@ -235,7 +252,9 @@ export const translations = {
       viewChart: "查看图表",
       download: "下载历史数据",
       search: "搜索",
-      searchPlaceholder: "输入股票代码筛选"
+      searchPlaceholder: "输入股票代码筛选",
+      batchDelete: "批量删除",
+      batchDeleteConfirm: "确认批量删除所选记录？"
     },
     pretrain: {
       title: "离线预训练",
@@ -588,7 +607,24 @@ export const translations = {
       accuracy: "Backtest Accuracy (Time Split)",
       brier: "Brier Score",
       ece: "Calibration Error (ECE)",
+      logloss: "LogLoss",
+      rocAuc: "ROC-AUC",
+      prAuc: "PR-AUC",
       calibrationBins: "Binned Win Rate / Avg Pred (Test)",
+      scalePosWeight: "scale_pos_weight",
+      classBalanceTrain: "Class Balance (Train)",
+      classBalanceVal: "Class Balance (Val)",
+      classBalanceTest: "Class Balance (Test)",
+      feature: "Feature",
+      featureIC: "Feature IC (Spearman)",
+      icMaxAbs: "Max |IC|",
+      icKept: "Suggested Kept",
+      baselines: "Baselines",
+      model: "Model",
+      logisticRegression: "Logistic Regression (Baseline)",
+      priorFromTrain: "Prior From Train",
+      alwaysNegative: "Always Negative",
+      trainPosRate: "Train Positive Rate",
       buy: "BUY",
       sell: "SELL",
       signalType: {
@@ -608,7 +644,14 @@ export const translations = {
         sell3b: "Sell 3B (3S-B)"
       },
       minutes: "min",
-      hours: "hrs"
+      hours: "hrs",
+      modelSource: "Model Source",
+      pretrainedModel: "Pretrained Model",
+      trainedAt: "Trained At",
+      ensembleScores: "Ensemble Weights",
+      online: "Online",
+      pretrained: "Pretrained",
+      ensemble: "Ensemble"
     },
     strategy: {
       title: "Strategy",
@@ -704,7 +747,9 @@ export const translations = {
       viewChart: "View Chart",
       download: "Download CSV",
       search: "Search",
-      searchPlaceholder: "Filter by stock code"
+      searchPlaceholder: "Filter by stock code",
+      batchDelete: "Batch Delete",
+      batchDeleteConfirm: "Confirm batch delete selected records?"
     },
     pretrain: {
       title: "Offline Pretraining",

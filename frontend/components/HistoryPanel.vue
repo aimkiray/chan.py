@@ -12,6 +12,17 @@
          />
          <UButton
            size="sm"
+           @click="batchDelete"
+           :loading="batchDeleting"
+           :disabled="loading || selectedCount <= 0"
+           color="red"
+           variant="solid"
+           icon="i-heroicons-trash"
+         >
+           {{ t('history.batchDelete') }}
+         </UButton>
+         <UButton
+           size="sm"
            @click="downloadHistory"
            :loading="downloading"
            :disabled="loading || total === 0"
@@ -32,6 +43,22 @@
         class="w-full" 
         :ui="{ th: { base: 'whitespace-nowrap', padding: 'px-3 py-2' }, td: { padding: 'px-3 py-2' } }"
       >
+        <template #select-header>
+          <UCheckbox
+            :model-value="allVisibleSelected"
+            :disabled="selectableResultIds.length === 0"
+            @update:model-value="toggleSelectAllVisible"
+          />
+        </template>
+
+        <template #select-data="{ row }">
+          <UCheckbox
+            :model-value="selectedIdSet.has(row.id)"
+            @click.stop
+            @update:model-value="(val) => toggleSelectResult(row.id, val)"
+          />
+        </template>
+
         <template #signal-data="{ row }">
            <UBadge v-if="row.signal_type" size="xs" :color="row.is_buy ? 'red' : 'green'" variant="subtle">
               {{ row.signal_type }}
@@ -62,7 +89,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, computed, watch } from 'vue'
+import { ref, onMounted, computed } from 'vue'
 import axios from 'axios'
 import { useI18n } from '../composables/useI18n'
 
@@ -71,14 +98,17 @@ const emit = defineEmits(['view'])
 const historyList = ref([])
 const loading = ref(false)
 const downloading = ref(false)
+const batchDeleting = ref(false)
 const toast = useToast()
 
 const page = ref(1)
 const pageSize = ref(10)
 const total = ref(0)
 const searchQuery = ref('')
+const selectedResultIds = ref([])
 
 const columns = computed(() => [
+  { key: 'select', label: '', class: 'w-[36px]' },
   { key: 'code', label: t('history.code'), sortable: true },
   { key: 'frequency', label: t('history.period') },
   { key: 'model', label: t('history.model') },
@@ -88,6 +118,40 @@ const columns = computed(() => [
   { key: 'accuracy', label: t('history.accuracy') },
   { key: 'actions', label: t('history.action') }
 ])
+
+const selectedIdSet = computed(() => new Set(selectedResultIds.value || []))
+const selectedCount = computed(() => (selectedResultIds.value || []).length)
+const selectableResultIds = computed(() => (historyList.value || []).map(r => r?.id).filter(x => Number.isFinite(Number(x))).map(x => Number(x)))
+const allVisibleSelected = computed(() => {
+  const ids = selectableResultIds.value || []
+  if (!ids.length) return false
+  const set = selectedIdSet.value
+  for (const id of ids) {
+    if (!set.has(id)) return false
+  }
+  return true
+})
+
+const toggleSelectResult = (id, val) => {
+  const rid = Number(id)
+  if (!Number.isFinite(rid)) return
+  const next = new Set(selectedIdSet.value)
+  if (val) next.add(rid)
+  else next.delete(rid)
+  selectedResultIds.value = Array.from(next)
+}
+
+const toggleSelectAllVisible = (val) => {
+  const ids = selectableResultIds.value || []
+  if (!ids.length) return
+  const next = new Set(selectedIdSet.value)
+  if (val) {
+    for (const id of ids) next.add(id)
+  } else {
+    for (const id of ids) next.delete(id)
+  }
+  selectedResultIds.value = Array.from(next)
+}
 
 const fetchHistory = async () => {
   loading.value = true
@@ -194,10 +258,32 @@ const deleteItem = async (row) => {
     
     try {
         await axios.delete(`/api/history/${row.id}`)
+        selectedResultIds.value = (selectedResultIds.value || []).filter((x) => Number(x) !== Number(row.id))
         fetchHistory()
     } catch (e) {
         console.error("Delete failed", e)
     }
+}
+
+const batchDelete = async () => {
+  if (selectedCount.value <= 0) return
+  if (!confirm(t('history.batchDeleteConfirm'))) return
+  batchDeleting.value = true
+  try {
+    const ids = Array.from(selectedIdSet.value)
+    const res = await axios.post('/api/history/batch_delete', { result_ids: ids })
+    const failed = res.data?.failed || []
+    if (failed.length) {
+      alert(failed.map(f => `${f.result_id}: ${f.reason || 'failed'}`).join('\n'))
+    }
+    selectedResultIds.value = []
+    await fetchHistory()
+  } catch (e) {
+    console.error(e)
+    toast.add({ title: t('app.deleteFailed'), color: 'red' })
+  } finally {
+    batchDeleting.value = false
+  }
 }
 
 onMounted(() => {

@@ -474,21 +474,21 @@ if (typeof window !== 'undefined') {
 watch(intradayFreq, (newFreq) => {
   if (newFreq === '1m') {
     dataLengthMin.value = 0.1
-    dataLengthMax.value = 1.0
+    dataLengthMax.value = 3.0
     dataLengthStep.value = 0.1
-    if (dataLengthYears.value > 1.0) dataLengthYears.value = 1.0
+    if (dataLengthYears.value > 3.0) dataLengthYears.value = 3.0
     if (dataLengthYears.value < 0.1) dataLengthYears.value = 0.1
   } else if (newFreq === '5m') {
     dataLengthMin.value = 0.1
-    dataLengthMax.value = 2.0
+    dataLengthMax.value = 10.0
     dataLengthStep.value = 0.1
-    if (dataLengthYears.value > 2.0) dataLengthYears.value = 2.0
+    if (dataLengthYears.value > 10.0) dataLengthYears.value = 10.0
     if (dataLengthYears.value < 0.1) dataLengthYears.value = 0.1
   } else if (['15m', '30m', '60m'].includes(newFreq)) {
     dataLengthMin.value = 0.1
-    dataLengthMax.value = 5.0
+    dataLengthMax.value = 10.0
     dataLengthStep.value = 0.1
-    if (dataLengthYears.value > 5.0) dataLengthYears.value = 5.0
+    if (dataLengthYears.value > 10.0) dataLengthYears.value = 10.0
     if (dataLengthYears.value < 0.1) dataLengthYears.value = 0.1
   } else if (['1w', '1mo'].includes(newFreq)) {
     dataLengthMin.value = 0.1

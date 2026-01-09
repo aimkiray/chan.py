@@ -16,6 +16,7 @@ from backend.chan_service import (
     compute_recent_accuracy,
     predict_proba_1,
     stragety_feature,
+    extract_state_features_from_cur_lv,
     get_stock_name
 )
 from backend.storage import StorageManager, StrategyRun
@@ -216,6 +217,7 @@ def _process_single_stock_strategy(
             if not bsp_list:
                 continue
             last_bsp = bsp_list[0]
+            state_feat = extract_state_features_from_cur_lv(cur_lv_chan, last_klu)
             if last_bsp.klu.idx not in bsp_dict and cur_lv_chan[-2].idx == last_bsp.klu.klc.idx:
                 bsp_count += 1
                 bsp_dict[last_bsp.klu.idx] = {
@@ -226,6 +228,8 @@ def _process_single_stock_strategy(
                     "decision_klu": last_klu,
                 }
                 try:
+                    if state_feat:
+                        bsp_dict[last_bsp.klu.idx]["feature"].add_feat(state_feat)
                     bsp_dict[last_bsp.klu.idx]["feature"].add_feat(stragety_feature(last_klu, enable_rolling_lookback=enable_rolling_lookback))
                 except Exception:
                     pass
@@ -258,7 +262,7 @@ def _process_single_stock_strategy(
         # Train with n_jobs=1 to avoid thread explosion
         backtest_kwargs = {
             "model_type": model_type,
-            "calibrate_method": "isotonic",
+            "calibrate_method": "none",
             "n_jobs": 1,
             "profit_threshold": profit_threshold,
             "auto_profit_quantile": auto_profit_quantile,
@@ -298,7 +302,7 @@ def _process_single_stock_strategy(
                 recent_kwargs = {
                     "model_type": model_type,
                     "recent_years": recent_accuracy_years,
-                    "calibrate_method": "isotonic",
+                    "calibrate_method": "none",
                     "n_jobs": 1,
                     "profit_threshold": profit_threshold,
                     "auto_profit_quantile": auto_profit_quantile,
@@ -360,10 +364,17 @@ def _process_single_stock_strategy(
                         feat_obj = None
                     if feat_obj is None:
                         feat_obj = selected_bsp.features
+                    try:
                         try:
-                            feat_obj.add_feat(stragety_feature(last_klu, enable_rolling_lookback=enable_rolling_lookback))
+                            cur_lv_chan = last_snapshot[0]
+                            state_feat2 = extract_state_features_from_cur_lv(cur_lv_chan, last_klu)
+                            if state_feat2:
+                                feat_obj.add_feat(state_feat2)
                         except Exception:
                             pass
+                        feat_obj.add_feat(stragety_feature(last_klu, enable_rolling_lookback=enable_rolling_lookback))
+                    except Exception:
+                        pass
                     feat_vec = [feat_obj.get(k, -9999999) for k in feature_meta]
                     signal_score = float(predict_proba_1(bst, [feat_vec])[0])
                 except Exception:
