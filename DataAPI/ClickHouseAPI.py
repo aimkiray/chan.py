@@ -1,5 +1,6 @@
 import os
 import datetime
+import threading
 from bisect import bisect_left, bisect_right
 from typing import Iterable, Optional
 from dotenv import load_dotenv
@@ -10,8 +11,26 @@ from Common.CTime import CTime
 from KLine.KLine_Unit import CKLine_Unit
 from .CommonStockAPI import CCommonStockApi
 
+class _LockedClickHouseClient:
+    def __init__(self, client: Client, lock: threading.Lock):
+        self._client = client
+        self._lock = lock
+
+    def execute(self, *args, **kwargs):
+        with self._lock:
+            return self._client.execute(*args, **kwargs)
+
+    def disconnect(self):
+        with self._lock:
+            return self._client.disconnect()
+
+    def __getattr__(self, name: str):
+        return getattr(self._client, name)
+
 class CClickHouseAPI(CCommonStockApi):
     _client = None
+    _client_lock = threading.Lock()
+    _init_lock = threading.Lock()
     _qfq_factor_cache = {}
     _hfq_factor_cache = {}
     _table_exists_cache = {}
@@ -22,26 +41,40 @@ class CClickHouseAPI(CCommonStockApi):
 
     @classmethod
     def do_init(cls):
-        if cls._client is None:
+        if cls._client is not None:
+            return
+        with cls._init_lock:
+            if cls._client is not None:
+                return
             load_dotenv()
             host = os.getenv("DB_HOST", "localhost")
             port = int(os.getenv("DB_PORT", 9000))
             user = os.getenv("DB_USER", "default")
             password = os.getenv("DB_PASSWORD", "")
             database = os.getenv("DB_NAME", "stock_data")
-            
+
+            raw_client = None
             try:
-                cls._client = Client(host=host, port=port, user=user, password=password, database=database)
-                # Test connection
-                cls._client.execute("SELECT 1")
+                raw_client = Client(host=host, port=port, user=user, password=password, database=database)
+                locked_client = _LockedClickHouseClient(raw_client, cls._client_lock)
+                locked_client.execute("SELECT 1")
+                cls._client = locked_client
             except Exception as e:
                 print(f"ClickHouse init failed: {e}")
+                try:
+                    if raw_client is not None:
+                        raw_client.disconnect()
+                except Exception:
+                    pass
                 cls._client = None
 
     @classmethod
     def do_close(cls):
         if cls._client:
-            cls._client.disconnect()
+            try:
+                cls._client.disconnect()
+            except Exception:
+                pass
             cls._client = None
 
     @classmethod

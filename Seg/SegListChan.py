@@ -34,32 +34,42 @@ class CSegListChan(CSegListComm):
         self.collect_left_seg(bi_lst)
 
     def cal_seg_sure(self, bi_lst: CBiList, begin_idx: int):
-        up_eigen = CEigenFX(BI_DIR.UP, lv=self.lv)  # 上升线段下降笔
-        down_eigen = CEigenFX(BI_DIR.DOWN, lv=self.lv)  # 下降线段上升笔
-        last_seg_dir = None if len(self) == 0 else self[-1].dir
-        for bi in bi_lst[begin_idx:]:
-            fx_eigen = None
-            if bi.is_down() and last_seg_dir != BI_DIR.UP:
-                if up_eigen.add(bi):
-                    fx_eigen = up_eigen
-            elif bi.is_up() and last_seg_dir != BI_DIR.DOWN:
-                if down_eigen.add(bi):
-                    fx_eigen = down_eigen
-            if len(self) == 0:  # 尝试确定第一段方向，不要以谁先成为分形来决定，反例：US.EVRG
-                if up_eigen.ele[1] is not None and bi.is_down():
-                    last_seg_dir = BI_DIR.DOWN
-                    down_eigen.clear()
-                elif down_eigen.ele[1] is not None and bi.is_up():
-                    up_eigen.clear()
-                    last_seg_dir = BI_DIR.UP
-                if up_eigen.ele[1] is None and last_seg_dir == BI_DIR.DOWN and bi.dir == BI_DIR.DOWN:
-                    last_seg_dir = None
-                elif down_eigen.ele[1] is None and last_seg_dir == BI_DIR.UP and bi.dir == BI_DIR.UP:
-                    last_seg_dir = None
+        cur_begin = begin_idx
+        while True:
+            up_eigen = CEigenFX(BI_DIR.UP, lv=self.lv)  # 上升线段下降笔
+            down_eigen = CEigenFX(BI_DIR.DOWN, lv=self.lv)  # 下降线段上升笔
+            last_seg_dir = None if len(self) == 0 else self[-1].dir
 
-            if fx_eigen:
-                self.treat_fx_eigen(fx_eigen, bi_lst)
-                break
+            fx_eigen = None
+            for bi in bi_lst[cur_begin:]:
+                if bi.is_down() and last_seg_dir != BI_DIR.UP:
+                    if up_eigen.add(bi):
+                        fx_eigen = up_eigen
+                elif bi.is_up() and last_seg_dir != BI_DIR.DOWN:
+                    if down_eigen.add(bi):
+                        fx_eigen = down_eigen
+                if len(self) == 0:  # 尝试确定第一段方向，不要以谁先成为分形来决定，反例：US.EVRG
+                    if up_eigen.ele[1] is not None and bi.is_down():
+                        last_seg_dir = BI_DIR.DOWN
+                        down_eigen.clear()
+                    elif down_eigen.ele[1] is not None and bi.is_up():
+                        up_eigen.clear()
+                        last_seg_dir = BI_DIR.UP
+                    if up_eigen.ele[1] is None and last_seg_dir == BI_DIR.DOWN and bi.dir == BI_DIR.DOWN:
+                        last_seg_dir = None
+                    elif down_eigen.ele[1] is None and last_seg_dir == BI_DIR.UP and bi.dir == BI_DIR.UP:
+                        last_seg_dir = None
+
+                if fx_eigen:
+                    break
+
+            if not fx_eigen:
+                return
+
+            next_begin = self.treat_fx_eigen(fx_eigen, bi_lst)
+            if next_begin is None:
+                return
+            cur_begin = next_begin
 
     def treat_fx_eigen(self, fx_eigen, bi_lst: CBiList):
         _test = fx_eigen.can_be_end(bi_lst)
@@ -67,10 +77,10 @@ class CSegListChan(CSegListComm):
         if _test in [True, None]:  # None表示反向分型找到尾部也没找到
             is_true = _test is not None  # 如果是正常结束
             if not self.add_new_seg(bi_lst, end_bi_idx, is_sure=is_true and fx_eigen.all_bi_is_sure()):  # 防止第一根线段的方向与首尾值异常
-                self.cal_seg_sure(bi_lst, end_bi_idx+1)
-                return
+                return end_bi_idx + 1
             self.lst[-1].eigen_fx = fx_eigen
             if is_true:
-                self.cal_seg_sure(bi_lst, end_bi_idx + 1)
+                return end_bi_idx + 1
+            return None
         else:
-            self.cal_seg_sure(bi_lst, fx_eigen.lst[1].idx)
+            return fx_eigen.lst[1].idx

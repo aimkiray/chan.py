@@ -199,6 +199,39 @@
                   </UTooltip>
                </div>
 
+               <div class="flex items-center gap-2">
+                  <UCheckbox v-model="autoProfitThreshold" :label="t('strategy.useAutoProfitThreshold')" />
+               </div>
+
+               <div v-if="!autoProfitThreshold">
+                 <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('strategy.profitThreshold') }}</label>
+                 <UInput type="number" v-model="proxyStrategyForm.profit_threshold" step="0.005" min="0" max="1" class="w-full" />
+               </div>
+
+               <div>
+                 <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('strategy.autoProfitQuantile') }}</label>
+                 <UInput type="number" v-model="proxyStrategyForm.auto_profit_quantile" step="0.05" min="0" max="1" :disabled="!autoProfitThreshold" class="w-full" />
+               </div>
+
+               <div>
+                 <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('strategy.profitLookahead') }}</label>
+                 <UInput type="number" v-model="proxyStrategyForm.profit_lookahead" step="1" min="0" max="250" class="w-full" />
+               </div>
+
+               <div>
+                 <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('strategy.startDate') }}</label>
+                 <UInput type="date" v-model="proxyStrategyForm.start_date" class="w-full" />
+               </div>
+
+               <div>
+                 <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('strategy.endDate') }}</label>
+                 <UInput type="date" v-model="proxyStrategyForm.end_date" class="w-full" />
+               </div>
+
+               <div class="flex items-center gap-2">
+                 <UCheckbox v-model="proxyStrategyForm.force_refresh" :label="t('strategy.forceRefresh')" />
+               </div>
+
                <div v-if="activeTab === 'analysis'" class="flex items-center gap-2">
                   <UCheckbox v-model="proxyBlend" :label="t('app.pretrainedBlend')" />
                   <UTooltip :text="t('sidebar.blendHint')" :popper="{ placement: 'right' }">
@@ -449,94 +482,48 @@
           <!-- Advanced Configs -->
           <div v-if="showAdvancedStrategy" class="space-y-3 pt-2 border-t border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-800/50 p-2 rounded">
               <div>
-                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ strategyAdvancedLabels.minRecentAccuracy }}</label>
-                <UInput type="number" v-model="proxyStrategyForm.min_recent_accuracy" step="0.05" min="0" max="1" class="w-full" />
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('strategy.portfolioTopN') }}</label>
+                <UInput type="number" v-model="proxyStrategyForm.portfolio_top_n" step="1" min="1" max="100" class="w-full" />
               </div>
 
               <div>
-                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ strategyAdvancedLabels.recentAccuracyYears }}</label>
-                <UInput type="number" v-model="proxyStrategyForm.recent_accuracy_years" step="0.1" min="0.1" max="10" class="w-full" />
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('strategy.holdingPeriod') }}</label>
+                <UInput type="number" v-model="proxyStrategyForm.holding_period" step="1" min="1" max="1000" class="w-full" />
               </div>
 
-              <div>
-                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ strategyAdvancedLabels.profitThreshold }}</label>
-                <UInput type="number" v-model="proxyStrategyForm.profit_threshold" step="0.005" min="0" max="1" class="w-full" />
+              <div class="flex items-center gap-2">
+                 <UCheckbox :model-value="Number(proxyStrategyForm.amp_whitelist_days || 0) > 0" :label="t('strategy.ampWhitelistEnable')" @update:model-value="toggleAmpWhitelist" />
               </div>
 
-              <div>
-                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ strategyAdvancedLabels.autoProfitQuantile }}</label>
-                <UInput type="number" v-model="proxyStrategyForm.auto_profit_quantile" step="0.05" min="0" max="1" class="w-full" />
+              <div v-if="Number(proxyStrategyForm.amp_whitelist_days || 0) > 0" class="space-y-2 pl-2 border-l-2 border-gray-200 dark:border-gray-700">
+                <div>
+                  <label class="text-xs text-gray-500">{{ t('strategy.ampWhitelistDays') }}</label>
+                  <UInput type="number" v-model="proxyStrategyForm.amp_whitelist_days" size="2xs" step="1" min="1" max="365" class="w-full" />
+                </div>
+                <div>
+                  <label class="text-xs text-gray-500">{{ t('strategy.ampWhitelistTopFrac') }}</label>
+                  <UInput type="number" v-model="proxyStrategyForm.amp_whitelist_top_frac" size="2xs" step="0.05" min="0.05" max="1.0" class="w-full" />
+                </div>
               </div>
 
-              <div>
-                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ strategyAdvancedLabels.profitLookahead }}</label>
-                <UInput type="number" v-model="proxyStrategyForm.profit_lookahead" step="1" min="0" max="250" class="w-full" />
+              <div class="flex items-center gap-2">
+                 <UCheckbox v-model="proxyStrategyForm.use_atr_label" :label="t('strategy.useAtrLabel')" />
               </div>
 
-              <div>
-                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ strategyAdvancedLabels.minBspCount }}</label>
-                <UInput type="number" v-model="proxyStrategyForm.min_bsp_count" step="1" min="0" max="1000000" class="w-full" />
-              </div>
-
-              <div>
-                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ strategyAdvancedLabels.minTestCount }}</label>
-                <UInput type="number" v-model="proxyStrategyForm.min_test_count" step="1" min="0" max="1000000" class="w-full" />
+              <div v-if="proxyStrategyForm.use_atr_label" class="space-y-2 pl-2 border-l-2 border-gray-200 dark:border-gray-700">
+                <div>
+                  <label class="text-xs text-gray-500">{{ t('strategy.atrPeriod') }}</label>
+                  <UInput type="number" v-model="proxyStrategyForm.atr_period" size="2xs" step="1" min="1" max="200" class="w-full" />
+                </div>
+                <div>
+                  <label class="text-xs text-gray-500">{{ t('strategy.atrMult') }}</label>
+                  <UInput type="number" v-model="proxyStrategyForm.atr_mult" size="2xs" step="0.1" min="0" max="100" class="w-full" />
+                </div>
               </div>
               
-              <!-- MACD Algo -->
               <div>
-                 <label class="block text-xs font-medium text-gray-500 mb-1">{{ t('sidebar.macdAlgo') }}</label>
-                 <USelectMenu v-model="proxyStrategyChanConfig.macd_algo" size="xs" :options="['peak', 'area', 'slope', 'diff']" />
-              </div>
-
-              <div>
-                <label class="block text-xs font-medium text-gray-500 mb-1">{{ strategyAdvancedLabels.zsAlgo }}</label>
-                <USelectMenu v-model="proxyStrategyChanConfig.zs_algo" size="xs" :options="['normal', 'over_seg', 'auto']" class="w-full" />
-              </div>
-
-              <div>
-                <label class="block text-xs font-medium text-gray-500 mb-1">{{ strategyAdvancedLabels.divergenceRate }}</label>
-                <UInput type="number" v-model="proxyStrategyChanConfig.divergence_rate" step="0.1" min="0" max="1000000000" class="w-full" />
-              </div>
-
-              <div>
-                <label class="block text-xs font-medium text-gray-500 mb-1">{{ strategyAdvancedLabels.maxBs2Rate }}</label>
-                <UInput type="number" v-model="proxyStrategyChanConfig.max_bs2_rate" step="0.01" min="0" max="1" class="w-full" />
-              </div>
-
-              <!-- Rolling Lookback -->
-              <div class="flex items-center gap-2">
-                 <UCheckbox v-model="proxyStrategyForm.enable_rolling_lookback" :label="t('sidebar.rollingFeature')" />
-              </div>
-
-              <!-- Bi Strict -->
-              <div class="flex items-center gap-2">
-                 <UCheckbox v-model="proxyStrategyChanConfig.bi_strict" :label="t('sidebar.strictBi')" />
-              </div>
-
-              <!-- Gap as KL -->
-              <div class="flex items-center gap-2">
-                 <UCheckbox v-model="proxyStrategyChanConfig.gap_as_kl" :label="t('sidebar.gapAsKl')" />
-              </div>
-
-              <!-- Require Signal -->
-              <div class="flex items-center gap-2">
-                 <UCheckbox v-model="proxyStrategyChanConfig.require_signal" :label="t('sidebar.signalOnly')" />
-              </div>
-
-              <div v-if="proxyStrategyChanConfig.require_signal" class="space-y-2 pl-2 border-l-2 border-gray-200 dark:border-gray-700">
-                  <div>
-                      <label class="text-xs text-gray-500">{{ t('sidebar.lookback') }}</label>
-                      <UInput type="number" v-model="proxyStrategyChanConfig.signal_lookback" size="2xs" min="1" max="20" />
-                  </div>
-                  <div>
-                      <label class="text-xs text-gray-500">{{ t('sidebar.direction') }}</label>
-                      <USelectMenu v-model="proxyStrategyChanConfig.signal_direction" size="2xs" :options="strategySignalDirectionOptions" value-attribute="value" option-attribute="label" />
-                  </div>
-                  <div>
-                      <label class="text-xs text-gray-500">{{ t('strategy.minSignalScore') }}</label>
-                      <UInput type="number" v-model="proxyStrategyForm.min_signal_score" size="2xs" step="0.05" min="0" max="1" class="w-full" />
-                  </div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('strategy.profitLookahead') }}</label>
+                <UInput type="number" v-model="proxyStrategyForm.profit_lookahead" step="1" min="0" max="250" class="w-full" />
               </div>
           </div>
 
@@ -634,27 +621,6 @@ const strategyFrequencyOptions = computed(() => [
   { label: t('periods.30m'), value: '30m' },
   { label: t('periods.5m'), value: '5m' }
 ])
-
-const strategySignalDirectionOptions = computed(() => [
-  { label: t('common.buy'), value: 'buy' },
-  { label: t('common.sell'), value: 'sell' },
-  { label: t('common.all'), value: 'both' }
-])
-
-const strategyAdvancedLabels = computed(() => {
-  return {
-    minRecentAccuracy: t('strategy.minRecentAccuracy'),
-    recentAccuracyYears: t('strategy.recentAccuracyYears'),
-    minBspCount: t('strategy.minBspCount'),
-    minTestCount: t('strategy.minTestCount'),
-    profitThreshold: t('strategy.profitThreshold'),
-    autoProfitQuantile: t('strategy.autoProfitQuantile'),
-    profitLookahead: t('strategy.profitLookahead'),
-    divergenceRate: t('strategy.divergenceRate'),
-    maxBs2Rate: t('strategy.maxBs2Rate'),
-    zsAlgo: t('strategy.zsAlgo')
-  }
-})
 
 const props = defineProps({
   activeTab: { type: String, default: 'analysis' },
@@ -773,6 +739,21 @@ const proxyStrategyChanConfig = computed({
   set: (val) => emit('update:strategyChanConfig', val)
 })
 
+const autoProfitThreshold = computed({
+  get: () => {
+    const cur = proxyStrategyForm.value || {}
+    return cur.profit_threshold === null
+  },
+  set: (val) => {
+    const cur = proxyStrategyForm.value || {}
+    if (val) {
+      proxyStrategyForm.value = { ...cur, profit_threshold: null }
+      return
+    }
+    proxyStrategyForm.value = { ...cur, profit_threshold: 0.01 }
+  }
+})
+
 const proxyPretrainConfig = computed({
   get: () => props.pretrainConfig,
   set: (val) => emit('update:pretrainConfig', val)
@@ -781,7 +762,7 @@ const proxyPretrainConfig = computed({
 watch(
   () => props.autype,
   (val) => {
-    const nextAutype = String(val || '').trim() || 'hfq'
+    const nextAutype = String(val || '').trim() || 'qfq'
 
     const curPretrain = proxyPretrainConfig.value || {}
     if (curPretrain.autype !== nextAutype) {
@@ -805,58 +786,45 @@ const autypeOptions = computed(() => [
 const showAdvancedStrategy = ref(false)
 const selectedPreset = ref('custom')
 
+const toggleAmpWhitelist = (enabled) => {
+  const cur = proxyStrategyForm.value || {}
+  if (enabled) {
+    const rawDays = Number(cur.amp_whitelist_days)
+    const nextDays = Number.isFinite(rawDays) && rawDays > 0 ? Math.round(rawDays) : 5
+    const rawFrac = Number(cur.amp_whitelist_top_frac)
+    const nextFrac = Number.isFinite(rawFrac) && rawFrac > 0 ? rawFrac : 0.3
+    proxyStrategyForm.value = { ...cur, amp_whitelist_days: nextDays, amp_whitelist_top_frac: nextFrac }
+    return
+  }
+  proxyStrategyForm.value = { ...cur, amp_whitelist_days: 0 }
+}
+
 const presets = computed(() => [
   { label: t('sidebar.presetCustom'), value: 'custom', config: {} },
   {
-    label: t('sidebar.presetDealer'),
-    value: 'dealer',
+    label: t('sidebar.presetDynamicThreshold'),
+    value: 'dynamic_threshold',
     config: {
-      min_accuracy: 0.90,
-      bi_strict: true,
-      model: 'xgboost',
-      require_signal: false,
-      enable_rolling_lookback: true
+        min_accuracy: 0.0,
+        bi_strict: true,
+        model: 'xgboost',
+        require_signal: true,
+        signal_direction: 'buy',
+        signal_lookback: 5,
+        min_signal_score: 0.6,
+        amp_whitelist_days: 20,
+        amp_whitelist_top_frac: 0.3,
+        use_atr_label: true,
+        atr_period: 14,
+        atr_mult: 1.0,
+        high_vol_atr_pct_min: null,
+        frequency: '30m',
+        profit_lookahead: 3,
+        portfolio_top_n: 2,
+        holding_period: 3,
+        profit_threshold: 0.0
     }
-  },
-  {
-    label: t('sidebar.presetQuantControl'),
-    value: 'quant_control',
-    config: {
-      min_accuracy: 0.85,
-      bi_strict: true,
-      require_signal: true,
-      signal_direction: 'buy',
-      bs_type: '1,2,3a,3b'
-    }
-  },
-  {
-    label: t('sidebar.presetPractical'),
-    value: 'practical_dual',
-    config: {
-      model: 'xgboost',
-      bi_strict: true,
-      bsp2_follow_1: true,
-      bsp3_follow_1: true,
-      min_zs_cnt: 1,
-      bs_type: '1,2,3a,3b',
-      enable_rolling_lookback: true,
-      data_length_years: 5.0,
-      min_accuracy: 0.6,
-      min_recent_accuracy: 0.7,
-      recent_accuracy_years: 1.0,
-      require_signal: true,
-      signal_lookback: 5,
-      signal_direction: 'buy',
-      min_signal_score: 0.8,
-      min_bsp_count: 90,
-      min_test_count: 20,
-      profit_threshold: null,
-      auto_profit_quantile: 0.7,
-      profit_lookahead: 5
-    }
-  },
-  { label: t('sidebar.presetConservative'), value: 'conservative', config: { min_accuracy: 0.85, bi_strict: true, model: 'xgboost', require_signal: false } },
-  { label: t('sidebar.presetAggressive'), value: 'aggressive', config: { min_accuracy: 0.6, bi_strict: false, model: 'xgboost', require_signal: false } }
+  }
 ])
 
 const applyPreset = () => {
@@ -869,6 +837,14 @@ const applyPreset = () => {
         if (p.config.min_signal_score !== undefined) proxyStrategyForm.value.min_signal_score = p.config.min_signal_score
         if (p.config.min_bsp_count !== undefined) proxyStrategyForm.value.min_bsp_count = p.config.min_bsp_count
         if (p.config.min_test_count !== undefined) proxyStrategyForm.value.min_test_count = p.config.min_test_count
+        if (p.config.high_vol_atr_pct_min !== undefined) proxyStrategyForm.value.high_vol_atr_pct_min = p.config.high_vol_atr_pct_min
+        if (p.config.amp_whitelist_days !== undefined) proxyStrategyForm.value.amp_whitelist_days = p.config.amp_whitelist_days
+        if (p.config.amp_whitelist_top_frac !== undefined) proxyStrategyForm.value.amp_whitelist_top_frac = p.config.amp_whitelist_top_frac
+        if (p.config.use_atr_label !== undefined) proxyStrategyForm.value.use_atr_label = p.config.use_atr_label
+        if (p.config.atr_period !== undefined) proxyStrategyForm.value.atr_period = p.config.atr_period
+        if (p.config.atr_mult !== undefined) proxyStrategyForm.value.atr_mult = p.config.atr_mult
+        if (p.config.portfolio_top_n !== undefined) proxyStrategyForm.value.portfolio_top_n = p.config.portfolio_top_n
+        if (p.config.holding_period !== undefined) proxyStrategyForm.value.holding_period = p.config.holding_period
         if (p.config.profit_threshold !== undefined) proxyStrategyForm.value.profit_threshold = p.config.profit_threshold
         if (p.config.auto_profit_quantile !== undefined) proxyStrategyForm.value.auto_profit_quantile = p.config.auto_profit_quantile
         if (p.config.profit_lookahead !== undefined) proxyStrategyForm.value.profit_lookahead = p.config.profit_lookahead
@@ -919,11 +895,6 @@ const modelOptions = computed(() => [
   { label: t('app.modelOptions.xgboost'), value: 'xgboost' },
   { label: t('app.modelOptions.lightgbm'), value: 'lightgbm' },
   { label: t('app.modelOptions.mlp'), value: 'mlp' }
-])
-
-const dataLengthModeOptions = computed(() => [
-  { label: t('pretrain.dataLengthMax'), value: 'max' },
-  { label: t('pretrain.dataLengthYears'), value: 'years' }
 ])
 
 const fillCodesFromPool = async () => {

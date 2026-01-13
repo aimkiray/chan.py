@@ -7,6 +7,7 @@ import concurrent.futures
 import os
 import copy
 import hashlib
+import numpy as np
 from typing import List, Dict, Any, Optional
 
 from backend.chan_service import (
@@ -14,12 +15,14 @@ from backend.chan_service import (
     CChanCustom,
     train_time_split_backtest,
     compute_recent_accuracy,
+    _atr_pct_from_klu,
     predict_proba_1,
     stragety_feature,
     extract_state_features_from_cur_lv,
     get_stock_name
 )
 from backend.storage import StorageManager, StrategyRun
+from backend.vector_backtest import VectorBacktester
 from Common.CEnum import KL_TYPE, DATA_SRC, AUTYPE
 from ChanConfig import CChanConfig
 from DataAPI.ClickHouseAPI import CClickHouseAPI
@@ -67,6 +70,10 @@ def _process_single_stock_strategy(
     min_signal_score: Optional[float],
     min_bsp_count: int,
     min_test_count: int,
+    high_vol_atr_pct_min: Optional[float],
+    use_atr_label: bool,
+    atr_period: int,
+    atr_mult: float,
     profit_threshold: Optional[float],
     auto_profit_quantile: float,
     profit_lookahead: int,
@@ -104,7 +111,7 @@ def _process_single_stock_strategy(
         )
         
         if not kl_list or len(kl_list) < 100:
-            return code, None, 0, 0.0, ""
+            return code, None, 0, 0.0, "", None
 
         # Chan Calc
         base_chan_config = {
@@ -172,6 +179,10 @@ def _process_single_stock_strategy(
                     "min_signal_score": float(min_signal_score) if min_signal_score is not None else None,
                     "min_bsp_count": int(min_bsp_count),
                     "min_test_count": int(min_test_count),
+                    "high_vol_atr_pct_min": float(high_vol_atr_pct_min) if high_vol_atr_pct_min is not None else None,
+                    "use_atr_label": bool(use_atr_label),
+                    "atr_period": int(atr_period),
+                    "atr_mult": float(atr_mult),
                     "profit_threshold": float(profit_threshold) if profit_threshold is not None else None,
                     "auto_profit_quantile": float(auto_profit_quantile),
                     "profit_lookahead": int(profit_lookahead),
@@ -189,6 +200,33 @@ def _process_single_stock_strategy(
         except Exception:
             pass
         # --- Cache Logic End ---
+
+        try:
+            hv = None
+            if high_vol_atr_pct_min not in ["", "null", "None", None]:
+                hv = float(high_vol_atr_pct_min)
+            if hv is not None:
+                atr_pct = _atr_pct_from_klu(kl_list[-1], period=atr_period)
+                if atr_pct is None or float(atr_pct) < float(hv):
+                    method = f"high_vol_filtered atr_pct={atr_pct}"
+                    try:
+                        if key_hash and storage:
+                            storage.save_strategy_cache(
+                                key_hash,
+                                code,
+                                0.0,
+                                0,
+                                method,
+                                None,
+                                data_start_time,
+                                data_end_time,
+                                cache_params,
+                            )
+                    except Exception:
+                        pass
+                    return code, None, 0, 0.0, method, None
+        except Exception:
+            pass
 
         chan = CChanCustom(
             code=code,
@@ -235,7 +273,7 @@ def _process_single_stock_strategy(
                     pass
         
         if not last_snapshot:
-            return code, None, len(bsp_dict), 0.0, ""
+            return code, None, len(bsp_dict), 0.0, "", None
 
         last_klu = last_snapshot[0][-1][-1]
         latest_bsp_list = last_snapshot.get_latest_bsp(number=0)
@@ -267,6 +305,9 @@ def _process_single_stock_strategy(
             "profit_threshold": profit_threshold,
             "auto_profit_quantile": auto_profit_quantile,
             "profit_lookahead": profit_lookahead,
+            "use_atr_label": bool(use_atr_label),
+            "atr_period": int(atr_period),
+            "atr_mult": float(atr_mult),
         }
         if int(min_test_count) > 0:
             backtest_kwargs["min_test"] = int(min_test_count)
@@ -307,6 +348,9 @@ def _process_single_stock_strategy(
                     "profit_threshold": profit_threshold,
                     "auto_profit_quantile": auto_profit_quantile,
                     "profit_lookahead": profit_lookahead,
+                    "use_atr_label": bool(use_atr_label),
+                    "atr_period": int(atr_period),
+                    "atr_mult": float(atr_mult),
                 }
                 if int(min_test_count) > 0:
                     recent_kwargs["min_test"] = int(min_test_count)
@@ -417,11 +461,11 @@ def _process_single_stock_strategy(
         except Exception:
             pass
 
-        return code, result, len(bsp_dict), current_accuracy, method
+        return code, result, len(bsp_dict), current_accuracy, method, accuracy_info
 
     except Exception as e:
         print(f"Error processing {code}: {e}")
-        return code, None, 0, 0.0, f"error: {str(e)}"
+        return code, None, 0, 0.0, f"error: {str(e)}", None
 
 class StrategyRunner:
     def __init__(self, storage: StorageManager):
@@ -460,6 +504,28 @@ class StrategyRunner:
             raw_autype = str(params.get("autype", "hfq") or "hfq").strip().lower()
             if raw_autype not in ("qfq", "hfq", "none"):
                 raw_autype = "hfq"
+            amp_whitelist_days = params.get("amp_whitelist_days", 0)
+            try:
+                if amp_whitelist_days in ["", "null", "None", None]:
+                    amp_whitelist_days = 0
+                amp_whitelist_days = int(float(amp_whitelist_days))
+            except Exception:
+                amp_whitelist_days = 0
+            if amp_whitelist_days < 0:
+                amp_whitelist_days = 0
+            if amp_whitelist_days > 365:
+                amp_whitelist_days = 365
+            amp_whitelist_top_frac = params.get("amp_whitelist_top_frac", 0.3)
+            try:
+                if amp_whitelist_top_frac in ["", "null", "None", None]:
+                    amp_whitelist_top_frac = 0.3
+                amp_whitelist_top_frac = float(amp_whitelist_top_frac)
+            except Exception:
+                amp_whitelist_top_frac = 0.3
+            if amp_whitelist_top_frac <= 0:
+                amp_whitelist_top_frac = 0.3
+            if amp_whitelist_top_frac > 1:
+                amp_whitelist_top_frac = 1.0
             data_length_years = float(params.get('data_length_years', 1.0))
             min_accuracy = float(params.get('min_accuracy', 0.8))
             if min_accuracy < 0:
@@ -527,6 +593,34 @@ class StrategyRunner:
             if min_test_count > 1000000:
                 min_test_count = 1000000
 
+            high_vol_atr_pct_min = params.get("high_vol_atr_pct_min", None)
+            try:
+                if high_vol_atr_pct_min in ["", "null", "None", None]:
+                    high_vol_atr_pct_min = None
+                if high_vol_atr_pct_min is not None:
+                    high_vol_atr_pct_min = float(high_vol_atr_pct_min)
+                    if high_vol_atr_pct_min < 0:
+                        high_vol_atr_pct_min = 0.0
+            except Exception:
+                high_vol_atr_pct_min = None
+
+            use_atr_label = bool(params.get("use_atr_label", False))
+            atr_period = params.get("atr_period", 14)
+            try:
+                atr_period = int(float(atr_period))
+            except Exception:
+                atr_period = 14
+            if atr_period <= 0:
+                atr_period = 14
+
+            atr_mult = params.get("atr_mult", 1.0)
+            try:
+                atr_mult = float(atr_mult)
+            except Exception:
+                atr_mult = 1.0
+            if atr_mult < 0:
+                atr_mult = 0.0
+
             profit_threshold = params.get('profit_threshold', 0.01)
             if profit_threshold in ["", "null", "None"]:
                 profit_threshold = None
@@ -575,6 +669,57 @@ class StrategyRunner:
             if not stocks:
                 self._update_progress(run_id, 0, 0, "failed")
                 return
+
+            if amp_whitelist_days > 0 and len(stocks) > 1:
+                try:
+                    autype_map = {"qfq": AUTYPE.QFQ, "hfq": AUTYPE.HFQ, "none": AUTYPE.NONE}
+                    used_autype = autype_map.get(raw_autype, AUTYPE.HFQ)
+                    lookback_days = max(30, int(amp_whitelist_days * 4))
+                    amp_begin_time = (datetime.datetime.now() - datetime.timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+                    def _avg_amp(code: str):
+                        try:
+                            kl_list = fetch_stock_data(code, KL_TYPE.K_DAY, amp_begin_time, None, DATA_SRC.CLICK_HOUSE, autype=used_autype)
+                            if not kl_list:
+                                return code, None
+                            tail = kl_list[-int(amp_whitelist_days):] if amp_whitelist_days > 0 else list(kl_list)
+                            if not tail:
+                                return code, None
+                            amps = []
+                            for k in tail:
+                                try:
+                                    c = float(getattr(k, "close", 0.0) or 0.0)
+                                    h = float(getattr(k, "high", 0.0) or 0.0)
+                                    l = float(getattr(k, "low", 0.0) or 0.0)
+                                    if c > 0:
+                                        amps.append((h - l) / c)
+                                except Exception:
+                                    continue
+                            if not amps:
+                                return code, None
+                            return code, float(sum(amps) / float(len(amps)))
+                        except Exception:
+                            return code, None
+
+                    amp_workers = max(1, min(16, len(stocks)))
+                    scored = []
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=amp_workers) as ex:
+                        futs = [ex.submit(_avg_amp, c) for c in stocks]
+                        for fut in concurrent.futures.as_completed(futs):
+                            try:
+                                c, a = fut.result()
+                                if a is not None:
+                                    scored.append((c, float(a)))
+                            except Exception:
+                                continue
+
+                    if scored:
+                        scored.sort(key=lambda x: float(x[1]), reverse=True)
+                        keep_n = int(max(1, round(len(scored) * float(amp_whitelist_top_frac))))
+                        keep = set([c for c, _ in scored[:keep_n]])
+                        stocks = [c for c in stocks if c in keep]
+                except Exception:
+                    pass
 
             self._update_progress(run_id, 0, len(stocks), "running")
             
@@ -651,6 +796,10 @@ class StrategyRunner:
                             min_signal_score,
                             min_bsp_count,
                             min_test_count,
+                            high_vol_atr_pct_min,
+                            use_atr_label,
+                            atr_period,
+                            atr_mult,
                             profit_threshold,
                             auto_profit_quantile,
                             profit_lookahead,
@@ -678,8 +827,11 @@ class StrategyRunner:
                         processed += 1
                         
                         try:
-                            r_code, r_result, r_samples, r_acc, r_method = future.result()
+                            r_code, r_result, r_samples, r_acc, r_method, r_info = future.result()
                             
+                            if r_info and isinstance(r_info, dict) and "predictions" in r_info:
+                                all_predictions[r_code] = r_info["predictions"]
+
                             if processed % 10 == 0:
                                 print(f"[Strategy] {r_code} samples={r_samples} accuracy={r_acc:.3f} {r_method}")
                                 self._update_progress(run_id, processed, len(stocks), "running")
@@ -695,6 +847,125 @@ class StrategyRunner:
                         # Submit a new task to replace the completed one
                         submit_next()
             
+            # Portfolio Backtest
+            if portfolio_top_n and all_predictions:
+                try:
+                    # 1. Prepare Data
+                    events_by_ts = {}
+                    for code, preds in all_predictions.items():
+                        for p in preds:
+                            ts = int(p.get('ts', 0))
+                            if ts > 0:
+                                events_by_ts.setdefault(ts, []).append({
+                                    'code': code,
+                                    'prob': float(p.get('prob', 0)),
+                                    'profit': float(p.get('profit', 0))
+                                })
+                    
+                    sorted_ts = sorted(events_by_ts.keys())
+                    min_score = float(min_signal_score) if min_signal_score is not None else 0.6
+                    holding_period = int(params.get('holding_period', 3))
+                    if holding_period < 1: holding_period = 1
+                    
+                    # 2. Simulate Trades
+                    trades = [] # {entry_idx, exit_idx, return, code}
+                    
+                    for i, ts in enumerate(sorted_ts):
+                        # Identify candidates
+                        candidates = events_by_ts[ts]
+                        candidates = [c for c in candidates if c['prob'] >= min_score]
+                        candidates.sort(key=lambda x: x['prob'], reverse=True)
+                        
+                        # Check available slots
+                        # Active trade: entry_idx <= i < exit_idx
+                        active_trades = [t for t in trades if t['entry_idx'] <= i < t['exit_idx']]
+                        slots_available = portfolio_top_n - len(active_trades)
+                        
+                        if slots_available > 0:
+                            held_codes = {t['code'] for t in active_trades}
+                            to_buy = []
+                            for c in candidates:
+                                if len(to_buy) >= slots_available:
+                                    break
+                                if c['code'] not in held_codes:
+                                    to_buy.append(c)
+                            
+                            for c in to_buy:
+                                trades.append({
+                                    'code': c['code'],
+                                    'entry_idx': i,
+                                    'exit_idx': i + holding_period,
+                                    'return': c['profit']
+                                })
+                    
+                    # 3. Calculate Curve
+                    step_returns = []
+                    for i in range(len(sorted_ts)):
+                        step_ret = 0.0
+                        # Active trades at this step
+                        active_trades = [t for t in trades if t['entry_idx'] <= i < t['exit_idx']]
+                        
+                        for t in active_trades:
+                            # Simple linear attribution of return
+                            step_ret += t['return'] / holding_period
+                        
+                        # Portfolio return = Sum(Position Returns) / TopN
+                        # (Assuming equal capital allocation to N slots)
+                        avg_step_ret = step_ret / portfolio_top_n
+                        step_returns.append(avg_step_ret)
+                    
+                    # 4. Metrics
+                    eq = 1.0
+                    equity_curve = [1.0]
+                    for r in step_returns:
+                        eq *= (1.0 + r)
+                        equity_curve.append(eq)
+                        
+                    total_return = eq - 1.0
+                    sharpe = 0.0
+                    max_dd = 0.0
+                    
+                    if step_returns:
+                        arr = np.array(step_returns)
+                        if np.std(arr) > 0:
+                            # Simple Sharpe (not annualized)
+                            sharpe = np.mean(arr) / np.std(arr)
+                            # To annualize, we'd need frequency. 
+                            # Assuming 30m (8 bars/day * 250 days = 2000)
+                            if frequency == '30m':
+                                sharpe *= np.sqrt(2000)
+                            elif frequency == '1d':
+                                sharpe *= np.sqrt(250)
+                            elif frequency == '60m':
+                                sharpe *= np.sqrt(1000)
+                        
+                        peak = -99999.0
+                        for v in equity_curve:
+                            if v > peak:
+                                peak = v
+                            dd = (peak - v) / peak if peak > 0 else 0
+                            max_dd = max(max_dd, dd)
+                            
+                    portfolio_res = {
+                        "code": "PORTFOLIO",
+                        "name": f"Portfolio (Top {portfolio_top_n})",
+                        "accuracy": 0.0,
+                        "recent_accuracy": 0.0,
+                        "signal_score": 0.0,
+                        "signal_type": f"Sharpe: {sharpe:.2f}, MaxDD: {max_dd:.2%}, Ret: {total_return:.2%}",
+                        "latest_date": datetime.datetime.now().strftime("%Y-%m-%d"),
+                        "metrics": {
+                            "sharpe": sharpe,
+                            "max_dd": max_dd,
+                            "total_return": total_return,
+                            "trade_count": len(trades)
+                        }
+                    }
+                    results.insert(0, portfolio_res)
+                except Exception as e:
+                    print(f"Portfolio calculation failed: {e}")
+                    traceback.print_exc()
+
             # Completed
             self._update_progress(run_id, processed, len(stocks), "completed", json.dumps(results), len(results))
             

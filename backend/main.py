@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any, List, Callable
 
 # Add parent directory to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from backend.chan_service import (
     get_chan_data,
@@ -39,6 +39,8 @@ from backend.chan_service import (
     get_pretrained_model_detail_by_key,
     delete_pretrained_model_bundle_by_key,
 )
+from backend.portfolio_service import get_portfolio_service
+from backend.vector_backtest import VectorBacktester
 from backend.serialization import serialize_chan_data
 from backend.storage import StorageManager, StrategyRun
 from backend.strategy_runner import StrategyRunner
@@ -255,6 +257,41 @@ def _shrink_pretrain_result(result):
                 out[k] = result.get(k)
     return out
 
+def _shrink_accuracy_result(result):
+    if not isinstance(result, dict):
+        return result
+    keep = [
+        "method",
+        "train_count",
+        "val_count",
+        "test_count",
+        "valid_count",
+        "total_count",
+        "accuracy",
+        "roc_auc",
+        "pr_auc",
+        "brier_score",
+        "ece",
+        "logloss",
+        "selected_features",
+        "warning",
+    ]
+    out = {k: result.get(k) for k in keep if k in result}
+    trading = result.get("trading")
+    if isinstance(trading, dict):
+        tv = None
+        try:
+            tv = (trading.get("topk_vector") or None)
+        except Exception:
+            tv = None
+        if tv is not None:
+            out["trading"] = {"topk_vector": tv}
+        else:
+            thr = trading.get("threshold") if isinstance(trading.get("threshold"), dict) else None
+            if thr is not None:
+                out["trading"] = {"threshold": thr}
+    return out
+
 def _calc_pretrain_begin_time(req, level: KL_TYPE):
     days = 365
     if req.data_length_years is not None:
@@ -297,7 +334,7 @@ class AnalyzeRequest(BaseModel):
     data_src: str = "clickhouse"
     model: str = "xgboost"
     do_predict: bool = False
-    autype: str = "hfq"
+    autype: str = "qfq"
     force_refresh: bool = False
     data_length_mode: str = "default" # "default" or "max"
     data_length_years: Optional[float] = None
@@ -331,7 +368,7 @@ class ValidateRequest(BaseModel):
     frequency: str = "1d"
     data_src: str = "clickhouse"
     model: str = "xgboost"
-    autype: str = "hfq"
+    autype: str = "qfq"
     data_length_mode: str = "default"
     data_length_years: Optional[float] = None
     start_date: Optional[str] = None
@@ -368,13 +405,34 @@ class PretrainRequest(BaseModel):
     pool_name: Optional[str] = None
     profit_threshold: Optional[float] = 0.01
     auto_profit_quantile: float = 0.7
-    profit_lookahead: int = 5
+    profit_lookahead: Optional[int] = None
+    high_vol_atr_pct_min: Optional[float] = None
+    use_atr_label: bool = False
+    atr_period: int = 14
+    atr_mult: float = 1.0
+    trade_cost: float = 0.0
+    topk_frac: float = 0.2
+    portfolio_min_score: float = 0.6
+    portfolio_top_n: int = 2
+
+def _default_profit_lookahead_for_frequency(freq: str) -> int:
+    f = str(freq or "").strip().lower()
+    if f == "30m":
+        return 3
+    return 5
 
 class UpdatePretrainedModelNameRequest(BaseModel):
     name: Optional[str] = None
 
 @app.post("/api/pretrain_jobs")
 async def create_pretrain_job(req: PretrainRequest):
+    profit_lookahead = req.profit_lookahead
+    try:
+        profit_lookahead = int(float(profit_lookahead)) if profit_lookahead not in ["", "null", "None", None] else None
+    except Exception:
+        profit_lookahead = None
+    if profit_lookahead is None or profit_lookahead <= 0:
+        profit_lookahead = _default_profit_lookahead_for_frequency(req.frequency)
     params = {
         "codes": sorted([normalize_code(str(c).strip()) for c in (req.codes or []) if str(c).strip()]),
         "data_length_mode": req.data_length_mode,
@@ -383,7 +441,11 @@ async def create_pretrain_job(req: PretrainRequest):
         "pool_name": req.pool_name,
         "profit_threshold": req.profit_threshold,
         "auto_profit_quantile": req.auto_profit_quantile,
-        "profit_lookahead": req.profit_lookahead,
+        "profit_lookahead": profit_lookahead,
+        "high_vol_atr_pct_min": req.high_vol_atr_pct_min,
+        "use_atr_label": bool(req.use_atr_label),
+        "atr_period": int(req.atr_period),
+        "atr_mult": float(req.atr_mult),
     }
     # Removed database duplicate check to allow re-training with new unique keys
     # if not req.force_refresh and storage.is_duplicate_pretrain(req.model, req.frequency, req.data_src, params):
@@ -447,7 +509,7 @@ async def create_pretrain_job(req: PretrainRequest):
             data_src_type = src_map.get(req.data_src, DATA_SRC.BAO_STOCK)
 
             begin_time = _calc_pretrain_begin_time(req, level)
-            raw_autype = str(getattr(req, "autype", "hfq") or "hfq").strip().lower()
+            raw_autype = str(getattr(req, "autype", "qfq") or "qfq").strip().lower()
             autype_map = {
                 "qfq": AUTYPE.QFQ,
                 "hfq": AUTYPE.HFQ,
@@ -456,6 +518,13 @@ async def create_pretrain_job(req: PretrainRequest):
             autype = autype_map.get(raw_autype)
             if autype is None:
                 autype = AUTYPE.HFQ
+            profit_lookahead = req.profit_lookahead
+            try:
+                profit_lookahead = int(float(profit_lookahead)) if profit_lookahead not in ["", "null", "None", None] else None
+            except Exception:
+                profit_lookahead = None
+            if profit_lookahead is None or profit_lookahead <= 0:
+                profit_lookahead = _default_profit_lookahead_for_frequency(req.frequency)
 
             def progress_cb(p):
                 if not isinstance(p, dict):
@@ -487,8 +556,12 @@ async def create_pretrain_job(req: PretrainRequest):
                 pool_name=req.pool_name,
                 profit_threshold=req.profit_threshold,
                 auto_profit_quantile=req.auto_profit_quantile,
-                profit_lookahead=req.profit_lookahead,
+                profit_lookahead=profit_lookahead,
                 autype=autype,
+                high_vol_atr_pct_min=req.high_vol_atr_pct_min,
+                use_atr_label=bool(req.use_atr_label),
+                atr_period=int(req.atr_period),
+                atr_mult=float(req.atr_mult),
             )
             if not path:
                 detail = None
@@ -848,6 +921,93 @@ async def get_history_detail(result_id: int):
         raise HTTPException(status_code=404, detail="Result not found")
     return result
 
+class CreatePortfolioRequest(BaseModel):
+    name: str
+    description: str = ""
+
+class AddPositionRequest(BaseModel):
+    code: str
+    volume: int
+    price: float
+    name: str = ""
+
+@app.get("/api/portfolios")
+async def list_portfolios():
+    return get_portfolio_service().list_portfolios()
+
+@app.post("/api/portfolios")
+async def create_portfolio(req: CreatePortfolioRequest):
+    return get_portfolio_service().create_portfolio(req.name, req.description)
+
+@app.delete("/api/portfolios/{portfolio_id}")
+async def delete_portfolio(portfolio_id: int):
+    get_portfolio_service().delete_portfolio(portfolio_id)
+    return {"status": "success"}
+
+@app.get("/api/portfolios/{portfolio_id}")
+async def get_portfolio_detail(portfolio_id: int):
+    p = get_portfolio_service().get_portfolio_detail(portfolio_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Portfolio not found")
+    return p
+
+@app.post("/api/portfolios/{portfolio_id}/positions")
+async def add_position(portfolio_id: int, req: AddPositionRequest):
+    get_portfolio_service().add_position(portfolio_id, req.code, req.volume, req.price, req.name)
+    return {"status": "success"}
+
+class VectorBacktestRequest(BaseModel):
+    pool_id: str = "chinext50"
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    model_key: Optional[str] = None
+
+@app.post("/api/backtest/vector")
+async def run_vector_backtest(req: VectorBacktestRequest):
+    # Default to last 3 months if not provided
+    import datetime
+    end = req.end_date
+    if not end:
+        end = datetime.datetime.now().strftime("%Y-%m-%d")
+    start = req.start_date
+    if not start:
+        start = (datetime.datetime.now() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
+    
+    # Run async? It might take time.
+    # For simplicity, run in thread pool or background task.
+    # But user wants results.
+    # If it takes too long, we should return a job ID.
+    # But for now, let's try synchronous with increased timeout or background task that stores result?
+    # Given the user wants a "Simulated Profit and Loss page", maybe we should store it.
+    
+    # Let's run it and return results directly if it's fast enough, 
+    # or better, start a background task and return a job ID (reusing pretrain_jobs logic or new one).
+    # Since "Simple Vector Backtest" is requested, maybe I can just run it.
+    # But 50 stocks * 3 months is manageable.
+    
+    # We can use the existing StrategyRunner structure but this is a specific logic.
+    # I'll instantiate VectorBacktester.
+    
+    tester = VectorBacktester()
+    
+    # Determine pool
+    pool_codes = []
+    if req.pool_id == "chinext50":
+        from backend.vector_backtest import get_chinext50_stocks
+        pool_codes = get_chinext50_stocks()
+    else:
+        # TODO: Support other pools
+        pass
+    
+    if not pool_codes:
+         # Fallback for testing
+         pool_codes = ["sz.300059", "sz.300750"] # Sample ChiNext stocks
+         
+    # Run
+    # Warning: This is blocking. In production, use background task.
+    result = tester.run(pool_codes, start, end, req.model_key)
+    return result
+
 @app.post("/api/analyze")
 async def analyze_stock(req: AnalyzeRequest):
     print(f"Received analyze request: code={req.code}, freq={req.frequency}, model={req.model}, force_refresh={req.force_refresh}, data_length_years={req.data_length_years}")
@@ -874,7 +1034,7 @@ async def analyze_stock(req: AnalyzeRequest):
             "clickhouse": DATA_SRC.CLICK_HOUSE,
         }
         data_src = src_map.get(req.data_src, DATA_SRC.BAO_STOCK)
-        raw_autype = str(getattr(req, "autype", "hfq") or "hfq").strip().lower()
+        raw_autype = str(getattr(req, "autype", "qfq") or "qfq").strip().lower()
         autype_map = {
             "qfq": AUTYPE.QFQ,
             "hfq": AUTYPE.HFQ,
@@ -1018,19 +1178,24 @@ async def analyze_stock(req: AnalyzeRequest):
         latest_data_time = str(kl_list[-1].time)
         
         # 4. Run Analysis with preloaded data
-        chan, bsp_dict, last_snapshot, config = get_chan_data(
-            req.code, 
-            req.trigger_step, 
-            req.bi_strict, 
-            level, 
-            data_src, 
-            preloaded_data=kl_list, 
-            do_predict=req.do_predict,
-            begin_time=begin_time,
-            end_time=end_time,
-            enable_rolling_lookback=req.enable_rolling_lookback,
-            autype=autype,
-        )
+        try:
+            chan, bsp_dict, last_snapshot, config = get_chan_data(
+                req.code, 
+                req.trigger_step, 
+                req.bi_strict, 
+                level, 
+                data_src, 
+                preloaded_data=kl_list, 
+                do_predict=req.do_predict,
+                begin_time=begin_time,
+                end_time=end_time,
+                enable_rolling_lookback=req.enable_rolling_lookback,
+                autype=autype,
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Error loading CChan: {e}")
         
         if not chan or not last_snapshot:
             raise HTTPException(status_code=404, detail=f"Data not found for {req.code}")
@@ -1318,7 +1483,7 @@ async def validate_codes(req: ValidateRequest):
         }
         data_src = src_map.get(req.data_src, DATA_SRC.BAO_STOCK)
 
-        raw_autype = str(getattr(req, "autype", "hfq") or "hfq").strip().lower()
+        raw_autype = str(getattr(req, "autype", "qfq") or "qfq").strip().lower()
         autype_map = {
             "qfq": AUTYPE.QFQ,
             "hfq": AUTYPE.HFQ,
@@ -1437,7 +1602,13 @@ async def validate_codes(req: ValidateRequest):
                     "feature_importance",
                     "warning",
                 ]
-                slim = {k: accuracy_info.get(k) for k in keep if isinstance(accuracy_info, dict) and k in accuracy_info}
+                if isinstance(accuracy_info, dict):
+                    slim = _shrink_accuracy_result(accuracy_info)
+                    for k in ("feature_importance_full", "feature_importance"):
+                        if k in accuracy_info:
+                            slim[k] = accuracy_info.get(k)
+                else:
+                    slim = {}
                 item["status"] = "success"
                 item["accuracy"] = slim
             except Exception as e:
@@ -1489,7 +1660,7 @@ async def pretrain_model(req: PretrainRequest):
         }
         data_src_type = src_map.get(req.data_src, DATA_SRC.BAO_STOCK)
 
-        raw_autype = str(getattr(req, "autype", "hfq") or "hfq").strip().lower()
+        raw_autype = str(getattr(req, "autype", "qfq") or "qfq").strip().lower()
         autype_map = {
             "qfq": AUTYPE.QFQ,
             "hfq": AUTYPE.HFQ,
@@ -1498,6 +1669,13 @@ async def pretrain_model(req: PretrainRequest):
         autype = autype_map.get(raw_autype)
         if autype is None:
             autype = AUTYPE.HFQ
+        profit_lookahead = req.profit_lookahead
+        try:
+            profit_lookahead = int(float(profit_lookahead)) if profit_lookahead not in ["", "null", "None", None] else None
+        except Exception:
+            profit_lookahead = None
+        if profit_lookahead is None or profit_lookahead <= 0:
+            profit_lookahead = _default_profit_lookahead_for_frequency(req.frequency)
 
         import datetime
         days = 365
@@ -1535,8 +1713,16 @@ async def pretrain_model(req: PretrainRequest):
             calibrate_method="none",
             profit_threshold=req.profit_threshold,
             auto_profit_quantile=req.auto_profit_quantile,
-            profit_lookahead=req.profit_lookahead,
+            profit_lookahead=profit_lookahead,
             autype=autype,
+            high_vol_atr_pct_min=req.high_vol_atr_pct_min,
+            use_atr_label=bool(req.use_atr_label),
+            atr_period=int(req.atr_period),
+            atr_mult=float(req.atr_mult),
+            trade_cost=float(req.trade_cost or 0.0),
+            topk_frac=float(req.topk_frac or 0.2),
+            portfolio_min_score=float(req.portfolio_min_score or 0.6),
+            portfolio_top_n=int(req.portfolio_top_n or 2),
         )
         if not path:
             raise HTTPException(status_code=400, detail=result.get("detail", "pretrain failed"))
@@ -1599,6 +1785,12 @@ class StrategyRequest(BaseModel):
     min_recent_accuracy: Optional[float] = None
     recent_accuracy_years: float = 1.0
     min_signal_score: Optional[float] = None
+    min_bsp_count: int = 0
+    min_test_count: int = 0
+    high_vol_atr_pct_min: Optional[float] = None
+    use_atr_label: bool = False
+    atr_period: int = 14
+    atr_mult: float = 1.0
     profit_threshold: Optional[float] = 0.01
     auto_profit_quantile: float = 0.7
     profit_lookahead: int = 5
@@ -1609,6 +1801,10 @@ class StrategyRequest(BaseModel):
     signal_lookback: int = 5
     signal_direction: str = "buy"  # buy, sell, both
     enable_rolling_lookback: bool = True # Enable/Disable long-term context features (250-bar lookback)
+    amp_whitelist_days: int = 0
+    amp_whitelist_top_frac: float = 0.3
+    portfolio_top_n: int = 2
+    holding_period: int = 3
 
 class StrategyRunsBatchDeleteRequest(BaseModel):
     run_ids: List[int] = []
@@ -1696,6 +1892,41 @@ async def batch_delete_strategy_runs(req: StrategyRunsBatchDeleteRequest):
     res = storage.batch_delete_strategy_runs(cancellable)
     merged_failed = (res.get("failed") or []) + failed
     return {"deleted": res.get("deleted") or [], "failed": merged_failed}
+
+@app.post("/api/strategy/runs/{run_id}/cancel")
+async def cancel_strategy_run(run_id: int):
+    rid = int(run_id)
+    session = storage.Session()
+    try:
+        run = session.query(StrategyRun).filter(StrategyRun.id == rid).first()
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        st = str(run.status or "")
+        if st in ["completed", "failed", "canceled"]:
+            return {"status": "success", "run_id": rid, "already_terminal": True}
+        if st in ["running"]:
+            raise HTTPException(status_code=409, detail="run is running")
+
+        removed_from_queue = False
+        with _task_queue_cv:
+            cur = _task_current
+            if cur and cur.get("kind") == "strategy_run" and str(cur.get("ref_id")) == str(rid):
+                raise HTTPException(status_code=409, detail="run is running")
+            kept = []
+            for t in _task_queue:
+                if t.get("kind") == "strategy_run" and str(t.get("ref_id")) == str(rid):
+                    removed_from_queue = True
+                    continue
+                kept.append(t)
+            _task_queue[:] = kept
+
+        run.status = "canceled"
+        run.progress = 0
+        run.completed_at = datetime.datetime.utcnow()
+        session.commit()
+        return {"status": "success", "run_id": rid, "removed_from_queue": removed_from_queue}
+    finally:
+        session.close()
 
 @app.delete("/api/strategy/runs/{run_id}")
 async def delete_strategy_run(run_id: int):

@@ -68,7 +68,7 @@
           @analyze="analyze(true)"
           @runStrategy="strategyPanelRef.runStrategy()"
           @runPretrain="pretrainPanelRef.runPretrain()"
-          @refresh="analyze(false, false, false)"
+          @refresh="analyze(false, false, true)"
             @toggle="handleManualClose"
             @refreshPretrained="fetchIntradayPretrainedModels"
             @searchHistory="handleSearchHistory"
@@ -148,7 +148,7 @@
             @analyze="analyze(true); mobileSidebarCollapsed = true"
             @runStrategy="strategyPanelRef.runStrategy()"
             @runPretrain="pretrainPanelRef.runPretrain()"
-            @refresh="analyze(false, false, false); mobileSidebarCollapsed = true"
+            @refresh="analyze(false, false, true); mobileSidebarCollapsed = true"
             @toggle="mobileSidebarCollapsed = !mobileSidebarCollapsed"
             @refreshPretrained="fetchIntradayPretrainedModels"
           />
@@ -282,7 +282,15 @@
                   :form="strategyForm"
                   :chanConfig="strategyChanConfig"
                   @view-stock="handleViewStockFromStrategy" 
+                  @add-to-portfolio="handleAddToPortfolio"
                 />
+             </div>
+          </div>
+
+          <!-- Portfolio Tab -->
+          <div v-show="activeTab === 'portfolio'" class="h-full w-full flex flex-col lg:overflow-hidden">
+             <div class="lg:h-full lg:overflow-hidden p-2 box-border bg-white dark:bg-gray-900 flex-1">
+                <PortfolioPanel ref="portfolioPanelRef" />
              </div>
           </div>
 
@@ -308,7 +316,7 @@
 <script setup>
 import { ref, watch, onMounted, onBeforeUnmount, nextTick, computed } from 'vue'
 import axios from 'axios'
-import { MemoryJournal, MemoryChartBar, MemoryBook, MemoryClock, MemoryChevronRight, MemoryFilter } from '@pictogrammers/memory'
+import { MemoryJournal, MemoryChartBar, MemoryBook, MemoryClock, MemoryChevronRight, MemoryFilter, MemoryBriefcase } from '@pictogrammers/memory'
 import { useI18n } from './composables/useI18n'
 
 const { currentLang: lang, t, formatTime } = useI18n()
@@ -319,6 +327,7 @@ const tabs = computed(() => [
   { name: 'intraday', label: t('app.intradayAnalysis'), icon: MemoryClock },
   { name: 'pretrain', label: t('app.pretrain'), icon: MemoryChartBar },
   { name: 'strategy', label: t('app.strategy'), icon: MemoryFilter },
+  { name: 'portfolio', label: 'Portfolio', icon: MemoryBriefcase },
   { name: 'history', label: t('app.history'), icon: MemoryBook },
   { name: 'help', label: t('app.guide'), icon: MemoryJournal }
 ])
@@ -348,7 +357,7 @@ const updateMobileTabsHint = () => {
 const handleManualClose = () => {
   showDesktopSidebar.value = false
   // If we are on a "Show" page, mark as manually hidden
-  if (!['pretrain', 'history', 'help'].includes(activeTab.value)) {
+  if (!['pretrain', 'history', 'help', 'portfolio'].includes(activeTab.value)) {
     userManuallyHidden.value = true
   }
 }
@@ -362,7 +371,7 @@ const triggerStep = ref(true)
 const biStrict = ref(false)
 const enableRollingLookback = ref(true)
 const dailyBlendModels = ref(false)
-const autype = ref('hfq')
+const autype = ref('qfq')
 const loading = ref(false)
 const hasRunAnalysis = ref(false)
 const hasRunIntraday = ref(false)
@@ -381,6 +390,7 @@ const chartRef = ref(null)
 const pretrainPanelRef = ref(null)
 const strategyPanelRef = ref(null)
 const historyPanelRef = ref(null)
+const portfolioPanelRef = ref(null)
 const strategyForm = ref({
   strategy_name: `Strategy-${new Date().getTime()}`,
   pool_id: '',
@@ -391,12 +401,23 @@ const strategyForm = ref({
   min_signal_score: null,
   min_bsp_count: 0,
   min_test_count: 0,
+  high_vol_atr_pct_min: null,
+  amp_whitelist_days: 0,
+  amp_whitelist_top_frac: 0.3,
+  use_atr_label: false,
+  atr_period: 14,
+  atr_mult: 1.0,
   profit_threshold: 0.01,
   auto_profit_quantile: 0.7,
   profit_lookahead: 5,
+  start_date: null,
+  end_date: null,
+  force_refresh: false,
   frequency: '1d',
   data_length_years: 1.0,
-  enable_rolling_lookback: true
+  enable_rolling_lookback: true,
+  portfolio_top_n: 2,
+  holding_period: 3
 })
 const strategyChanConfig = ref({
   bi_strict: true,
@@ -462,11 +483,14 @@ if (typeof window !== 'undefined') {
   const savedAutype = localStorage.getItem('lastAutype')
   if (savedAutype) {
     const raw = String(savedAutype).trim().toLowerCase()
-    const nextAutype = raw
-    autype.value = ['hfq', 'qfq', 'none'].includes(nextAutype) ? nextAutype : 'hfq'
-    if (autype.value !== raw) {
-      localStorage.setItem('lastAutype', autype.value)
+    const migrated = localStorage.getItem('autypeMigrated') === '1'
+    let nextAutype = ['hfq', 'qfq', 'none'].includes(raw) ? raw : 'qfq'
+    if (!migrated && raw === 'hfq') {
+      nextAutype = 'qfq'
+      localStorage.setItem('autypeMigrated', '1')
     }
+    autype.value = nextAutype
+    if (nextAutype !== raw) localStorage.setItem('lastAutype', nextAutype)
   }
 }
 
@@ -827,6 +851,26 @@ const getPretrainedAvailability = ({ isIntraday }) => {
         })
       }
 
+      const startDateRaw = strategyForm.value.start_date
+      const endDateRaw = strategyForm.value.end_date
+      const startDate = String(startDateRaw || '').trim() || null
+      const endDate = String(endDateRaw || '').trim() || null
+
+      const profitThresholdRaw = strategyForm.value.profit_threshold
+      let profitThreshold = null
+      if (profitThresholdRaw !== '' && profitThresholdRaw !== undefined && profitThresholdRaw !== null) {
+        const v = Number(profitThresholdRaw)
+        profitThreshold = Number.isFinite(v) ? Math.max(0, v) : null
+      }
+
+      const autoQRaw = Number(strategyForm.value.auto_profit_quantile)
+      const autoQ = Number.isFinite(autoQRaw) ? autoQRaw : 0.7
+
+      const lookaheadRaw = Number(strategyForm.value.profit_lookahead)
+      const lookahead = Number.isFinite(lookaheadRaw) ? Math.max(0, Math.floor(lookaheadRaw)) : 5
+
+      const shouldForceRefresh = !!forceRefresh || !!strategyForm.value.force_refresh
+
       const params = {
         code: code.value,
         frequency: frequency,
@@ -835,12 +879,14 @@ const getPretrainedAvailability = ({ isIntraday }) => {
         trigger_step: triggerStep.value,
         bi_strict: biStrict.value,
         enable_rolling_lookback: enableRollingLookback.value,
-        profit_threshold: strategyForm.value.profit_threshold,
-        auto_profit_quantile: strategyForm.value.auto_profit_quantile,
-        profit_lookahead: strategyForm.value.profit_lookahead,
+        start_date: startDate,
+        end_date: endDate,
+        profit_threshold: profitThreshold,
+        auto_profit_quantile: autoQ,
+        profit_lookahead: lookahead,
         data_src: dataSrc.value,
         model: model.value,
-        force_refresh: forceRefresh,
+        force_refresh: shouldForceRefresh,
         data_length_years: dataLengthYears.value,
         use_pretrained: isIntraday
             ? (intradayBlendModels.value ? (intradayPretrainedChoice.value === 'none' ? false : true) : false)
@@ -1022,6 +1068,13 @@ const handleViewStockFromStrategy = (stockCode) => {
   code.value = stockCode
   activeTab.value = 'analysis'
   analyze(true)
+}
+
+const handleAddToPortfolio = ({ code, name }) => {
+  activeTab.value = 'portfolio'
+  nextTick(() => {
+    portfolioPanelRef.value?.openAddPosition(code, name)
+  })
 }
 </script>
 

@@ -1,6 +1,6 @@
 from typing import List, Dict, Any
 from Plot.PlotMeta import CChanPlotMeta, CBi_meta, CSeg_meta, CZS_meta, CBS_Point_meta, Cklc_meta
-from Common.CEnum import KL_TYPE
+from Common.CEnum import KL_TYPE, DATA_FIELD
 
 def serialize_chan_data(meta: CChanPlotMeta, lv: KL_TYPE) -> Dict[str, Any]:
     """
@@ -15,6 +15,7 @@ def serialize_chan_data(meta: CChanPlotMeta, lv: KL_TYPE) -> Dict[str, Any]:
     klines = []
     dates = []
     volumes = []
+    adj_factors = []
     
     # klu_iter yields CKLine_Unit. We need to handle time.
     for klu in meta.klu_iter():
@@ -22,7 +23,19 @@ def serialize_chan_data(meta: CChanPlotMeta, lv: KL_TYPE) -> Dict[str, Any]:
         dates.append(date_str)
         # open, close, low, high
         klines.append([float(klu.open), float(klu.close), float(klu.low), float(klu.high)])
-        volumes.append(float(klu.qfq_volume) if hasattr(klu, 'qfq_volume') else 0.0)
+        
+        # Get volume from trade_info
+        vol = 0.0
+        if hasattr(klu, 'trade_info') and klu.trade_info:
+            vol = klu.trade_info.metric.get(DATA_FIELD.FIELD_VOLUME, 0.0)
+        volumes.append(float(vol) if vol is not None else 0.0)
+
+        af = getattr(klu, "adj_factor", 1.0)
+        try:
+            af = float(af)
+        except Exception:
+            af = 1.0
+        adj_factors.append(af)
         
     # Bi
     bi_list = []
@@ -94,6 +107,7 @@ def serialize_chan_data(meta: CChanPlotMeta, lv: KL_TYPE) -> Dict[str, Any]:
         "dates": dates,
         "klines": klines, # [open, close, low, high]
         "volumes": volumes,
+        "adj_factors": adj_factors,
         "bi": bi_list,
         "seg": seg_list,
         "zs": zs_list,

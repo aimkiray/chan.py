@@ -203,7 +203,32 @@ onMounted(() => {
       })
   }
 
-  // 5. Means
+  // 5. Volume Series
+  // Calculate median volume for outlier detection
+  const sortedVols = [...volumes].sort((a, b) => a - b)
+  const medianVol = sortedVols[Math.floor(sortedVols.length / 2)] || 0
+  // Cap at 20x median to prevent extreme outliers (e.g. bad data or extreme spikes) from squashing the chart
+  const volCap = medianVol > 0 ? medianVol * 20 : Number.MAX_VALUE
+
+  // Volume color: Red (up) or Green (down) based on close >= open
+  const volumeBars = []
+  klines.forEach((item, idx) => {
+      const open = item[0]
+      const close = item[1]
+      let vol = volumes[idx]
+      
+      // Apply cap for rendering (tooltip still uses raw volumes[idx])
+      if (vol > volCap) {
+          vol = volCap
+      }
+
+      volumeBars.push({
+          value: vol,
+          itemStyle: { color: close >= open ? '#ef4444' : '#10b981' }
+      })
+  })
+
+  // 6. Means
   const series = [
       {
           name: 'K-Line',
@@ -215,6 +240,16 @@ onMounted(() => {
               borderColor: '#ef4444',
               borderColor0: '#10b981'
           }
+      },
+      {
+          name: 'Volume',
+          type: 'bar',
+          xAxisIndex: 1,
+          yAxisIndex: 1,
+          large: false,
+          progressive: 0,
+          progressiveThreshold: 0,
+          data: volumeBars
       },
       {
           name: 'Bi',
@@ -273,7 +308,18 @@ onMounted(() => {
       }
   }
 
+  const formatBigNumber = (v) => {
+      const n = Number(v)
+      if (!Number.isFinite(n)) return ''
+      if (n >= 100000000) return (n / 100000000).toFixed(2) + '亿'
+      if (n >= 10000) return (n / 10000).toFixed(2) + '万'
+      return n.toFixed(2)
+  }
+
   const option = {
+      axisPointer: {
+        link: { xAxisIndex: 'all' }
+      },
       tooltip: {
           trigger: 'axis',
           confine: true,
@@ -303,11 +349,20 @@ onMounted(() => {
             let close = null
             let low = null
             let high = null
-            if (Array.isArray(k?.data) && k.data.length >= 4) {
-              open = k.data[0]
-              close = k.data[1]
-              low = k.data[2]
-              high = k.data[3]
+            
+            if (Array.isArray(k?.data)) {
+                if (k.data.length === 4) {
+                  open = k.data[0]
+                  close = k.data[1]
+                  low = k.data[2]
+                  high = k.data[3]
+                } else if (k.data.length > 4) {
+                  // ECharts sometimes includes the axis value at index 0
+                  open = k.data[1]
+                  close = k.data[2]
+                  low = k.data[3]
+                  high = k.data[4]
+                }
             }
 
             let pctText = '--'
@@ -324,24 +379,74 @@ onMounted(() => {
             const rows = []
             rows.push(`<div class="font-semibold">${dateLabel}</div>`)
             rows.push(`<div class="text-xs opacity-80">${t('chart.candleTooltip.changePct')}: ${pctText}</div>`)
-            rows.push(`<div class="mt-1">${k?.marker || ''}${t('chart.candleTooltip.open')}: ${fmt2(open)} ${t('chart.candleTooltip.high')}: ${fmt2(high)}<br/>${t('chart.candleTooltip.low')}: ${fmt2(low)} ${t('chart.candleTooltip.close')}: ${fmt2(close)}</div>`)
+            
+            // Collect OHLC and MA data first
+            const ohlcItems = [
+                { label: t('chart.candleTooltip.open'), val: open, marker: k?.marker || '' },
+                { label: t('chart.candleTooltip.high'), val: high, marker: '' },
+                { label: t('chart.candleTooltip.low'), val: low, marker: '' },
+                { label: t('chart.candleTooltip.close'), val: close, marker: '' }
+            ]
 
             const maRows = (list || [])
               .filter((p) => typeof p?.seriesName === 'string' && p.seriesName.startsWith('MA'))
               .slice()
               .sort((a, b) => Number(String(a.seriesName).slice(2)) - Number(String(b.seriesName).slice(2)))
 
-            if (maRows.length) {
-              const maParts = maRows.map((p) => `${p.marker || ''}${p.seriesName}: ${fmt2(p.data)}`)
-              rows.push(`<div class="mt-1">${maParts.join('<br/>')}</div>`)
+            const maItems = maRows.map((p) => ({
+                label: p.seriesName,
+                val: p.data,
+                marker: p.marker || ''
+            }))
+
+            // Add Volume
+            // Prefer using raw data to avoid summing up stacked series or getting 0 from the wrong stack
+            let volVal = undefined
+            if (idx >= 0 && volumes?.[idx] !== undefined) {
+               volVal = volumes[idx]
+            } else {
+               // Fallback: sum up all 'Volume' series values (since we split them into Up/Down, one is 0 and one is value)
+               const volParams = list.filter((p) => p?.seriesName === 'Volume')
+               if (volParams.length > 0) {
+                   volVal = volParams.reduce((sum, p) => sum + (Number(p.value) || 0), 0)
+               }
             }
+            
+            // let volMarker = vol?.marker || '' // Marker is tricky with 2 series, just omit or use generic
+            let volMarker = '<span style="display:inline-block;margin-right:4px;border-radius:10px;width:10px;height:10px;background-color:#5470c6;"></span>' // Default blue-ish or just omit
+            // Actually, we can try to find the active series marker
+            const activeVol = list.find(p => p?.seriesName === 'Volume' && p?.value > 0)
+            if (activeVol) volMarker = activeVol.marker
+
+            if (volVal !== undefined && volVal !== null) {
+                maItems.push({
+                    label: t('chart.tooltip.volume') || 'Volume',
+                    val: volVal,
+                    displayVal: formatBigNumber(volVal),
+                    marker: volMarker
+                })
+            }
+
+            const allItems = [...ohlcItems, ...maItems]
+
+            let gridHtml = `<div class="mt-1" style="display:grid;grid-template-columns:14px auto auto;column-gap:8px;row-gap:2px;align-items:center;">`
+            
+            allItems.forEach(item => {
+                const display = item.displayVal || fmt2(item.val)
+                gridHtml += `<div>${item.marker}</div>` + 
+                            `<div style="text-align:left;">${item.label}</div>` + 
+                            `<div style="text-align:right;font-family:monospace;font-weight:bold;">${display}</div>`
+            })
+            
+            gridHtml += `</div>`
+            rows.push(gridHtml)
 
             return rows.join('')
           }
       },
       legend: {
-          data: ['K-Line', 'Bi', 'Seg', 'Center', ...Object.keys(data.means || {}).map(k => `MA${k}`)],
-          bottom: 20,
+          data: ['K-Line', 'Volume', 'Bi', 'Seg', 'Center', ...Object.keys(data.means || {}).map(k => `MA${k}`)],
+          bottom: 5,
           left: 'center',
           padding: 5,
           itemGap: 10,
@@ -352,6 +457,7 @@ onMounted(() => {
                 if (typeof name !== 'string') return name
                 const descriptions = {
                     'K-Line': t('chart.tooltip.kline'),
+                    'Volume': t('chart.tooltip.volume') || 'Volume',
                     'Bi': t('chart.tooltip.bi'),
                     'Seg': t('chart.tooltip.seg'),
                     'Center': t('chart.tooltip.center')
@@ -364,26 +470,53 @@ onMounted(() => {
             }
           }
       },
-      grid: {
-        left: 50,
-        right: 50,
-        bottom: 120,
-        top: 30,
-        containLabel: false
-    },
-      xAxis: {
+      grid: [
+        {
+          left: 50,
+          right: 50,
+          top: 30,
+          height: '65%',
+          containLabel: false
+        },
+        {
+          left: 50,
+          right: 50,
+          top: '77%',
+          height: '5%',
+          containLabel: false
+        }
+      ],
+      xAxis: [
+        {
           type: 'category',
           data: dates,
           scale: true,
-          boundaryGap: false,
+          boundaryGap: true,
           axisLine: { onZero: false, lineStyle: { color: '#888' } },
+          axisLabel: { show: false }, // Hide labels for top chart
+          splitLine: { show: false },
+          min: 'dataMin',
+          max: 'dataMax',
+          gridIndex: 0
+        },
+        {
+          type: 'category',
+          data: dates,
+          scale: true,
+          boundaryGap: true,
+          axisLine: { onZero: false, lineStyle: { color: '#888' } },
+          axisTick: { alignWithLabel: true },
           axisLabel: { color: '#666' },
           splitLine: { show: false },
           min: 'dataMin',
-          max: 'dataMax'
-      },
-      yAxis: {
+          max: 'dataMax',
+          gridIndex: 1
+        }
+      ],
+      yAxis: [
+        {
           scale: true,
+          gridIndex: 0,
           axisLine: { lineStyle: { color: '#888' } },
           axisLabel: {
             color: '#666',
@@ -392,23 +525,33 @@ onMounted(() => {
               return Number.isFinite(n) ? n.toFixed(2) : String(v)
             }
           },
-          splitArea: {
-              show: true
-          }
-      },
+          splitArea: { show: true }
+        },
+        {
+          scale: true,
+          gridIndex: 1,
+          axisLine: { lineStyle: { color: '#888' } },
+          axisLabel: { show: false },
+          axisTick: { show: false },
+          splitLine: { show: false }
+        }
+      ],
       dataZoom: [
           {
               type: 'inside',
+              xAxisIndex: [0, 1],
               start: startPercent,
               end: 100
           },
           {
               show: true,
+              xAxisIndex: [0, 1],
               type: 'slider',
               bottom: 60,
               height: 20,
-              left: 'center',
-              width: '80%',
+              left: 50,
+              right: 50,
+              showDetail: false,
               start: startPercent,
               end: 100
           }

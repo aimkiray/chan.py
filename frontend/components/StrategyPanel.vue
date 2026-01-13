@@ -116,6 +116,17 @@
                     {{ t('strategy.viewDetail') }}
                   </UButton>
                   <UButton
+                    v-if="isRunCancellable(row)"
+                    size="xs"
+                    variant="link"
+                    color="gray"
+                    :loading="cancelingRunId === row.id"
+                    @click="cancelRun(row)"
+                  >
+                    {{ t('app.cancel') }}
+                  </UButton>
+                  <UButton
+                    v-else
                     size="xs"
                     variant="link"
                     color="red"
@@ -216,6 +227,11 @@
                   <span v-if="row.signal_score === null || row.signal_score === undefined || row.signal_score === ''">-</span>
                   <span v-else :class="row.signal_score >= 0.8 ? 'text-green-600 dark:text-green-400 font-bold' : ''">{{ (row.signal_score * 100).toFixed(1) }}%</span>
                 </template>
+                <template #actions-data="{ row }">
+                  <UButton size="2xs" color="gray" variant="ghost" icon="i-heroicons-plus" @click="$emit('add-to-portfolio', { code: row.code, name: row.name })">
+                    Add
+                  </UButton>
+                </template>
               </UTable>
             </div>
 
@@ -274,7 +290,13 @@
                   {{ t('strategy.noResults') }}
                 </div>
                 <div v-else>
-                  {{ selectedRunDetail.status === 'pending' || selectedRunDetail.status === 'queued' ? t('strategy.waiting') : t('strategy.running') }}
+                  {{
+                    selectedRunDetail.status === 'pending' || selectedRunDetail.status === 'queued'
+                      ? t('strategy.waiting')
+                      : selectedRunDetail.status === 'canceled'
+                        ? t('strategy.canceled')
+                        : t('strategy.running')
+                  }}
                 </div>
               </div>
           </div>
@@ -299,7 +321,8 @@ const columns = [
   { key: 'recent_accuracy', label: t('strategy.recentAccuracy') },
   { key: 'signal_score', label: t('strategy.signalScore') },
   { key: 'signal_type', label: 'Signal' },
-  { key: 'latest_date', label: t('analysis.signalDate') }
+  { key: 'latest_date', label: t('analysis.signalDate') },
+  { key: 'actions', label: '' }
 ]
 
 const getStatusLabel = (status) => {
@@ -308,6 +331,7 @@ const getStatusLabel = (status) => {
   if (st === 'running') return t('strategy.runningShort')
   if (st === 'completed') return t('strategy.completed')
   if (st === 'failed') return t('strategy.failed')
+  if (st === 'canceled') return t('strategy.canceled')
   return st || '-'
 }
 
@@ -318,6 +342,7 @@ const getStatusColor = (status) => {
     case 'running': return 'blue'
     case 'pending': return 'orange'
     case 'queued': return 'orange'
+    case 'canceled': return 'gray'
     default: return 'gray'
   }
 }
@@ -350,6 +375,7 @@ const detailPageInput = ref('')
 const selectedRunIds = ref([])
 const batchDeleting = ref(false)
 const deletingRunId = ref(null)
+const cancelingRunId = ref(null)
 let pollTimer = null
 
 // Use props in runStrategy
@@ -412,9 +438,31 @@ const runStrategy = async () => {
     const zsAlgo = String(props.chanConfig.zs_algo || '').trim()
     if (zsAlgo) chanConfig.zs_algo = zsAlgo
 
+    const f = props.form || {}
     const params = {
-      ...props.form,
       strategy_name: strategyName,
+      scope: f.scope,
+      pool_id: f.pool_id,
+      model: f.model,
+      autype: f.autype,
+      min_accuracy: f.min_accuracy,
+      min_recent_accuracy: f.min_recent_accuracy,
+      recent_accuracy_years: f.recent_accuracy_years,
+      min_signal_score: f.min_signal_score,
+      min_bsp_count: f.min_bsp_count,
+      min_test_count: f.min_test_count,
+      high_vol_atr_pct_min: f.high_vol_atr_pct_min,
+      amp_whitelist_days: f.amp_whitelist_days,
+      amp_whitelist_top_frac: f.amp_whitelist_top_frac,
+      use_atr_label: f.use_atr_label,
+      atr_period: f.atr_period,
+      atr_mult: f.atr_mult,
+      profit_threshold: f.profit_threshold,
+      auto_profit_quantile: f.auto_profit_quantile,
+      profit_lookahead: f.profit_lookahead,
+      frequency: f.frequency,
+      data_length_years: f.data_length_years,
+      enable_rolling_lookback: f.enable_rolling_lookback,
       chan_config: chanConfig,
       require_signal: props.chanConfig.require_signal,
       signal_lookback: props.chanConfig.signal_lookback,
@@ -441,6 +489,8 @@ const formatParams = (params) => {
     `Model: ${params.model}`,
     `MinAcc: ${params.min_accuracy}`,
   ]
+  const awd = Number(params.amp_whitelist_days)
+  if (Number.isFinite(awd) && awd > 0) parts.push(`AmpTop: ${Math.round(awd)}d`)
   if (params.min_recent_accuracy !== null && params.min_recent_accuracy !== undefined && params.min_recent_accuracy !== '') {
     parts.push(`MinRecentAcc: ${params.min_recent_accuracy}`)
   }
@@ -465,6 +515,12 @@ const formatParams = (params) => {
   if (params.min_test_count !== null && params.min_test_count !== undefined && params.min_test_count !== '') {
     const v = Number(params.min_test_count)
     if (Number.isFinite(v) && v > 0) parts.push(`MinTest: ${v}`)
+  }
+  if (params.portfolio_top_n !== null && params.portfolio_top_n !== undefined && params.portfolio_top_n !== '') {
+    parts.push(`TopN: ${params.portfolio_top_n}`)
+  }
+  if (params.holding_period !== null && params.holding_period !== undefined && params.holding_period !== '') {
+    parts.push(`Hold: ${params.holding_period}`)
   }
   return parts.join(', ')
 }
@@ -519,6 +575,11 @@ const allVisibleSelected = computed(() => {
 const isRunDeletable = (run) => {
   const st = String(run?.status || '')
   return !['running', 'pending', 'queued'].includes(st)
+}
+
+const isRunCancellable = (run) => {
+  const st = String(run?.status || '')
+  return ['pending', 'queued'].includes(st)
 }
 
 const toggleSelectRun = (id, val) => {
@@ -618,6 +679,25 @@ const jumpToDetailPage = () => {
   if (Number.isFinite(p) && p >= 1 && p <= detailTotalPages.value) {
     detailPage.value = p
     detailPageInput.value = ''
+  }
+}
+
+const cancelRun = async (run) => {
+  const id = run?.id
+  if (!isRunCancellable(run)) return
+  if (!confirm(t('strategy.cancelConfirm'))) return
+  cancelingRunId.value = id
+  try {
+    await axios.post(`/api/strategy/runs/${id}/cancel`)
+    if (selectedRunId.value === id) {
+      selectedRunId.value = null
+      selectedRunDetail.value = null
+    }
+    await fetchRuns()
+  } catch (e) {
+    console.error(e)
+  } finally {
+    cancelingRunId.value = null
   }
 }
 
