@@ -1505,7 +1505,6 @@ def build_training_data_from_infos(
         except Exception:
             profit = 0.0
         dyn_th = float(used_profit_threshold)
-        used_profit_for_label = profit
         if bool(use_atr_label):
             decision_klu = info.get("decision_klu")
             bsp_obj = info.get("bsp_obj")
@@ -1514,11 +1513,9 @@ def build_training_data_from_infos(
             if atr_pct is not None:
                 try:
                     dyn_th = float(max(dyn_th, float(atr_mult) * float(atr_pct)))
-                    # Use max profit for label when ATR is enabled
-                    used_profit_for_label = _max_profit_for_info(info, lookahead=profit_lookahead)
                 except Exception:
                     dyn_th = float(used_profit_threshold)
-        label = 1 if float(used_profit_for_label) > float(dyn_th) else 0
+        label = 1 if float(profit) > float(dyn_th) else 0
         fill_zero_features = {"bsp2s_break_bi_amp", "bsp2_break_bi_amp", "divergence_rate"}
         feat_vec = []
         for k in feature_meta:
@@ -1772,6 +1769,13 @@ def build_estimator(model_type="xgboost", n_jobs=-1, scale_pos_weight=1.0, use_s
             subsample=ss,
             colsample_bytree=cs,
         )
+        if bool(use_scale_pos_weight):
+            try:
+                spw = float(scale_pos_weight)
+            except Exception:
+                spw = 1.0
+            if spw > 0:
+                params["scale_pos_weight"] = spw
         if xgb_min_child_weight is not None:
             params["min_child_weight"] = float(xgb_min_child_weight)
         if monotone_constraints is not None:
@@ -1803,6 +1807,13 @@ def build_estimator(model_type="xgboost", n_jobs=-1, scale_pos_weight=1.0, use_s
         ra = 0.0 if lgb_reg_alpha is None else float(lgb_reg_alpha)
         rl = 10.0 if lgb_reg_lambda is None else float(lgb_reg_lambda)
         params = dict(n_estimators=ne, learning_rate=lr, max_depth=md, verbosity=-1, n_jobs=n_jobs, reg_alpha=ra, reg_lambda=rl)
+        if bool(use_scale_pos_weight):
+            try:
+                spw = float(scale_pos_weight)
+            except Exception:
+                spw = 1.0
+            if spw > 0:
+                params["scale_pos_weight"] = spw
         if monotone_constraints is not None:
             mc = monotone_constraints
             if isinstance(mc, tuple):

@@ -161,7 +161,7 @@
         </span>
       </div>
 
-      <div v-if="showCalibrationBins && accuracy.calibration_bins && accuracy.calibration_bins.length" class="mt-3">
+      <div v-if="showCalibrationBins && displayCalibrationBins.length" class="mt-3">
         <div class="text-center mb-2">{{ t('analysis.calibrationBins') }}</div>
         <div class="overflow-x-auto">
           <table class="w-full text-[11px] border border-gray-100 dark:border-gray-800">
@@ -174,8 +174,8 @@
               </tr>
             </thead>
             <tbody>
-              <tr v-for="(b, i) in accuracy.calibration_bins" :key="i" class="border-t border-gray-100 dark:border-gray-800">
-                <td class="p-1 text-left tabular-nums">{{ Number(b.low).toFixed(1) }}-{{ Number(b.high).toFixed(1) }}</td>
+              <tr v-for="(b, i) in displayCalibrationBins" :key="i" class="border-t border-gray-100 dark:border-gray-800">
+                <td class="p-1 text-left tabular-nums">{{ calibrationBinLabel(b) }}</td>
                 <td class="p-1 text-left tabular-nums">{{ b.count }}</td>
                 <td class="p-1 text-left tabular-nums">{{ (Number(b.avg_pred) * 100).toFixed(1) }}%</td>
                 <td class="p-1 text-left tabular-nums">{{ (Number(b.win_rate) * 100).toFixed(1) }}%</td>
@@ -270,6 +270,26 @@ const props = defineProps({
   },
   loading: Boolean
 })
+
+const displayCalibrationBins = computed(() => {
+  const q = props?.accuracy?.quantile_bins
+  if (Array.isArray(q) && q.length) return q
+  const fixed = props?.accuracy?.calibration_bins
+  if (Array.isArray(fixed) && fixed.length) return fixed
+  return []
+})
+
+const isQuantileBins = computed(() => {
+  const q = props?.accuracy?.quantile_bins
+  return Array.isArray(q) && q.length > 0
+})
+
+const calibrationBinLabel = (b) => {
+  const low = Number(b?.low || 0)
+  const high = Number(b?.high || 0)
+  if (isQuantileBins.value) return `${(low * 100).toFixed(2)}%-${(high * 100).toFixed(2)}%`
+  return `${low.toFixed(1)}-${high.toFixed(1)}`
+}
 
 const featureIc = computed(() => props?.accuracy?.feature_ic || null)
 const icTopAbs = computed(() => {

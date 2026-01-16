@@ -347,6 +347,9 @@ class AnalyzeRequest(BaseModel):
     profit_threshold: Optional[float] = 0.01
     auto_profit_quantile: float = 0.7
     profit_lookahead: int = 5
+    use_atr_label: bool = False
+    atr_period: int = 14
+    atr_mult: float = 1.0
     backtest_mode: str = "auto"
     walk_forward_max_folds: int = 20
     walk_forward_test_window: Optional[int] = None
@@ -356,6 +359,7 @@ class AnalyzeRequest(BaseModel):
     topk_frac: float = 0.2
     quantile_bin_count: int = 5
     calibrate_method: str = "none"
+    use_scale_pos_weight: bool = False
     xgb_max_depth: Optional[int] = None
     xgb_reg_alpha: Optional[float] = None
     xgb_reg_lambda: Optional[float] = None
@@ -377,6 +381,9 @@ class ValidateRequest(BaseModel):
     profit_threshold: Optional[float] = 0.01
     auto_profit_quantile: float = 0.7
     profit_lookahead: int = 5
+    use_atr_label: bool = False
+    atr_period: int = 14
+    atr_mult: float = 1.0
     backtest_mode: str = "auto"
     walk_forward_max_folds: int = 20
     walk_forward_test_window: Optional[int] = None
@@ -386,6 +393,7 @@ class ValidateRequest(BaseModel):
     topk_frac: float = 0.2
     quantile_bin_count: int = 5
     calibrate_method: str = "none"
+    use_scale_pos_weight: bool = False
     xgb_max_depth: Optional[int] = None
     xgb_reg_alpha: Optional[float] = None
     xgb_reg_lambda: Optional[float] = None
@@ -1248,6 +1256,10 @@ async def analyze_stock(req: AnalyzeRequest):
                     profit_threshold=req.profit_threshold,
                     auto_profit_quantile=req.auto_profit_quantile,
                     profit_lookahead=req.profit_lookahead,
+                    use_atr_label=req.use_atr_label,
+                    atr_period=req.atr_period,
+                    atr_mult=req.atr_mult,
+                    use_scale_pos_weight=req.use_scale_pos_weight,
                     backtest_mode=req.backtest_mode,
                     walk_forward_max_folds=req.walk_forward_max_folds,
                     walk_forward_test_window=req.walk_forward_test_window,
@@ -1337,6 +1349,10 @@ async def analyze_stock(req: AnalyzeRequest):
                     profit_threshold=req.profit_threshold,
                     auto_profit_quantile=req.auto_profit_quantile,
                     profit_lookahead=req.profit_lookahead,
+                    use_atr_label=req.use_atr_label,
+                    atr_period=req.atr_period,
+                    atr_mult=req.atr_mult,
+                    use_scale_pos_weight=req.use_scale_pos_weight,
                     backtest_mode=req.backtest_mode,
                     walk_forward_max_folds=req.walk_forward_max_folds,
                     walk_forward_test_window=req.walk_forward_test_window,
@@ -1569,6 +1585,10 @@ async def validate_codes(req: ValidateRequest):
                     profit_threshold=req.profit_threshold,
                     auto_profit_quantile=req.auto_profit_quantile,
                     profit_lookahead=req.profit_lookahead,
+                    use_atr_label=req.use_atr_label,
+                    atr_period=req.atr_period,
+                    atr_mult=req.atr_mult,
+                    use_scale_pos_weight=req.use_scale_pos_weight,
                     backtest_mode=req.backtest_mode,
                     walk_forward_max_folds=req.walk_forward_max_folds,
                     walk_forward_test_window=req.walk_forward_test_window,
