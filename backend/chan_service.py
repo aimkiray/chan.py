@@ -1734,6 +1734,14 @@ def _scale_pos_weight_from_y(y):
     return float(neg) / float(pos)
 
 def build_estimator(model_type="xgboost", n_jobs=-1, scale_pos_weight=1.0, use_scale_pos_weight: bool = False, xgb_max_depth: Optional[int] = None, xgb_reg_alpha: Optional[float] = None, xgb_reg_lambda: Optional[float] = None, xgb_subsample: Optional[float] = None, xgb_colsample_bytree: Optional[float] = None, lgb_max_depth: Optional[int] = None, lgb_reg_alpha: Optional[float] = None, lgb_reg_lambda: Optional[float] = None, monotone_constraints=None):
+    if model_type in ["logistic_regression", "logreg", "lr"]:
+        return Pipeline(
+            [
+                ("imputer", SimpleImputer(missing_values=-9999999, strategy="mean")),
+                ("scaler", StandardScaler()),
+                ("logreg", LogisticRegression(max_iter=1000, solver="liblinear")),
+            ]
+        )
     if model_type == "xgboost":
         xgb_learning_rate = _env_float("MLCHAN_XGB_LEARNING_RATE", None)
         xgb_n_estimators = _env_int("MLCHAN_XGB_N_ESTIMATORS", None)
@@ -1914,6 +1922,36 @@ def _env_csv_list(key: str, default: str = ""):
         dedup.append(s)
     return dedup
 
+def _csv_list_from_raw(raw):
+    if raw is None:
+        return None
+    parts = []
+    if isinstance(raw, (list, tuple, set)):
+        for x in raw:
+            s = str(x or "").strip()
+            if not s:
+                continue
+            parts.append(s)
+    else:
+        sraw = str(raw or "").strip()
+        if not sraw:
+            return []
+        sraw = sraw.replace("，", ",").replace("\n", " ").replace("\t", " ")
+        for chunk in sraw.split(","):
+            for token in str(chunk or "").strip().split():
+                s = str(token or "").strip()
+                if not s:
+                    continue
+                parts.append(s)
+    dedup = []
+    seen = set()
+    for s in parts:
+        if s in seen:
+            continue
+        seen.add(s)
+        dedup.append(s)
+    return dedup
+
 def _env_float(key: str, default: Optional[float] = None) -> Optional[float]:
     raw = os.environ.get(key, None)
     if raw is None or str(raw).strip() == "":
@@ -1956,6 +1994,37 @@ def _monotone_mode():
         return "fixed+ic"
     return "fixed"
 
+def _monotone_overrides():
+    raw = os.environ.get("MLCHAN_MONOTONE_OVERRIDES", "")
+    parts = []
+    for x in str(raw or "").split(","):
+        s = str(x or "").strip()
+        if not s:
+            continue
+        parts.append(s)
+    out = {}
+    for item in parts:
+        if ":" in item:
+            k, v = item.split(":", 1)
+        elif "=" in item:
+            k, v = item.split("=", 1)
+        else:
+            continue
+        key = str(k or "").strip()
+        if not key:
+            continue
+        try:
+            iv = int(float(str(v or "").strip()))
+        except Exception:
+            continue
+        if iv > 0:
+            out[key] = 1
+        elif iv < 0:
+            out[key] = -1
+        else:
+            out[key] = 0
+    return out
+
 def _build_monotone_constraints(feature_meta, sign_map=None):
     if not feature_meta:
         return None
@@ -1968,18 +2037,24 @@ def _build_monotone_constraints(feature_meta, sign_map=None):
         "zs_height": 1,
         "bsp1_bi_amp": -1,
         "bsp2_bi_amp": 1,
+        "bsp2s_bi_amp": 1,
         "bi_last_amp_r": 1,
+        "bi_prev_amp_r": 1,
         "bsp2s_retrace_rate": -1,
         "seg_last_dir": 1,
         "bsp3_zs_height": 1,
     }
+    overrides = _monotone_overrides()
     out = []
     has_nonzero = False
     for f in (feature_meta or []):
         key = str(f)
         v = None
+        if isinstance(overrides, dict) and key in overrides:
+            v = overrides.get(key, 0)
         if mode in ["fixed", "fixed+ic"]:
-            v = fixed.get(key, None)
+            if v is None:
+                v = fixed.get(key, None)
         if v is None and mode in ["ic", "fixed+ic"] and isinstance(sign_map, dict):
             v = sign_map.get(key, 0)
         if v is None:
@@ -2097,6 +2172,139 @@ def _rank_transform_min_n() -> int:
 def _rank_transform_feature_list():
     return _env_csv_list("MLCHAN_RANK_FEATURES", "")
 
+def _debug_feature_list():
+    raw = os.environ.get("MLCHAN_DEBUG_FEATURES", "")
+    if str(raw or "").strip():
+        return _env_csv_list("MLCHAN_DEBUG_FEATURES", "")
+    return ["volatility_250", "bsp1_bi_amp", "bsp2s_bi_amp", "bi_prev_amp_r"]
+
+def _feature_value_stats(X, feature_meta, features, missing_value: float = -9999999.0):
+    if not X or not feature_meta or not features:
+        return {}
+    idx_by_name = {}
+    for j, name in enumerate(feature_meta or []):
+        if name is None:
+            continue
+        idx_by_name[str(name)] = int(j)
+    want = [str(f) for f in (features or []) if str(f)]
+    out = {}
+    for name in want:
+        j = idx_by_name.get(name, None)
+        if j is None:
+            continue
+        vals = []
+        for row in (X or []):
+            if not row or int(j) >= len(row):
+                continue
+            try:
+                v = float(row[int(j)])
+            except Exception:
+                continue
+            if (not np.isfinite(v)) or float(v) == float(missing_value):
+                continue
+            vals.append(v)
+        if not vals:
+            out[name] = {"valid_n": 0, "min": None, "max": None, "p01": None, "p50": None, "p99": None}
+            continue
+        try:
+            arr = np.asarray(vals, dtype=float)
+            p01 = float(np.quantile(arr, 0.01))
+            p50 = float(np.quantile(arr, 0.50))
+            p99 = float(np.quantile(arr, 0.99))
+            mn = float(np.min(arr))
+            mx = float(np.max(arr))
+        except Exception:
+            p01, p50, p99 = None, None, None
+            mn, mx = None, None
+        out[name] = {"valid_n": int(len(vals)), "min": mn, "max": mx, "p01": p01, "p50": p50, "p99": p99}
+    return out
+
+def _debug_feature_checks_from_collections(cols):
+    if not isinstance(cols, dict) or not cols:
+        return []
+    out = []
+    for name, v in (cols or {}).items():
+        if not isinstance(v, dict):
+            continue
+        x = v.get("x") or []
+        y = v.get("y") or []
+        total = min(len(x), len(y))
+        if total <= 1:
+            out.append({"feature": str(name), "valid_n": int(total), "spearman_ic": 0.0, "roc_auc": None})
+            continue
+        try:
+            xx = np.asarray(list(x[:total]), dtype=float)
+        except Exception:
+            xx = np.asarray([float(z) for z in x[:total]], dtype=float)
+        try:
+            yy = np.asarray(list(y[:total]), dtype=float)
+        except Exception:
+            yy = np.asarray([float(z) for z in y[:total]], dtype=float)
+        ic = _spearman_corr(xx, yy) if xx.size > 1 and yy.size > 1 else 0.0
+        auc = None
+        try:
+            if len(set([int(float(z)) for z in yy.tolist()])) >= 2:
+                auc = float(roc_auc_score([int(float(z)) for z in yy.tolist()], xx.tolist()))
+        except Exception:
+            auc = None
+        out.append({"feature": str(name), "valid_n": int(total), "spearman_ic": float(ic), "roc_auc": auc})
+    out.sort(key=lambda r: float(abs(r.get("spearman_ic", 0.0) or 0.0)), reverse=True)
+    return out
+
+def _collect_feature_cols(X, y, feature_meta, features, missing_value: float = -9999999.0):
+    if not X or not y or not feature_meta or not features:
+        return {}
+    idx_by_name = {str(name): int(j) for j, name in enumerate(feature_meta or []) if name is not None}
+    want = [str(f) for f in (features or []) if str(f) and str(f) in idx_by_name]
+    out = {str(f): {"x": [], "y": []} for f in want}
+    total = min(len(X), len(y))
+    for i in range(total):
+        yi = None
+        try:
+            yi = int(y[i])
+        except Exception:
+            try:
+                yi = int(float(y[i]))
+            except Exception:
+                yi = None
+        if yi is None:
+            continue
+        row = X[i] or []
+        for f in want:
+            j = idx_by_name.get(str(f))
+            if j is None or int(j) >= len(row):
+                continue
+            try:
+                xv = float(row[int(j)])
+            except Exception:
+                continue
+            if (not np.isfinite(xv)) or float(xv) == float(missing_value):
+                continue
+            out[str(f)]["x"].append(float(xv))
+            out[str(f)]["y"].append(int(yi))
+    return out
+
+def _rank_debug_meta(feature_meta, rank_cols):
+    enabled = _rank_transform_enabled()
+    min_n = _rank_transform_min_n()
+    only = _rank_transform_feature_list()
+    ranked = []
+    if feature_meta and isinstance(rank_cols, dict):
+        for j in sorted(list(rank_cols.keys())):
+            try:
+                jj = int(j)
+            except Exception:
+                continue
+            if 0 <= jj < len(feature_meta or []):
+                ranked.append(str(feature_meta[jj]))
+    return {
+        "enabled": bool(enabled),
+        "min_n": int(min_n),
+        "only_features": list(only or []),
+        "ranked_feature_count": int(len(ranked)),
+        "ranked_features": ranked[:50],
+    }
+
 def _rank_transform_fit_sorted_cols(X_train, feature_meta=None, missing_value: float = -9999999.0):
     if not X_train:
         return None
@@ -2174,8 +2382,9 @@ def _rank_transform_apply_sorted_cols(X, sorted_cols, missing_value: float = -99
         out.append(nr)
     return out
 
-def _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=None, missing_value: float = -9999999.0):
-    if not _rank_transform_enabled():
+def _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=None, missing_value: float = -9999999.0, rank_transform_enabled: Optional[bool] = None):
+    enabled = _rank_transform_enabled() if rank_transform_enabled is None else bool(rank_transform_enabled)
+    if not enabled:
         return X_train, X_val, X_test, None
     sorted_cols = _rank_transform_fit_sorted_cols(X_train, feature_meta=feature_meta, missing_value=missing_value)
     if not sorted_cols:
@@ -2667,6 +2876,42 @@ def _roc_auc_from_probs(y, probs):
     except Exception:
         return None
 
+def _weighted_mean(pairs):
+    if not pairs:
+        return None
+    sw = 0.0
+    sx = 0.0
+    for v, w in (pairs or []):
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+            fw = float(w)
+        except Exception:
+            continue
+        if not np.isfinite(fv) or not np.isfinite(fw) or fw <= 0.0:
+            continue
+        sw += fw
+        sx += fv * fw
+    if sw <= 0.0:
+        return None
+    return float(sx / sw)
+
+def _rank01(values):
+    if values is None:
+        return []
+    try:
+        a = np.asarray(values, dtype=float)
+    except Exception:
+        a = np.asarray([float(x) for x in (values or [])], dtype=float)
+    if a.ndim != 1 or int(a.size) <= 0:
+        return []
+    r = _rankdata_average_ties(a)
+    n = float(a.size)
+    if n <= 0:
+        return []
+    return [float(x / n) for x in r.tolist()]
+
 def _pr_auc_from_probs(y, probs):
     if not y or not probs:
         return None
@@ -2815,6 +3060,156 @@ def _precision_at_threshold_from_probs(y, probs, threshold: float = 0.7):
     if c <= 0:
         return {"threshold": float(thr), "count": 0, "precision": 0.0, "avg_pred": 0.0}
     return {"threshold": float(thr), "count": int(c), "precision": float(sum_y / c), "avg_pred": float(sum_p / c)}
+
+def _threshold_curve_from_profits(probs, profits, trade_cost: float = 0.0, max_points: int = 60):
+    if not probs or not profits:
+        return []
+    total = min(len(probs), len(profits))
+    if total <= 0:
+        return []
+    try:
+        max_points = int(max_points)
+    except Exception:
+        max_points = 60
+    if max_points <= 0:
+        max_points = 60
+
+    clean_probs = []
+    clean_profits = []
+    for i in range(total):
+        try:
+            p = float(probs[i])
+        except Exception:
+            p = 0.0
+        try:
+            r = float(profits[i])
+        except Exception:
+            r = 0.0
+        if p < 0.0:
+            p = 0.0
+        if p > 1.0:
+            p = 1.0
+        clean_probs.append(p)
+        clean_profits.append(r)
+
+    sorted_probs = sorted(clean_probs)
+    if not sorted_probs:
+        return []
+
+    anchors = [0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+    qs = []
+    if max_points > 0:
+        for k in range(max_points):
+            qs.append(k / max_points)
+    thresholds = set()
+    for q in qs:
+        try:
+            idx = int(round(q * (len(sorted_probs) - 1)))
+        except Exception:
+            idx = 0
+        if idx < 0:
+            idx = 0
+        if idx >= len(sorted_probs):
+            idx = len(sorted_probs) - 1
+        thresholds.add(float(sorted_probs[idx]))
+    for a in anchors:
+        thresholds.add(float(a))
+    thresholds = [t for t in thresholds if 0.0 <= float(t) <= 1.0]
+    thresholds.sort()
+
+    curve = []
+    for thr in thresholds:
+        idxs = [i for i in range(total) if float(clean_probs[i]) >= float(thr)]
+        pnls = [(float(clean_profits[i]) - float(trade_cost or 0.0)) for i in idxs] if idxs else []
+        if not pnls:
+            curve.append(
+                {
+                    "threshold": float(thr),
+                    "trade_count": 0,
+                    "avg_net_profit": 0.0,
+                    "total_net_profit": 0.0,
+                    "sharpe": 0.0,
+                    "max_drawdown": 0.0,
+                    "win_rate": 0.0,
+                }
+            )
+            continue
+        curve.append(
+            {
+                "threshold": float(thr),
+                "trade_count": int(len(pnls)),
+                "avg_net_profit": float(sum(pnls) / len(pnls)),
+                "total_net_profit": float(sum(pnls)),
+                "sharpe": _sharpe_from_returns(pnls),
+                "max_drawdown": _max_drawdown_from_pnls(pnls),
+                "win_rate": float(sum(1 for r in pnls if float(r) > 0.0) / len(pnls)),
+            }
+        )
+    return curve
+
+def _recommended_threshold_for_target_win(threshold_curve, target_win_rate: float = 0.5, min_trades: int = 30):
+    if not isinstance(threshold_curve, list) or not threshold_curve:
+        return {"target_win_rate": float(target_win_rate), "min_trades": int(min_trades), "threshold": None, "trade_count": 0, "win_rate": 0.0}
+    try:
+        target = float(target_win_rate)
+    except Exception:
+        target = 0.5
+    if target <= 0:
+        target = 0.5
+    if target > 1.0:
+        target = 1.0
+    try:
+        min_trades = int(min_trades)
+    except Exception:
+        min_trades = 30
+    if min_trades < 1:
+        min_trades = 1
+
+    best = None
+    for row in threshold_curve:
+        try:
+            thr = float(row.get("threshold"))
+        except Exception:
+            continue
+        try:
+            c = int(row.get("trade_count", 0))
+        except Exception:
+            c = 0
+        try:
+            w = float(row.get("win_rate", 0.0))
+        except Exception:
+            w = 0.0
+        if c < min_trades:
+            continue
+        if w < target:
+            continue
+        if best is None or thr < float(best.get("threshold") or 1.0):
+            best = {"threshold": float(thr), "trade_count": int(c), "win_rate": float(w)}
+    if best is not None:
+        return {"target_win_rate": float(target), "min_trades": int(min_trades), **best}
+
+    fallback = None
+    for row in threshold_curve:
+        try:
+            thr = float(row.get("threshold"))
+        except Exception:
+            continue
+        try:
+            c = int(row.get("trade_count", 0))
+        except Exception:
+            c = 0
+        try:
+            w = float(row.get("win_rate", 0.0))
+        except Exception:
+            w = 0.0
+        if c < min_trades:
+            continue
+        if fallback is None or w > float(fallback.get("win_rate") or -1.0) or (w == float(fallback.get("win_rate") or -1.0) and thr > float(fallback.get("threshold") or 0.0)):
+            fallback = {"threshold": float(thr), "trade_count": int(c), "win_rate": float(w)}
+    if fallback is not None:
+        return {"target_win_rate": float(target), "min_trades": int(min_trades), **fallback}
+
+    return {"target_win_rate": float(target), "min_trades": int(min_trades), "threshold": None, "trade_count": 0, "win_rate": 0.0}
 
 def _high_confidence_bins_from_probs(y, probs, ranges=None):
     if ranges is None:
@@ -3252,6 +3647,8 @@ def _walk_forward_eval_infos(
     portfolio_min_score: Optional[float] = None,
     portfolio_top_n: Optional[int] = None,
     quantile_bin_count: int = 5,
+    rank_transform_enabled: Optional[bool] = None,
+    only_features=None,
 ):
     n = len(infos or [])
     if n <= 0:
@@ -3270,8 +3667,10 @@ def _walk_forward_eval_infos(
 
     used_calibrate_method_req = _normalize_calibrate_method(calibrate_method)
     forced_features = _force_feature_list()
-    only_features = _only_feature_list()
-    if only_features:
+    only_features_list = _csv_list_from_raw(only_features) if only_features is not None else None
+    if only_features_list is None:
+        only_features_list = _only_feature_list()
+    if only_features_list:
         forced_features = []
 
     provided_val_window = walk_forward_val_window is not None
@@ -3351,7 +3750,10 @@ def _walk_forward_eval_infos(
     p_prior_all = []
     p_logreg_all = []
     infos_all = []
+    dbg_feats = _debug_feature_list()
+    dbg_oos = {str(f): {"x": [], "y": []} for f in (dbg_feats or []) if str(f)}
     folds = []
+    fold_pred_sets = []
     last_model = None
     last_meta = []
     last_fold_train_X = None
@@ -3375,8 +3777,8 @@ def _walk_forward_eval_infos(
         test_infos = infos[test_start:test_end]
 
         feature_meta = _feature_meta_from_infos(train_infos)
-        if only_features:
-            feature_meta = list(only_features or [])
+        if only_features_list:
+            feature_meta = list(only_features_list or [])
         if not feature_meta:
             train_end += step
             used_folds += 1
@@ -3398,7 +3800,7 @@ def _walk_forward_eval_infos(
 
         monotone_constraints = None
         if model_type in ["xgboost", "lightgbm"]:
-            if only_features:
+            if only_features_list:
                 sign_map = {}
                 table = compute_feature_ic_table(X_train, y_train, feature_meta, min_n=50)
                 for r in (table or []):
@@ -3442,8 +3844,12 @@ def _walk_forward_eval_infos(
                         X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
                 monotone_constraints = _build_monotone_constraints(feature_meta, sign_map=sign_map)
 
-        X_train, X_val, X_test, rank_cols = _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=feature_meta)
+        dbg_feats = _debug_feature_list()
+        dbg_pre = _feature_value_stats(X_train, feature_meta, dbg_feats)
+        X_train, X_val, X_test, rank_cols = _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=feature_meta, rank_transform_enabled=rank_transform_enabled)
+        dbg_post_rank = _feature_value_stats(X_train, feature_meta, dbg_feats)
         X_train, X_val, X_test, winsor_bounds = _maybe_winsorize_splits(X_train, X_val, X_test)
+        dbg_post_winsor = _feature_value_stats(X_train, feature_meta, dbg_feats)
 
         selected_features = []
         feature_sel_meta = {"selected_features": [], "dropped_by_importance": 0, "dropped_by_corr": 0}
@@ -3510,7 +3916,7 @@ def _walk_forward_eval_infos(
             used_folds += 1
             continue
 
-        X_train, X_val, X_test, rank_cols = _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=feature_meta)
+        X_train, X_val, X_test, rank_cols = _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=feature_meta, rank_transform_enabled=rank_transform_enabled)
         X_train, X_val, X_test, winsor_bounds = _maybe_winsorize_splits(X_train, X_val, X_test)
 
         score_model = model
@@ -3557,6 +3963,14 @@ def _walk_forward_eval_infos(
         logreg_ok = bool(fold_logreg_probs) and len(fold_logreg_probs) >= total
         if not logreg_ok:
             fold_logreg_probs = list(prior_probs)
+
+        fold_pred_sets.append(
+            {
+                "probs": [float(probs[i]) for i in range(total)],
+                "logreg_probs": [float(fold_logreg_probs[i]) for i in range(total)],
+                "y": [int(y_test[i]) for i in range(total)],
+            }
+        )
         last_fold_train_X = X_train
         last_fold_train_y = y_train
         last_fold_test_X = X_test
@@ -3564,12 +3978,28 @@ def _walk_forward_eval_infos(
         last_fold_feature_meta = list(feature_meta or [])
 
         profit_fold = []
+        idx_by_name = {str(name): int(j) for j, name in enumerate(feature_meta or []) if name is not None}
+        dbg_fold = {str(f): {"x": [], "y": []} for f in (dbg_feats or []) if str(f) in idx_by_name}
         for i in range(total):
             p_all.append(float(probs[i]))
             y_all.append(int(y_test[i]))
             p_prior_all.append(float(prior_probs[i]))
             p_logreg_all.append(float(fold_logreg_probs[i]))
             infos_all.append(test_infos[i])
+            for f, pack in (dbg_fold or {}).items():
+                j = idx_by_name.get(str(f))
+                if j is None or i >= len(X_test) or j >= len(X_test[i] or []):
+                    continue
+                try:
+                    xv = float((X_test[i] or [])[int(j)])
+                except Exception:
+                    continue
+                if (not np.isfinite(xv)) or float(xv) == float(-9999999.0):
+                    continue
+                pack["x"].append(float(xv))
+                pack["y"].append(int(y_test[i]))
+                dbg_oos[str(f)]["x"].append(float(xv))
+                dbg_oos[str(f)]["y"].append(int(y_test[i]))
             try:
                 pr = float(_profit_for_info(test_infos[i], lookahead=profit_lookahead))
             except Exception:
@@ -3586,6 +4016,8 @@ def _walk_forward_eval_infos(
             "val_count": len(X_val),
             "test_count": len(X_test),
             "rank_transformed": bool(rank_cols),
+            "rank_transform": _rank_debug_meta(feature_meta, rank_cols),
+            "feature_value_stats": {"train_pre_rank": dbg_pre, "train_post_rank": dbg_post_rank, "train_post_winsor": dbg_post_winsor},
             "winsorized": bool(winsor_bounds),
             "calibrated": bool(calibrated),
             "calibrate_method": used_calibrate_method,
@@ -3609,6 +4041,7 @@ def _walk_forward_eval_infos(
                 "roc_auc": _roc_auc_from_probs(y_test, fold_logreg_probs),
                 "pr_auc": _pr_auc_from_probs(y_test, fold_logreg_probs),
             },
+            "debug_feature_checks": _debug_feature_checks_from_collections(dbg_fold),
         }
         vec_fold = _topk_vector_metrics_from_infos(
             test_infos,
@@ -3638,6 +4071,26 @@ def _walk_forward_eval_infos(
     bins_quantile = _quantile_bins_from_probs(y_all, p_all, bin_count=quantile_bin_count)
     reversal = _reversal_check_from_probs(y_all, p_all, quantile_bin_count=quantile_bin_count)
 
+    roc_auc_fold_mean = _weighted_mean([(f.get("roc_auc"), f.get("test_count", 0)) for f in (folds or [])])
+    lr_roc_auc_fold_mean = _weighted_mean(
+        [((f.get("baseline_logistic_regression") or {}).get("roc_auc"), f.get("test_count", 0)) for f in (folds or [])]
+    )
+    probs_foldrank = []
+    lr_probs_foldrank = []
+    y_foldrank = []
+    for pack in (fold_pred_sets or []):
+        yp = list(pack.get("y") or [])
+        pp = list(pack.get("probs") or [])
+        lp = list(pack.get("logreg_probs") or [])
+        n2 = min(len(yp), len(pp), len(lp))
+        if n2 <= 0:
+            continue
+        probs_foldrank.extend(_rank01(pp[:n2]))
+        lr_probs_foldrank.extend(_rank01(lp[:n2]))
+        y_foldrank.extend(yp[:n2])
+    roc_auc_foldrank = _roc_auc_from_probs(y_foldrank, probs_foldrank)
+    lr_roc_auc_foldrank = _roc_auc_from_probs(y_foldrank, lr_probs_foldrank)
+
     baseline_zero = [0.0 for _ in range(len(p_all))]
     bz_correct, bz_total, bz_acc = _accuracy_from_probs(y_all, baseline_zero, threshold=threshold)
     bp_correct, bp_total, bp_acc = _accuracy_from_probs(y_all, p_prior_all, threshold=threshold)
@@ -3646,6 +4099,13 @@ def _walk_forward_eval_infos(
     last_fold_ic = None
     if last_fold_test_X and last_fold_test_y and last_fold_feature_meta:
         last_fold_ic = compute_feature_ic_report(last_fold_test_X, last_fold_test_y, last_fold_feature_meta, include_table=True, top_n=20)
+    lr_trained_folds = 0
+    for f in (folds or []):
+        try:
+            if bool((f.get("baseline_logistic_regression") or {}).get("trained")):
+                lr_trained_folds += 1
+        except Exception:
+            pass
     topk_n = int(max(1, round(len(p_all) * tk_frac)))
     idxs = list(range(len(p_all)))
     idxs.sort(key=lambda i: float(p_all[i]), reverse=True)
@@ -3737,6 +4197,8 @@ def _walk_forward_eval_infos(
         "total_count": int(total_count),
         "accuracy": float(acc),
         "method": "walk_forward",
+        "rank_transform": (dict((folds[-1] or {}).get("rank_transform") or {}) if folds else _rank_debug_meta(last_meta, None)),
+        "feature_value_stats": (dict((folds[-1] or {}).get("feature_value_stats") or {}) if folds else {}),
         "calibrate_method_requested": str(calibrate_method),
         "calibrate_method_effective": (str(used_calibrate_method_req) if used_calibrate_method_req is not None else None),
         "train_count": int(folds[-1]["train_count"]) if folds else 0,
@@ -3747,6 +4209,8 @@ def _walk_forward_eval_infos(
         "brier_score": brier_val,
         "logloss": logloss_val,
         "roc_auc": roc_auc_val,
+        "roc_auc_fold_mean": roc_auc_fold_mean,
+        "roc_auc_foldrank": roc_auc_foldrank,
         "pr_auc": pr_auc_val,
         "ece": float(ece),
         "prob_summary": _prob_summary_from_probs(p_all),
@@ -3785,9 +4249,14 @@ def _walk_forward_eval_infos(
                 "brier_score": _brier_from_probs(y_all, p_logreg_all),
                 "logloss": _logloss_from_probs(y_all, p_logreg_all),
                 "roc_auc": _roc_auc_from_probs(y_all, p_logreg_all),
+                "roc_auc_fold_mean": lr_roc_auc_fold_mean,
+                "roc_auc_foldrank": lr_roc_auc_foldrank,
                 "pr_auc": _pr_auc_from_probs(y_all, p_logreg_all),
+                "trained_folds": int(lr_trained_folds),
+                "total_folds": int(len(folds or [])),
             },
         },
+        "debug_feature_checks_oos": _debug_feature_checks_from_collections(dbg_oos),
         "trading": trading,
         "predictions": [
             {
@@ -3825,7 +4294,7 @@ def evaluate_model_accuracy(model, X, y, threshold=0.5):
 
     return correct, total, (correct / total if total > 0 else 0.0)
 
-def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, val_ratio=0.2, threshold=0.5, calibrate_method="none", min_train=200, min_val=200, min_test=500, n_jobs=-1, profit_threshold: Optional[float] = 0.02, auto_profit_quantile: float = 0.7, profit_lookahead: int = 3, use_atr_label: bool = False, atr_period: int = 14, atr_mult: float = 1.0, use_scale_pos_weight: bool = False, xgb_max_depth: Optional[int] = None, xgb_reg_alpha: Optional[float] = None, xgb_reg_lambda: Optional[float] = None, lgb_max_depth: Optional[int] = None, lgb_reg_alpha: Optional[float] = None, lgb_reg_lambda: Optional[float] = None, backtest_mode: str = "auto", walk_forward_max_folds: int = 20, walk_forward_test_window: Optional[int] = None, walk_forward_val_window: Optional[int] = None, walk_forward_step: Optional[int] = None, trade_cost: float = 0.0, topk_frac: float = 0.2, quantile_bin_count: int = 5):
+def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, val_ratio=0.2, threshold=0.5, calibrate_method="none", min_train=200, min_val=200, min_test=500, n_jobs=-1, profit_threshold: Optional[float] = 0.02, auto_profit_quantile: float = 0.7, profit_lookahead: int = 3, use_atr_label: bool = False, atr_period: int = 14, atr_mult: float = 1.0, use_scale_pos_weight: bool = False, xgb_max_depth: Optional[int] = None, xgb_reg_alpha: Optional[float] = None, xgb_reg_lambda: Optional[float] = None, lgb_max_depth: Optional[int] = None, lgb_reg_alpha: Optional[float] = None, lgb_reg_lambda: Optional[float] = None, backtest_mode: str = "auto", walk_forward_max_folds: int = 20, walk_forward_test_window: Optional[int] = None, walk_forward_val_window: Optional[int] = None, walk_forward_step: Optional[int] = None, trade_cost: float = 0.0, topk_frac: float = 0.2, quantile_bin_count: int = 5, rank_transform_enabled: Optional[bool] = None, only_features=None):
     empty_model = None
     empty_meta = []
     if not bsp_dict:
@@ -3859,8 +4328,10 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
     n = len(infos)
     calibrate_method_req = _normalize_calibrate_method(calibrate_method)
     forced_features = _force_feature_list()
-    only_features = _only_feature_list()
-    if only_features:
+    only_features_list = _csv_list_from_raw(only_features) if only_features is not None else None
+    if only_features_list is None:
+        only_features_list = _only_feature_list()
+    if only_features_list:
         forced_features = []
     try:
         val_ratio = float(val_ratio)
@@ -3945,11 +4416,13 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             trade_cost=trade_cost,
             topk_frac=topk_frac,
             quantile_bin_count=quantile_bin_count,
+            rank_transform_enabled=rank_transform_enabled,
+            only_features=only_features_list,
         )
 
         feature_meta = build_feature_meta(bsp_dict)
-        if only_features:
-            feature_meta = list(only_features or [])
+        if only_features_list:
+            feature_meta = list(only_features_list or [])
         if profit_threshold is None:
             used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead)
         else:
@@ -3960,7 +4433,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
         monotone_sign_map = None
         winsor_bounds_all = None
         if str(model_type or "").strip().lower() in ["xgboost", "lightgbm"] and X_all and y_all and feature_meta and len(set(y_all)) >= 2:
-            if only_features:
+            if only_features_list:
                 sign_map = {}
                 table = compute_feature_ic_table(X_all, y_all, feature_meta, min_n=50)
                 for r in (table or []):
@@ -4001,7 +4474,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
                 if isinstance(sign_map, dict):
                     monotone_sign_map = dict(sign_map)
 
-        X_all, _, _, rank_cols_all = _maybe_rank_transform_splits(X_all, None, None, feature_meta=feature_meta)
+        X_all, _, _, rank_cols_all = _maybe_rank_transform_splits(X_all, None, None, feature_meta=feature_meta, rank_transform_enabled=rank_transform_enabled)
         X_all, _, _, winsor_bounds_all = _maybe_winsorize_splits(X_all, None, None)
 
         final_model = None
@@ -4026,7 +4499,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
 
         selected_features = []
         feature_importance_full = []
-        if final_model and feature_meta and (not only_features):
+        if final_model and feature_meta and (not only_features_list):
             feature_importance_full = _get_feature_importance(final_model, feature_meta)
             topk = 5
             if forced_features:
@@ -4045,7 +4518,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
                         try:
                             monotone_constraints2 = None
                             monotone_constraints2 = _build_monotone_constraints(feature_meta2, sign_map=monotone_sign_map)
-                            X_all2, _, _, rank_cols_all = _maybe_rank_transform_splits(X_all2, None, None, feature_meta=feature_meta2)
+                            X_all2, _, _, rank_cols_all = _maybe_rank_transform_splits(X_all2, None, None, feature_meta=feature_meta2, rank_transform_enabled=rank_transform_enabled)
                             X_all2, _, _, winsor_bounds_all = _maybe_winsorize_splits(X_all2, None, None)
                             model2 = train_model_from_xy(
                                 X_all2,
@@ -4230,8 +4703,8 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
     test_infos = infos[val_end:]
 
     feature_meta = build_feature_meta(bsp_dict)
-    if only_features:
-        feature_meta = list(only_features or [])
+    if only_features_list:
+        feature_meta = list(only_features_list or [])
     if profit_threshold is None:
         used_profit_threshold = _auto_profit_threshold_from_infos(train_infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead)
     else:
@@ -4242,7 +4715,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
     monotone_constraints = None
     winsor_bounds = None
     if model_type in ["xgboost", "lightgbm"]:
-        if only_features:
+        if only_features_list:
             sign_map = {}
             table = compute_feature_ic_table(X_train, y_train, feature_meta, min_n=50)
             for r in (table or []):
@@ -4286,8 +4759,12 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
                     X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
             monotone_constraints = _build_monotone_constraints(feature_meta, sign_map=sign_map)
 
-    X_train, X_val, X_test, rank_cols = _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=feature_meta)
+    dbg_feats = _debug_feature_list()
+    dbg_pre = _feature_value_stats(X_train, feature_meta, dbg_feats)
+    X_train, X_val, X_test, rank_cols = _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=feature_meta, rank_transform_enabled=rank_transform_enabled)
+    dbg_post_rank = _feature_value_stats(X_train, feature_meta, dbg_feats)
     X_train, X_val, X_test, winsor_bounds = _maybe_winsorize_splits(X_train, X_val, X_test)
+    dbg_post_winsor = _feature_value_stats(X_train, feature_meta, dbg_feats)
 
     feature_ic_train = compute_feature_ic_report(X_train, y_train, feature_meta, include_table=True, top_n=20)
     feature_ic_val = compute_feature_ic_report(X_val, y_val, feature_meta, include_table=False, top_n=20)
@@ -4371,7 +4848,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
                 X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
                 X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
                 X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
-                X_train, X_val, X_test, rank_cols = _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=feature_meta)
+                X_train, X_val, X_test, rank_cols = _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=feature_meta, rank_transform_enabled=rank_transform_enabled)
                 X_train, X_val, X_test, winsor_bounds = _maybe_winsorize_splits(X_train, X_val, X_test)
                 class_balance = {
                     "train": _binary_balance_meta(y_train),
@@ -4383,7 +4860,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
         except Exception:
             model = None
             feature_sel_meta = {"selected_features": [], "dropped_by_importance": 0, "dropped_by_corr": 0}
-    if model and feature_meta and (not only_features):
+    if model and feature_meta and (not only_features_list):
         feature_importance_full = _get_feature_importance(model, feature_meta)
     feature_ic_selected_train = compute_feature_ic_report(X_train, y_train, feature_meta, include_table=False, top_n=20)
     feature_ic_selected_test = compute_feature_ic_report(X_test, y_test, feature_meta, include_table=False, top_n=20)
@@ -4505,6 +4982,10 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
     top10_pnls = [(float(profit_test[i]) - float(trade_cost or 0.0)) for i in top10_idxs] if top10_idxs else []
     topk_pnls = [(float(profit_test[i]) - float(trade_cost or 0.0)) for i in topk_idxs] if topk_idxs else []
 
+    threshold_curve = _threshold_curve_from_profits(probs, profit_test, trade_cost=trade_cost or 0.0, max_points=60)
+    recommended_threshold_for_target_win = _recommended_threshold_for_target_win(threshold_curve, target_win_rate=0.5, min_trades=30)
+    estimated_trade_count = int(recommended_threshold_for_target_win.get("trade_count", 0) or 0)
+
     brier_val = _brier_from_probs(y_test, probs)
     warning_msg = None
     if brier_val > 0.25:
@@ -4537,6 +5018,9 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
         "val_count": len(X_val),
         "test_count": len(X_test),
         "rank_transformed": bool(rank_cols),
+        "rank_transform": _rank_debug_meta(feature_meta, rank_cols),
+        "feature_value_stats": {"train_pre_rank": dbg_pre, "train_post_rank": dbg_post_rank, "train_post_winsor": dbg_post_winsor},
+        "debug_feature_checks_test": _debug_feature_checks_from_collections(_collect_feature_cols(X_test, y_test, feature_meta, dbg_feats)),
         "winsorized": bool(winsor_bounds),
         "brier_score": brier_val,
         "warning": warning_msg,
@@ -4616,6 +5100,9 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
                 "win_rate": float(sum(1 for r in top10_pnls if r > 0.0) / len(top10_pnls)) if top10_pnls else 0.0,
             },
         },
+        "threshold_curve": threshold_curve,
+        "recommended_threshold_for_target_win": recommended_threshold_for_target_win,
+        "estimated_trade_count": estimated_trade_count,
         "predictions": [
             {
                 "ts": int(getattr(test_infos[i].get("open_time"), "ts", 0) or 0) if i < len(test_infos) and test_infos[i] else 0,

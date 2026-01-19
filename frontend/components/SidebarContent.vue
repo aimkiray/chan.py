@@ -200,6 +200,23 @@
                </div>
 
                <div class="flex items-center gap-2">
+                  <UCheckbox v-model="proxyRankTransformEnabled" :label="t('sidebar.rankTransform')" />
+                  <UTooltip :text="t('sidebar.rankTransformHint')" :popper="{ placement: 'right' }">
+                     <UIcon name="i-heroicons-exclamation-circle" class="w-4 h-4 text-gray-400 hover:text-gray-600 cursor-help" />
+                  </UTooltip>
+               </div>
+
+               <div>
+                 <div class="flex items-center gap-1 mb-2">
+                   <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('sidebar.onlyFeatures') }}</label>
+                   <UTooltip :text="t('sidebar.onlyFeaturesHint')" :popper="{ placement: 'right' }">
+                     <UIcon name="i-heroicons-exclamation-circle" class="w-4 h-4 text-gray-400 hover:text-gray-600 cursor-help" />
+                   </UTooltip>
+                 </div>
+                 <UInput v-model="proxyOnlyFeatures" :placeholder="t('sidebar.onlyFeaturesPlaceholder')" class="w-full" />
+               </div>
+
+               <div class="flex items-center gap-2">
                   <UCheckbox v-model="autoProfitThreshold" :label="t('strategy.useAutoProfitThreshold')" />
                </div>
 
@@ -441,7 +458,7 @@
              <div class="flex items-center gap-1 mb-2">
                 <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.model') }}</label>
              </div>
-             <USelectMenu v-model="proxyStrategyForm.model" :options="['xgboost', 'lightgbm', 'mlp']" class="w-full" />
+             <USelectMenu v-model="proxyStrategyForm.model" :options="['xgboost', 'lightgbm', 'mlp', 'logistic_regression']" class="w-full" />
           </div>
 
           <!-- Frequency -->
@@ -628,6 +645,8 @@ const props = defineProps({
   autype: { type: String, default: 'qfq' },
   triggerStep: Boolean,
   biStrict: Boolean,
+  rankTransformEnabled: { type: Boolean, default: true },
+  onlyFeatures: { type: String, default: '' },
   loading: Boolean,
   // Daily Props
   blend: { type: Boolean, default: false },
@@ -662,7 +681,7 @@ const props = defineProps({
 })
 
 const emit = defineEmits([
-  'update:code', 'update:autype', 'update:triggerStep', 'update:biStrict', 'update:blend', 
+  'update:code', 'update:autype', 'update:triggerStep', 'update:biStrict', 'update:rankTransformEnabled', 'update:onlyFeatures', 'update:blend', 
   'update:dataSrc', 'update:model', 'update:intradayFreq', 'update:dataLengthYears',
   'update:pretrainedChoice', 'update:intradayBlend', 'update:enableRollingLookback',
   'update:strategyForm', 'update:strategyChanConfig', 'update:pretrainConfig',
@@ -687,6 +706,16 @@ const proxyTriggerStep = computed({
 const proxyBiStrict = computed({
   get: () => props.biStrict,
   set: (val) => emit('update:biStrict', val)
+})
+
+const proxyRankTransformEnabled = computed({
+  get: () => props.rankTransformEnabled,
+  set: (val) => emit('update:rankTransformEnabled', val)
+})
+
+const proxyOnlyFeatures = computed({
+  get: () => props.onlyFeatures,
+  set: (val) => emit('update:onlyFeatures', val)
 })
 
 const proxyBlend = computed({
@@ -894,7 +923,8 @@ const dataSrcOptions = computed(() => [
 const modelOptions = computed(() => [
   { label: t('app.modelOptions.xgboost'), value: 'xgboost' },
   { label: t('app.modelOptions.lightgbm'), value: 'lightgbm' },
-  { label: t('app.modelOptions.mlp'), value: 'mlp' }
+  { label: t('app.modelOptions.mlp'), value: 'mlp' },
+  { label: t('app.modelOptions.logistic_regression'), value: 'logistic_regression' }
 ])
 
 const fillCodesFromPool = async () => {

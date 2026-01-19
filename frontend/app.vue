@@ -46,6 +46,8 @@
           v-model:autype="autype"
           v-model:triggerStep="triggerStep"
           v-model:biStrict="biStrict"
+          v-model:rankTransformEnabled="rankTransformEnabled"
+          v-model:onlyFeatures="onlyFeatures"
           v-model:enableRollingLookback="enableRollingLookback"
           v-model:blend="dailyBlendModels"
           v-model:dataSrc="dataSrc"
@@ -125,6 +127,8 @@
             v-model:autype="autype"
             v-model:triggerStep="triggerStep"
             v-model:biStrict="biStrict"
+            v-model:rankTransformEnabled="rankTransformEnabled"
+            v-model:onlyFeatures="onlyFeatures"
             v-model:enableRollingLookback="enableRollingLookback"
             v-model:blend="dailyBlendModels"
             v-model:dataSrc="dataSrc"
@@ -369,6 +373,8 @@ const handleManualOpen = () => {
 
 const triggerStep = ref(true)
 const biStrict = ref(false)
+const rankTransformEnabled = ref(true)
+const onlyFeatures = ref('')
 const enableRollingLookback = ref(true)
 const dailyBlendModels = ref(false)
 const autype = ref('qfq')
@@ -580,6 +586,16 @@ onMounted(() => {
     enableRollingLookback.value = savedEnableRollingLookback === 'true'
   }
 
+  const savedRankTransformEnabled = localStorage.getItem('lastRankTransformEnabled')
+  if (savedRankTransformEnabled) {
+    rankTransformEnabled.value = savedRankTransformEnabled !== 'false'
+  }
+
+  const savedOnlyFeatures = localStorage.getItem('lastOnlyFeatures')
+  if (savedOnlyFeatures !== null) {
+    onlyFeatures.value = savedOnlyFeatures
+  }
+
   const savedIntradayPretrained = localStorage.getItem('intradayPretrainedChoice')
   if (savedIntradayPretrained) {
     intradayPretrainedChoice.value = savedIntradayPretrained
@@ -708,6 +724,16 @@ watch(autype, (newVal) => {
 watch(enableRollingLookback, (newVal) => {
   if (!isInitialized.value) return
   localStorage.setItem('lastEnableRollingLookback', newVal)
+})
+
+watch(rankTransformEnabled, (newVal) => {
+  if (!isInitialized.value) return
+  localStorage.setItem('lastRankTransformEnabled', newVal)
+})
+
+watch(onlyFeatures, (newVal) => {
+  if (!isInitialized.value) return
+  localStorage.setItem('lastOnlyFeatures', String(newVal ?? ''))
 })
 
 watch(intradayPretrainedChoice, (newVal) => {
@@ -870,6 +896,7 @@ const getPretrainedAvailability = ({ isIntraday }) => {
       const lookahead = Number.isFinite(lookaheadRaw) ? Math.max(0, Math.floor(lookaheadRaw)) : 5
 
       const shouldForceRefresh = !!forceRefresh || !!strategyForm.value.force_refresh
+      const onlyFeaturesRaw = String(onlyFeatures.value ?? '').trim()
 
       const params = {
         code: code.value,
@@ -879,6 +906,8 @@ const getPretrainedAvailability = ({ isIntraday }) => {
         trigger_step: triggerStep.value,
         bi_strict: biStrict.value,
         enable_rolling_lookback: enableRollingLookback.value,
+        rank_transform_enabled: rankTransformEnabled.value,
+        only_features: onlyFeaturesRaw ? onlyFeaturesRaw : null,
         start_date: startDate,
         end_date: endDate,
         profit_threshold: profitThreshold,
@@ -967,6 +996,7 @@ const getPretrainedAvailability = ({ isIntraday }) => {
   // Second pass: Background Prediction if needed
    if (separatePrediction) {
        try {
+           const onlyFeaturesRaw = String(onlyFeatures.value ?? '').trim()
            const params = {
                code: code.value,
                frequency: '1d',
@@ -974,6 +1004,9 @@ const getPretrainedAvailability = ({ isIntraday }) => {
                autype: autype.value,
                trigger_step: triggerStep.value,
                bi_strict: biStrict.value,
+               enable_rolling_lookback: enableRollingLookback.value,
+               rank_transform_enabled: rankTransformEnabled.value,
+               only_features: onlyFeaturesRaw ? onlyFeaturesRaw : null,
                profit_threshold: strategyForm.value.profit_threshold,
                auto_profit_quantile: strategyForm.value.auto_profit_quantile,
                profit_lookahead: strategyForm.value.profit_lookahead,

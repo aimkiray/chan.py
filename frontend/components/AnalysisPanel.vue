@@ -117,6 +117,52 @@
         </span>
       </div>
 
+      <div v-if="thresholdCurve.length" class="mt-4 p-3 bg-gray-50 dark:bg-gray-800 rounded border border-gray-100 dark:border-gray-700">
+        <div class="flex items-center justify-between gap-2 mb-2">
+          <div class="font-bold text-sm text-gray-700 dark:text-gray-300">{{ t('analysis.thresholdRecommendation') }}</div>
+          <div class="text-[10px] text-gray-400 tabular-nums">
+            {{ t('analysis.curvePoints', { n: thresholdCurve.length }) }}
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-2">
+          <div class="flex items-center justify-between gap-2">
+            <div class="text-[11px] text-gray-500">{{ t('analysis.targetWinRate') }}</div>
+            <UInput v-model="targetWinPct" size="xs" class="w-16 text-right" />
+          </div>
+          <div class="flex items-center justify-between gap-2">
+            <div class="text-[11px] text-gray-500">{{ t('analysis.minTrades') }}</div>
+            <UInput v-model="minTrades" size="xs" class="w-16 text-right" />
+          </div>
+        </div>
+
+        <div class="mt-3 grid grid-cols-3 gap-2 text-[11px]">
+          <div class="flex flex-col">
+            <span class="text-gray-400">{{ t('analysis.recommendedThreshold') }}</span>
+            <span v-if="recommendedRow" class="font-mono text-gray-700 dark:text-gray-200">{{ Number(recommendedRow.threshold).toFixed(3) }}</span>
+            <span v-else class="text-gray-400">--</span>
+          </div>
+          <div class="flex flex-col">
+            <span class="text-gray-400">{{ t('analysis.estimatedTradeCount') }}</span>
+            <span v-if="recommendedRow" class="tabular-nums text-gray-700 dark:text-gray-200">{{ Number(recommendedRow.trade_count || 0) }}</span>
+            <span v-else class="text-gray-400">--</span>
+          </div>
+          <div class="flex flex-col text-right">
+            <span class="text-gray-400">{{ t('analysis.winRateAtThreshold') }}</span>
+            <span v-if="recommendedRow" class="tabular-nums text-gray-700 dark:text-gray-200">{{ (Number(recommendedRow.win_rate || 0) * 100).toFixed(1) }}%</span>
+            <span v-else class="text-gray-400">--</span>
+          </div>
+        </div>
+
+        <div v-if="recommendedRow" class="mt-2 flex items-center justify-between gap-2">
+          <div class="text-[10px] text-gray-400">
+            {{ t('analysis.avgNetProfit') }}: <span class="font-mono">{{ Number(recommendedRow.avg_net_profit || 0).toFixed(4) }}</span>
+          </div>
+          <UBadge v-if="recommendedMeetsTarget" color="green" size="xs" variant="subtle">{{ t('analysis.targetMet') }}</UBadge>
+          <UBadge v-else color="orange" size="xs" variant="subtle">{{ t('analysis.targetNotMet') }}</UBadge>
+        </div>
+      </div>
+
       <div v-if="accuracy.brier_score !== undefined" class="mt-2 text-center">
         {{ t('analysis.brier') }}:
         <span class="font-medium ml-1">{{ Number(accuracy.brier_score).toFixed(4) }}</span>
@@ -132,6 +178,28 @@
         <span v-if="accuracy.train_count !== undefined" class="mr-2">train={{ accuracy.train_count }}</span>
         <span v-if="accuracy.val_count !== undefined" class="mr-2">val={{ accuracy.val_count }}</span>
         <span v-if="accuracy.test_count !== undefined">test={{ accuracy.test_count }}</span>
+      </div>
+
+      <div v-if="rankDebugEnabled" class="mt-2 text-center">
+        <span class="mr-2">{{ t('analysis.rankTransform') }}: {{ rankEffectiveLabel }}</span>
+        <span v-if="rankedFeatureCount !== null" class="mr-2">ranked={{ rankedFeatureCount }}</span>
+        <span v-if="rankMinN !== null" class="mr-2">min_n={{ rankMinN }}</span>
+      </div>
+
+      <div v-if="rankStatLine" class="mt-1 text-center text-[11px] text-gray-400">
+        {{ rankStatLine }}
+      </div>
+
+      <div v-if="volSingleLine" class="mt-1 text-center text-[11px] text-gray-400">
+        {{ volSingleLine }}
+      </div>
+
+      <div v-if="foldAucLine" class="mt-1 text-center text-[11px] text-gray-400">
+        {{ foldAucLine }}
+      </div>
+
+      <div v-if="aucDiagLine" class="mt-1 text-center text-[11px] text-gray-400">
+        {{ aucDiagLine }}
       </div>
 
       <div v-if="accuracy.scale_pos_weight !== undefined" class="mt-2 text-center">
@@ -251,7 +319,7 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 
 const { t, formatTime: formatTimeI18n } = useI18n()
 
@@ -270,6 +338,49 @@ const props = defineProps({
   },
   loading: Boolean
 })
+
+const targetWinPct = ref(50)
+const minTrades = ref(30)
+
+const thresholdCurve = computed(() => {
+  const c = props?.accuracy?.threshold_curve
+  return Array.isArray(c) ? c : []
+})
+
+const recommendedFromCurve = computed(() => {
+  const curve = thresholdCurve.value
+  if (!curve.length) return { row: null, meetsTarget: false }
+  const target = Math.max(0, Math.min(100, Number(targetWinPct.value)))
+  const minN = Math.max(1, Number(minTrades.value))
+  const targetWin = target / 100
+
+  const rows = curve
+    .map(r => ({
+      threshold: Number(r?.threshold),
+      trade_count: Number(r?.trade_count),
+      win_rate: Number(r?.win_rate),
+      avg_net_profit: Number(r?.avg_net_profit)
+    }))
+    .filter(r => Number.isFinite(r.threshold) && Number.isFinite(r.trade_count) && Number.isFinite(r.win_rate))
+    .filter(r => r.trade_count >= minN)
+    .sort((a, b) => a.threshold - b.threshold)
+
+  if (!rows.length) return { row: null, meetsTarget: false }
+
+  const firstMeet = rows.find(r => r.win_rate >= targetWin) || null
+  if (firstMeet) return { row: firstMeet, meetsTarget: true }
+
+  const bestWin = rows.reduce((best, r) => {
+    if (!best) return r
+    if (r.win_rate > best.win_rate) return r
+    if (r.win_rate === best.win_rate && r.threshold > best.threshold) return r
+    return best
+  }, null)
+  return { row: bestWin, meetsTarget: false }
+})
+
+const recommendedRow = computed(() => recommendedFromCurve.value.row)
+const recommendedMeetsTarget = computed(() => recommendedFromCurve.value.meetsTarget)
 
 const displayCalibrationBins = computed(() => {
   const q = props?.accuracy?.quantile_bins
@@ -317,6 +428,105 @@ const baselineRows = computed(() => {
 const latestCloseText = computed(() => {
   const n = Number(props.latestClose)
   return Number.isFinite(n) ? n.toFixed(2) : '--'
+})
+
+const rankTransform = computed(() => props?.accuracy?.rank_transform || null)
+const rankDebugEnabled = computed(() => !!rankTransform.value && typeof rankTransform.value === 'object')
+const rankEffectiveLabel = computed(() => {
+  const en = rankTransform.value?.enabled
+  if (en === true) return t('analysis.enabled')
+  if (en === false) return t('analysis.disabled')
+  return '--'
+})
+const rankedFeatureCount = computed(() => {
+  const n = rankTransform.value?.ranked_feature_count
+  const v = Number(n)
+  return Number.isFinite(v) ? v : null
+})
+const rankMinN = computed(() => {
+  const n = rankTransform.value?.min_n
+  const v = Number(n)
+  return Number.isFinite(v) ? v : null
+})
+
+const rankStats = computed(() => props?.accuracy?.feature_value_stats || null)
+const rankStatLine = computed(() => {
+  const s = rankStats.value
+  const pre = s?.train_pre_rank?.volatility_250
+  const post = s?.train_post_rank?.volatility_250
+  if (!pre || !post) return ''
+  const preMax = Number(pre?.max)
+  const postMax = Number(post?.max)
+  if (!Number.isFinite(preMax) || !Number.isFinite(postMax)) return ''
+  return `${t('analysis.volatility250Max')} pre=${preMax.toFixed(4)} post=${postMax.toFixed(4)}`
+})
+
+const debugFeatureChecks = computed(() => {
+  const a = props?.accuracy
+  const c1 = a?.debug_feature_checks_oos
+  if (Array.isArray(c1)) return c1
+  const c2 = a?.debug_feature_checks_test
+  if (Array.isArray(c2)) return c2
+  return []
+})
+
+const volSingleLine = computed(() => {
+  const row = debugFeatureChecks.value.find(r => String(r?.feature) === 'volatility_250')
+  if (!row) return ''
+  const auc = row?.roc_auc
+  const ic = row?.spearman_ic
+  const aucNum = Number(auc)
+  const icNum = Number(ic)
+  const aucText = Number.isFinite(aucNum) ? aucNum.toFixed(4) : '--'
+  const icText = Number.isFinite(icNum) ? icNum.toFixed(4) : '--'
+  const n = Number(row?.valid_n || 0)
+  const nText = Number.isFinite(n) ? n : '--'
+  return `${t('analysis.volatility250Single')} auc=${aucText} ic=${icText} n=${nText}`
+})
+
+const foldAucLine = computed(() => {
+  const folds = Array.isArray(props?.accuracy?.folds) ? props.accuracy.folds : []
+  if (!folds.length) return ''
+  const lrAucs = folds
+    .map(f => Number(f?.baseline_logistic_regression?.roc_auc))
+    .filter(v => Number.isFinite(v))
+  const volAucs = folds
+    .map(f => {
+      const rows = Array.isArray(f?.debug_feature_checks) ? f.debug_feature_checks : []
+      const r = rows.find(x => String(x?.feature) === 'volatility_250')
+      return Number(r?.roc_auc)
+    })
+    .filter(v => Number.isFinite(v))
+  if (!lrAucs.length && !volAucs.length) return ''
+  const lrText = lrAucs.length ? lrAucs.map(v => v.toFixed(4)).join(',') : '--'
+  const volText = volAucs.length ? volAucs.map(v => v.toFixed(4)).join(',') : '--'
+  return `${t('analysis.foldAuc')} lr=[${lrText}] vol=[${volText}]`
+})
+
+const aucDiagLine = computed(() => {
+  const a = props?.accuracy
+  if (!a) return ''
+  const modelPooled = Number(a?.roc_auc)
+  const modelFoldMean = Number(a?.roc_auc_fold_mean)
+  const modelFoldRank = Number(a?.roc_auc_foldrank)
+  const lr = a?.baseline?.logistic_regression
+  const lrPooled = Number(lr?.roc_auc)
+  const lrFoldMean = Number(lr?.roc_auc_fold_mean)
+  const lrFoldRank = Number(lr?.roc_auc_foldrank)
+  const parts = []
+  if (Number.isFinite(modelPooled) || Number.isFinite(modelFoldMean) || Number.isFinite(modelFoldRank)) {
+    const p = Number.isFinite(modelPooled) ? modelPooled.toFixed(4) : '--'
+    const m = Number.isFinite(modelFoldMean) ? modelFoldMean.toFixed(4) : '--'
+    const r = Number.isFinite(modelFoldRank) ? modelFoldRank.toFixed(4) : '--'
+    parts.push(`model auc pooled=${p} fold_mean=${m} fold_rank=${r}`)
+  }
+  if (Number.isFinite(lrPooled) || Number.isFinite(lrFoldMean) || Number.isFinite(lrFoldRank)) {
+    const p = Number.isFinite(lrPooled) ? lrPooled.toFixed(4) : '--'
+    const m = Number.isFinite(lrFoldMean) ? lrFoldMean.toFixed(4) : '--'
+    const r = Number.isFinite(lrFoldRank) ? lrFoldRank.toFixed(4) : '--'
+    parts.push(`lr auc pooled=${p} fold_mean=${m} fold_rank=${r}`)
+  }
+  return parts.join(' | ')
 })
 
 const timeDiffLabel = computed(() => {

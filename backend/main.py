@@ -159,6 +159,8 @@ def _dt_to_utc_iso(dt):
 def _model_type_label(model_type: str) -> str:
     mt = str(model_type or "").strip()
     key = mt.lower()
+    if key in ["logistic_regression", "logreg", "lr"]:
+        return "LogisticRegression"
     if key == "xgboost":
         return "XGBoost"
     if key == "lightgbm":
@@ -344,6 +346,8 @@ class AnalyzeRequest(BaseModel):
     pretrained_model_key: Optional[str] = None
     blend_models: Optional[bool] = None
     enable_rolling_lookback: bool = True # Enable/Disable long-term context features
+    rank_transform_enabled: Optional[bool] = None
+    only_features: Optional[Any] = None
     profit_threshold: Optional[float] = 0.01
     auto_profit_quantile: float = 0.7
     profit_lookahead: int = 5
@@ -1052,6 +1056,12 @@ async def analyze_stock(req: AnalyzeRequest):
         if autype is None:
             raise HTTPException(status_code=400, detail="invalid autype, expect qfq/hfq/none")
 
+        try:
+            if isinstance(req.only_features, str) and not str(req.only_features).strip():
+                req.only_features = None
+        except Exception:
+            pass
+
         # 1. Calculate Time Range First
         import datetime
         
@@ -1116,6 +1126,8 @@ async def analyze_stock(req: AnalyzeRequest):
             "data_length_years": req.data_length_years,
             "start_date": req.start_date,
             "end_date": req.end_date,
+            "rank_transform_enabled": req.rank_transform_enabled,
+            "only_features": req.only_features,
             "profit_threshold": req.profit_threshold,
             "auto_profit_quantile": req.auto_profit_quantile,
             "profit_lookahead": req.profit_lookahead,
@@ -1129,6 +1141,24 @@ async def analyze_stock(req: AnalyzeRequest):
             "topk_frac": req.topk_frac,
             "quantile_bin_count": req.quantile_bin_count,
         }
+        env_keys = [
+            "MLCHAN_RANK_TRANSFORM",
+            "MLCHAN_RANK_MIN_N",
+            "MLCHAN_RANK_FEATURES",
+            "MLCHAN_WINSORIZE",
+            "MLCHAN_WINSORIZE_LO",
+            "MLCHAN_WINSORIZE_HI",
+            "MLCHAN_WINSORIZE_MIN_N",
+            "MLCHAN_MONOTONE_MODE",
+            "MLCHAN_MONOTONE_OVERRIDES",
+            "MLCHAN_ONLY_FEATURES",
+            "MLCHAN_FORCE_FEATURES",
+            "MLCHAN_DROP_FEATURES",
+            "MLCHAN_IC_ABS_THRESHOLD",
+            "MLCHAN_IC_TOP_N",
+            "MLCHAN_IC_MIN_N",
+        ]
+        params["mlchan_env"] = {k: os.environ.get(k) for k in env_keys if os.environ.get(k) is not None}
         use_online_latest = bool(data_src == DATA_SRC.CLICK_HOUSE)
         params["use_online_latest"] = use_online_latest
         if req.use_pretrained is not None:
@@ -1274,6 +1304,8 @@ async def analyze_stock(req: AnalyzeRequest):
                     lgb_max_depth=req.lgb_max_depth,
                     lgb_reg_alpha=req.lgb_reg_alpha,
                     lgb_reg_lambda=req.lgb_reg_lambda,
+                    rank_transform_enabled=req.rank_transform_enabled,
+                    only_features=req.only_features,
                 )
                 if online_accuracy is not None:
                     online_accuracy["pretrained"] = False
@@ -1367,6 +1399,8 @@ async def analyze_stock(req: AnalyzeRequest):
                     lgb_max_depth=req.lgb_max_depth,
                     lgb_reg_alpha=req.lgb_reg_alpha,
                     lgb_reg_lambda=req.lgb_reg_lambda,
+                    rank_transform_enabled=req.rank_transform_enabled,
+                    only_features=req.only_features,
                 )
                 if accuracy_info is not None:
                     accuracy_info["pretrained"] = False

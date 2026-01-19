@@ -36,7 +36,8 @@ export const translations = {
       modelOptions: {
         xgboost: "XGBoost",
         lightgbm: "LightGBM",
-        mlp: "MLP"
+        mlp: "MLP",
+        logistic_regression: "逻辑回归"
       },
       cancel: "取消",
       delete: "删除",
@@ -69,6 +70,11 @@ export const translations = {
       strictHint: "要求顶底分型之间至少有3根非包含关系的K线。",
       enableRollingLookback: "滚动回溯",
       rollingLookbackHint: "使用滚动窗口进行训练和预测，模拟真实交易场景。",
+      rankTransform: "Rank 变换",
+      rankTransformHint: "将特征按训练集分位数映射到 0~1，用于缓解长尾分布。",
+      onlyFeatures: "仅使用特征",
+      onlyFeaturesHint: "留空表示使用默认特征；支持逗号/空格分隔。",
+      onlyFeaturesPlaceholder: "如：volatility_250",
       strategyPresets: "预设策略",
       frequency: "频率",
       macdAlgo: "MACD算法",
@@ -158,7 +164,23 @@ export const translations = {
       ensembleScores: "模型融合权重",
       online: "在线训练",
       pretrained: "预训练",
-      ensemble: "混合融合"
+      ensemble: "混合融合",
+      rankTransform: "Rank 变换",
+      enabled: "开启",
+      disabled: "关闭",
+      volatility250Max: "volatility_250 最大值",
+      volatility250Single: "volatility_250 单特征",
+      foldAuc: "折间AUC",
+      thresholdRecommendation: "阈值/TopK 交易可执行性",
+      curvePoints: "曲线点数: {n}",
+      targetWinRate: "目标胜率(%)",
+      minTrades: "最小交易数",
+      recommendedThreshold: "推荐阈值",
+      estimatedTradeCount: "预计交易数",
+      winRateAtThreshold: "该阈值胜率",
+      avgNetProfit: "平均净收益",
+      targetMet: "已达标",
+      targetNotMet: "未达标"
     },
     strategy: {
       title: "策略选股",
@@ -591,7 +613,8 @@ export const translations = {
       modelOptions: {
         xgboost: "XGBoost",
         lightgbm: "LightGBM",
-        mlp: "MLP"
+        mlp: "MLP",
+        logistic_regression: "Logistic Regression"
       },
       cancel: "Cancel",
       delete: "Delete",
@@ -623,6 +646,11 @@ export const translations = {
       strictHint: "Requires at least 3 non-included K-lines between top/bottom types.",
       enableRollingLookback: "Rolling Lookback",
       rollingLookbackHint: "Enable rolling window for training and prediction to simulate real trading scenarios.",
+      rankTransform: "Rank transform",
+      rankTransformHint: "Maps features to 0~1 by training-set ranks to reduce long-tail effects.",
+      onlyFeatures: "Only features",
+      onlyFeaturesHint: "Empty = default features. Supports comma/space separated list.",
+      onlyFeaturesPlaceholder: "e.g. volatility_250",
       strategyPresets: "Presets",
       frequency: "Frequency",
       macdAlgo: "MACD Algo",
@@ -712,7 +740,23 @@ export const translations = {
       ensembleScores: "Ensemble Weights",
       online: "Online",
       pretrained: "Pretrained",
-      ensemble: "Ensemble"
+      ensemble: "Ensemble",
+      rankTransform: "Rank transform",
+      enabled: "On",
+      disabled: "Off",
+      volatility250Max: "volatility_250 max",
+      volatility250Single: "volatility_250 single-feature",
+      foldAuc: "Fold AUC",
+      thresholdRecommendation: "Executable Threshold / TopK",
+      curvePoints: "Curve points: {n}",
+      targetWinRate: "Target win (%)",
+      minTrades: "Min trades",
+      recommendedThreshold: "Recommended threshold",
+      estimatedTradeCount: "Estimated trades",
+      winRateAtThreshold: "Win rate",
+      avgNetProfit: "Avg net profit",
+      targetMet: "Target met",
+      targetNotMet: "Target not met"
     },
     strategy: {
       title: "Strategy",
