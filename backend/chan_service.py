@@ -1367,6 +1367,28 @@ def _profit_for_info(info, lookahead: int = 3):
         profit = (base_price - future_klu.close) / (base_price or 1e-12)
     return float(profit)
 
+def _exit_ts_for_info(info, lookahead: int = 3) -> int:
+    try:
+        decision_klu = (info or {}).get("decision_klu")
+    except Exception:
+        decision_klu = None
+    bsp_obj = None
+    try:
+        bsp_obj = (info or {}).get("bsp_obj")
+    except Exception:
+        bsp_obj = None
+    cur_klu = decision_klu if decision_klu is not None else (getattr(bsp_obj, "klu", None) if bsp_obj is not None else None)
+    future_klu = cur_klu
+    for _ in range(int(lookahead or 0)):
+        nxt = getattr(future_klu, "next", None) if future_klu is not None else None
+        if nxt is None:
+            break
+        future_klu = nxt
+    try:
+        return int(getattr(getattr(future_klu, "time", None), "ts", 0) or 0)
+    except Exception:
+        return 0
+
 def _max_profit_for_info(info, lookahead: int = 3):
     decision_klu = info.get('decision_klu')
     cur_klu = decision_klu if decision_klu else info['bsp_obj'].klu
@@ -1390,6 +1412,30 @@ def _max_profit_for_info(info, lookahead: int = 3):
     if max_p == -999.0:
         return 0.0
     return float(max_p)
+
+def _min_profit_for_info(info, lookahead: int = 3):
+    decision_klu = info.get('decision_klu')
+    cur_klu = decision_klu if decision_klu else info['bsp_obj'].klu
+    base_price = cur_klu.close
+    if base_price <= 0:
+        return 0.0
+
+    future_klu = cur_klu
+    min_p = 999.0
+    for _ in range(int(lookahead or 0)):
+        nxt = getattr(future_klu, 'next', None)
+        if nxt:
+            future_klu = nxt
+            if info['is_buy']:
+                loss = (future_klu.low - base_price) / base_price
+            else:
+                loss = (base_price - future_klu.high) / base_price
+            min_p = min(min_p, loss)
+        else:
+            break
+    if min_p == 999.0:
+        return 0.0
+    return float(min_p)
 
 def _auto_profit_threshold_from_infos(infos, q: float = 0.7, min_threshold: float = 0.0, profit_lookahead: int = 3):
     profits = []
@@ -2036,7 +2082,7 @@ def _build_monotone_constraints(feature_meta, sign_map=None):
         "volatility_250": 1,
         "zs_height": 1,
         "bsp1_bi_amp": -1,
-        "bsp2_bi_amp": 1,
+        "bsp2_bi_amp": -1,
         "bsp2s_bi_amp": 1,
         "bi_last_amp_r": 1,
         "bi_prev_amp_r": 1,
@@ -2876,6 +2922,47 @@ def _roc_auc_from_probs(y, probs):
     except Exception:
         return None
 
+def _yearly_auc_from_predictions(predictions):
+    if not predictions:
+        return []
+    by_year = {}
+    for r in (predictions or []):
+        try:
+            ts = int((r or {}).get("ts") or 0)
+            p = float((r or {}).get("prob"))
+            y = int((r or {}).get("label"))
+        except Exception:
+            continue
+        if ts <= 0:
+            continue
+        try:
+            yr = int(datetime.datetime.fromtimestamp(ts).year)
+        except Exception:
+            continue
+        pack = by_year.get(yr)
+        if pack is None:
+            pack = {"y": [], "p": []}
+            by_year[yr] = pack
+        pack["y"].append(int(y))
+        pack["p"].append(float(p))
+
+    out = []
+    for yr in sorted(by_year.keys()):
+        yy = list((by_year.get(yr) or {}).get("y") or [])
+        pp = list((by_year.get(yr) or {}).get("p") or [])
+        if not yy or not pp:
+            continue
+        pos_rate = float(sum(yy) / len(yy)) if yy else 0.0
+        out.append(
+            {
+                "year": int(yr),
+                "count": int(len(yy)),
+                "pos_rate": float(pos_rate),
+                "roc_auc": _roc_auc_from_probs(yy, pp),
+            }
+        )
+    return out
+
 def _weighted_mean(pairs):
     if not pairs:
         return None
@@ -3263,6 +3350,7 @@ def _prob_summary_from_probs(probs):
             "p50": 0.0,
             "p75": 0.0,
             "p95": 0.0,
+            "p99": 0.0,
             "max": 0.0,
             "mean": 0.0,
             "std": 0.0,
@@ -3284,6 +3372,7 @@ def _prob_summary_from_probs(probs):
             "p50": 0.0,
             "p75": 0.0,
             "p95": 0.0,
+            "p99": 0.0,
             "max": 0.0,
             "mean": 0.0,
             "std": 0.0,
@@ -3321,6 +3410,7 @@ def _prob_summary_from_probs(probs):
         "p50": _q(0.50),
         "p75": _q(0.75),
         "p95": _q(0.95),
+        "p99": _q(0.99),
         "max": float(vals[-1]),
         "mean": float(mean),
         "std": float(std),
@@ -3578,6 +3668,293 @@ def _topk_vector_metrics_from_infos(
         "sharpe": _sharpe_from_returns(rets),
         "pos_win_rate": (float(sum(1 for r in pos_rets if r > 0.0) / float(len(pos_rets))) if pos_rets else 0.0),
         "bar_win_rate": (float(sum(1 for r in rets if r > 0.0) / float(len(rets))) if rets else 0.0),
+    }
+
+def _simulate_threshold_hold(predictions, threshold: float = 0.7, trade_cost: float = 0.0, long_only: bool = True, no_overlap: bool = True):
+    if not predictions:
+        return {
+            "threshold": float(threshold),
+            "trade_cost": float(trade_cost or 0.0),
+            "long_only": bool(long_only),
+            "no_overlap": bool(no_overlap),
+            "trade_count": 0,
+            "win_rate": 0.0,
+            "avg_return": 0.0,
+            "total_return": 0.0,
+            "max_drawdown": 0.0,
+            "sharpe": 0.0,
+            "profit_factor": None,
+            "equity_curve": [],
+        }
+    try:
+        thr = float(threshold)
+    except Exception:
+        thr = 0.7
+    thr = 0.0 if thr < 0.0 else (1.0 if thr > 1.0 else thr)
+    try:
+        tc = float(trade_cost or 0.0)
+    except Exception:
+        tc = 0.0
+
+    items = []
+    for r in (predictions or []):
+        if not isinstance(r, dict):
+            continue
+        try:
+            ts = int(r.get("ts") or 0)
+        except Exception:
+            ts = 0
+        if ts <= 0:
+            continue
+        items.append(r)
+    items.sort(key=lambda x: int(x.get("ts") or 0))
+
+    eq = 1.0
+    rets = []
+    curve = []
+    in_pos_until = 0
+    for r in items:
+        try:
+            ts = int(r.get("ts") or 0)
+        except Exception:
+            continue
+        if ts <= 0:
+            continue
+        if bool(no_overlap) and int(in_pos_until) > 0 and ts < int(in_pos_until):
+            continue
+        if bool(long_only) and (not bool(r.get("is_buy"))):
+            continue
+        try:
+            prob = float(r.get("prob"))
+        except Exception:
+            continue
+        if not np.isfinite(prob) or float(prob) < float(thr):
+            continue
+        try:
+            pr = float(r.get("profit"))
+        except Exception:
+            pr = 0.0
+        if not np.isfinite(pr):
+            pr = 0.0
+        rr = float(pr) - float(tc)
+        rets.append(float(rr))
+        eq = float(eq) * float(1.0 + float(rr))
+        try:
+            exit_ts = int(r.get("exit_ts") or 0)
+        except Exception:
+            exit_ts = 0
+        if exit_ts <= 0:
+            exit_ts = ts
+        curve.append({"ts": int(exit_ts), "equity": float(eq), "r": float(rr), "entry_ts": int(ts), "prob": float(prob)})
+        if bool(no_overlap):
+            in_pos_until = int(max(int(in_pos_until), int(exit_ts)))
+
+    if not rets:
+        return {
+            "threshold": float(thr),
+            "trade_cost": float(tc),
+            "long_only": bool(long_only),
+            "no_overlap": bool(no_overlap),
+            "trade_count": 0,
+            "win_rate": 0.0,
+            "avg_return": 0.0,
+            "total_return": 0.0,
+            "max_drawdown": 0.0,
+            "sharpe": 0.0,
+            "profit_factor": None,
+            "equity_curve": [],
+        }
+
+    win_rate = float(sum(1 for x in rets if float(x) > 0.0) / float(len(rets))) if rets else 0.0
+    avg_ret = float(sum(rets) / float(len(rets))) if rets else 0.0
+    pos_sum = float(sum([x for x in rets if float(x) > 0.0])) if rets else 0.0
+    neg_sum = float(sum([x for x in rets if float(x) < 0.0])) if rets else 0.0
+    pf = None
+    if neg_sum < 0.0:
+        pf = float(pos_sum / abs(float(neg_sum))) if abs(float(neg_sum)) > 0 else None
+    return {
+        "threshold": float(thr),
+        "trade_cost": float(tc),
+        "long_only": bool(long_only),
+        "no_overlap": bool(no_overlap),
+        "trade_count": int(len(rets)),
+        "win_rate": float(win_rate),
+        "avg_return": float(avg_ret),
+        "total_return": float(eq - 1.0),
+        "max_drawdown": _max_drawdown_from_returns(rets),
+        "sharpe": _sharpe_from_returns(rets),
+        "profit_factor": pf,
+        "equity_curve": curve,
+    }
+
+def _simulate_intraday_top1(predictions, min_pred: float = 0.25, trade_cost: float = 0.0, long_only: bool = True, no_overlap: bool = True):
+    if not predictions:
+        return {
+            "min_pred": float(min_pred),
+            "trade_cost": float(trade_cost or 0.0),
+            "long_only": bool(long_only),
+            "no_overlap": bool(no_overlap),
+            "trade_count": 0,
+            "win_rate": 0.0,
+            "avg_return": 0.0,
+            "total_return": 0.0,
+            "annualized_return": None,
+            "max_drawdown": 0.0,
+            "sharpe": 0.0,
+            "profit_factor": None,
+            "equity_curve": [],
+        }
+    try:
+        mp = float(min_pred)
+    except Exception:
+        mp = 0.25
+    mp = 0.0 if mp < 0.0 else (1.0 if mp > 1.0 else mp)
+    try:
+        tc = float(trade_cost or 0.0)
+    except Exception:
+        tc = 0.0
+
+    best_by_day = {}
+    for r in (predictions or []):
+        if not isinstance(r, dict):
+            continue
+        try:
+            ts = int(r.get("ts") or 0)
+        except Exception:
+            ts = 0
+        if ts <= 0:
+            continue
+        if bool(long_only) and (not bool(r.get("is_buy"))):
+            continue
+        try:
+            prob = float(r.get("prob"))
+        except Exception:
+            continue
+        if (not np.isfinite(prob)) or float(prob) < float(mp):
+            continue
+        try:
+            dt = datetime.datetime.fromtimestamp(int(ts))
+            day_key = int(dt.year) * 10000 + int(dt.month) * 100 + int(dt.day)
+        except Exception:
+            continue
+        cur = best_by_day.get(day_key)
+        if cur is None:
+            best_by_day[day_key] = r
+            continue
+        try:
+            cur_prob = float(cur.get("prob"))
+        except Exception:
+            cur_prob = float("-inf")
+        if float(prob) > float(cur_prob):
+            best_by_day[day_key] = r
+
+    days = sorted(best_by_day.keys())
+    if not days:
+        return {
+            "min_pred": float(mp),
+            "trade_cost": float(tc),
+            "long_only": bool(long_only),
+            "no_overlap": bool(no_overlap),
+            "trade_count": 0,
+            "win_rate": 0.0,
+            "avg_return": 0.0,
+            "total_return": 0.0,
+            "annualized_return": None,
+            "max_drawdown": 0.0,
+            "sharpe": 0.0,
+            "profit_factor": None,
+            "equity_curve": [],
+        }
+
+    eq = 1.0
+    rets = []
+    curve = []
+    in_pos_until = 0
+    first_exit_ts = 0
+    last_exit_ts = 0
+    for dk in days:
+        r = best_by_day.get(dk) or {}
+        try:
+            ts = int(r.get("ts") or 0)
+        except Exception:
+            continue
+        if ts <= 0:
+            continue
+        if bool(no_overlap) and int(in_pos_until) > 0 and ts < int(in_pos_until):
+            continue
+        try:
+            pr = float(r.get("profit"))
+        except Exception:
+            pr = 0.0
+        if not np.isfinite(pr):
+            pr = 0.0
+        rr = float(pr) - float(tc)
+        rets.append(float(rr))
+        eq = float(eq) * float(1.0 + float(rr))
+        try:
+            exit_ts = int(r.get("exit_ts") or 0)
+        except Exception:
+            exit_ts = 0
+        if exit_ts <= 0:
+            exit_ts = ts
+        if first_exit_ts <= 0:
+            first_exit_ts = int(exit_ts)
+        last_exit_ts = int(exit_ts)
+        try:
+            prob = float(r.get("prob"))
+        except Exception:
+            prob = 0.0
+        curve.append({"ts": int(exit_ts), "equity": float(eq), "r": float(rr), "entry_ts": int(ts), "prob": float(prob), "day": int(dk)})
+        if bool(no_overlap):
+            in_pos_until = int(max(int(in_pos_until), int(exit_ts)))
+
+    if not rets:
+        return {
+            "min_pred": float(mp),
+            "trade_cost": float(tc),
+            "long_only": bool(long_only),
+            "no_overlap": bool(no_overlap),
+            "trade_count": 0,
+            "win_rate": 0.0,
+            "avg_return": 0.0,
+            "total_return": 0.0,
+            "annualized_return": None,
+            "max_drawdown": 0.0,
+            "sharpe": 0.0,
+            "profit_factor": None,
+            "equity_curve": [],
+        }
+
+    win_rate = float(sum(1 for x in rets if float(x) > 0.0) / float(len(rets))) if rets else 0.0
+    avg_ret = float(sum(rets) / float(len(rets))) if rets else 0.0
+    pos_sum = float(sum([x for x in rets if float(x) > 0.0])) if rets else 0.0
+    neg_sum = float(sum([x for x in rets if float(x) < 0.0])) if rets else 0.0
+    pf = None
+    if neg_sum < 0.0:
+        pf = float(pos_sum / abs(float(neg_sum))) if abs(float(neg_sum)) > 0 else None
+    ann = None
+    if first_exit_ts > 0 and last_exit_ts > first_exit_ts:
+        span_days = float(last_exit_ts - first_exit_ts) / 86400.0
+        if span_days > 0.0:
+            try:
+                ann = float((float(eq) ** (365.0 / float(span_days))) - 1.0)
+            except Exception:
+                ann = None
+
+    return {
+        "min_pred": float(mp),
+        "trade_cost": float(tc),
+        "long_only": bool(long_only),
+        "no_overlap": bool(no_overlap),
+        "trade_count": int(len(rets)),
+        "win_rate": float(win_rate),
+        "avg_return": float(avg_ret),
+        "total_return": float(eq - 1.0),
+        "annualized_return": ann,
+        "max_drawdown": _max_drawdown_from_returns(rets),
+        "sharpe": _sharpe_from_returns(rets),
+        "profit_factor": pf,
+        "equity_curve": curve,
     }
 
 def _feature_meta_from_infos(infos):
@@ -4192,6 +4569,61 @@ def _walk_forward_eval_infos(
     else:
         advice.append("Brier <= 0.25：概率质量可用，可尝试阈值或分桶策略。")
 
+    predictions = [
+        {
+            "ts": int(getattr(infos_all[i].get("open_time"), "ts", 0) or 0) if i < len(infos_all) and infos_all[i] else 0,
+            "exit_ts": (int(_exit_ts_for_info(infos_all[i], lookahead=profit_lookahead)) if i < len(infos_all) and infos_all[i] else 0),
+            "prob": float(p_all[i]),
+            "label": int(y_all[i]),
+            "is_buy": (bool(infos_all[i].get("is_buy")) if i < len(infos_all) and infos_all[i] else False),
+            "profit": (float(_profit_for_info(infos_all[i], lookahead=profit_lookahead)) if i < len(infos_all) and infos_all[i] else 0.0),
+            "min_profit": (float(_min_profit_for_info(infos_all[i], lookahead=profit_lookahead)) if i < len(infos_all) and infos_all[i] else 0.0),
+        }
+        for i in range(len(p_all))
+    ]
+    buy_probs = []
+    sell_probs = []
+    for r in predictions:
+        try:
+            p = float(r.get("prob"))
+        except Exception:
+            p = 0.0
+        if bool(r.get("is_buy")):
+            buy_probs.append(p)
+        else:
+            sell_probs.append(p)
+    yearly_auc = _yearly_auc_from_predictions(predictions)
+    try:
+        hold_sim_070 = _simulate_threshold_hold(predictions, threshold=0.7, trade_cost=trade_cost, long_only=True, no_overlap=True)
+        if isinstance(hold_sim_070, dict):
+            hold_sim_070["holding_period"] = int(profit_lookahead or 0)
+            hold_sim_070["signal"] = "prob>=0.7 & is_buy"
+
+        hold_sim_055 = _simulate_threshold_hold(predictions, threshold=0.55, trade_cost=trade_cost, long_only=True, no_overlap=True)
+        if isinstance(hold_sim_055, dict):
+            hold_sim_055["holding_period"] = int(profit_lookahead or 0)
+            hold_sim_055["signal"] = "prob>=0.55 & is_buy"
+        hold_sim_030 = _simulate_threshold_hold(predictions, threshold=0.30, trade_cost=trade_cost, long_only=True, no_overlap=True)
+        if isinstance(hold_sim_030, dict):
+            hold_sim_030["holding_period"] = int(profit_lookahead or 0)
+            hold_sim_030["signal"] = "prob>=0.30 & is_buy"
+        hold_sim_025 = _simulate_threshold_hold(predictions, threshold=0.25, trade_cost=trade_cost, long_only=True, no_overlap=True)
+        if isinstance(hold_sim_025, dict):
+            hold_sim_025["holding_period"] = int(profit_lookahead or 0)
+            hold_sim_025["signal"] = "prob>=0.25 & is_buy"
+        intraday_top1 = _simulate_intraday_top1(predictions, min_pred=0.25, trade_cost=trade_cost, long_only=True, no_overlap=True)
+        if isinstance(intraday_top1, dict):
+            intraday_top1["holding_period"] = int(profit_lookahead or 0)
+            intraday_top1["signal"] = "top1_per_day & prob>=0.25 & is_buy"
+        if isinstance(trading, dict):
+            trading["threshold_hold_070"] = hold_sim_070
+            trading["threshold_hold_055"] = hold_sim_055
+            trading["threshold_hold_030"] = hold_sim_030
+            trading["threshold_hold_025"] = hold_sim_025
+            trading["intraday_top1"] = intraday_top1
+    except Exception:
+        pass
+
     return {
         "valid_count": int(total_correct),
         "total_count": int(total_count),
@@ -4214,6 +4646,9 @@ def _walk_forward_eval_infos(
         "pr_auc": pr_auc_val,
         "ece": float(ece),
         "prob_summary": _prob_summary_from_probs(p_all),
+        "prob_summary_all": _prob_summary_from_probs(p_all),
+        "prob_summary_buy": _prob_summary_from_probs(buy_probs),
+        "prob_summary_sell": _prob_summary_from_probs(sell_probs),
         "strategy_advice": advice,
         "calibration_bins": bins_fixed,
         "precision_at_0.7": _precision_at_threshold_from_probs(y_all, p_all, threshold=0.7),
@@ -4258,14 +4693,8 @@ def _walk_forward_eval_infos(
         },
         "debug_feature_checks_oos": _debug_feature_checks_from_collections(dbg_oos),
         "trading": trading,
-        "predictions": [
-            {
-                "ts": int(getattr(infos_all[i].get("open_time"), "ts", 0) or 0) if i < len(infos_all) and infos_all[i] else 0,
-                "prob": float(p_all[i]),
-                "label": int(y_all[i])
-            }
-            for i in range(len(p_all))
-        ]
+        "yearly_auc": yearly_auc,
+        "predictions": predictions,
     }, {
         "probs": p_all,
         "y": y_all,

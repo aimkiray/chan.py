@@ -4,7 +4,6 @@ import datetime
 import concurrent.futures
 import traceback
 from typing import List, Dict, Optional, Tuple, Any
-import akshare as ak
 from sqlalchemy.orm import Session
 
 from backend.chan_service import (
@@ -13,8 +12,10 @@ from backend.chan_service import (
     stragety_feature,
     extract_state_features_from_cur_lv,
     load_pretrained_model_bundle,
+    load_pretrained_model_bundle_by_key,
     predict_proba_1,
-    get_stock_name
+    get_stock_name,
+    normalize_code,
 )
 from Common.CEnum import KL_TYPE, DATA_SRC, AUTYPE
 from ChanConfig import CChanConfig
@@ -25,6 +26,7 @@ def get_chinext50_stocks() -> List[str]:
     Get ChiNext 50 stocks.
     """
     try:
+        import akshare as ak
         # Try akshare first
         # 399673 is ChiNext 50 index code
         df = ak.index_stock_cons(symbol="399673")
@@ -34,11 +36,11 @@ def get_chinext50_stocks() -> List[str]:
             # typical columns: variety, date, symbol, name...
             # symbol is usually the code.
             if 'stock_code' in df.columns:
-                return df['stock_code'].tolist()
+                return [normalize_code(str(x)) for x in df['stock_code'].tolist()]
             if '品种代码' in df.columns:
-                return df['品种代码'].tolist()
+                return [normalize_code(str(x)) for x in df['品种代码'].tolist()]
             # Fallback: check first column
-            return df.iloc[:, 0].tolist()
+            return [normalize_code(str(x)) for x in df.iloc[:, 0].tolist()]
     except Exception as e:
         print(f"Error getting ChiNext 50 from akshare: {e}")
     
@@ -50,20 +52,24 @@ def _calc_stock_signals(
     end_time: str,
     model_bundle: Any,
     kl_type=KL_TYPE.K_30M,
-    data_src=DATA_SRC.CLICK_HOUSE
+    data_src=DATA_SRC.CLICK_HOUSE,
+    autype=AUTYPE.QFQ,
+    enable_rolling_lookback: bool = True,
+    score_feature: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Calculate signals for a single stock.
     Returns DataFrame with index=time, columns=[score, price].
     """
     try:
+        code = normalize_code(str(code))
         kl_list = fetch_stock_data(
             code,
             kl_type,
             begin_time,
             end_time,
             data_src,
-            autype=AUTYPE.HFQ
+            autype=autype
         )
         
         if not kl_list or len(kl_list) < 100:
@@ -88,16 +94,28 @@ def _calc_stock_signals(
         chan = CChanCustom(
             code=code,
             begin_time=begin_time,
-            end_time=None,
+            end_time=end_time,
             data_src=data_src,
             lv_list=[kl_type],
             config=chan_config,
-            autype=AUTYPE.HFQ,
+            autype=autype,
             preloaded_data=kl_list
         )
 
-        bst = model_bundle['bst']
-        feature_meta = model_bundle['feature_meta']
+        used_score_feature = str(score_feature or "").strip()
+        if used_score_feature:
+            bst = None
+            feature_meta = None
+        else:
+            bst = None
+            if isinstance(model_bundle, dict):
+                bst = model_bundle.get("bst")
+                if bst is None:
+                    bst = model_bundle.get("model")
+
+            feature_meta = model_bundle.get("feature_meta") if isinstance(model_bundle, dict) else None
+            if bst is None or not isinstance(feature_meta, list) or len(feature_meta) <= 0:
+                return pd.DataFrame()
         
         results = []
         
@@ -133,7 +151,7 @@ def _calc_stock_signals(
             # We need to extract features.
             
             try:
-                feat_dict = stragety_feature(last_klu, enable_rolling_lookback=True)
+                feat_dict = stragety_feature(last_klu, enable_rolling_lookback=enable_rolling_lookback)
                 # Add state features
                 state_feat = extract_state_features_from_cur_lv(cur_lv_chan, last_klu)
                 if state_feat:
@@ -145,8 +163,17 @@ def _calc_stock_signals(
                         # Fallback if it's an object with to_dict or similar, or just try to merge
                         pass
                 
-                feat_vec = [feat_dict.get(k, -9999999) for k in feature_meta]
-                score = float(predict_proba_1(bst, [feat_vec])[0])
+                if used_score_feature:
+                    raw = feat_dict.get(used_score_feature, np.nan)
+                    try:
+                        score = float(raw)
+                    except Exception:
+                        score = float("nan")
+                    if not np.isfinite(score):
+                        continue
+                else:
+                    feat_vec = [feat_dict.get(k, -9999999) for k in feature_meta]
+                    score = float(predict_proba_1(bst, [feat_vec])[0])
                 
                 results.append({
                     "time": pd.to_datetime(ts),
@@ -174,30 +201,77 @@ class VectorBacktester:
             model_key: Optional[str] = None,
             **kwargs
     ) -> Dict[str, Any]:
-        
-        # 1. Load Model
-        # If model_key is not provided, find the best one or latest one
+        pool_codes = [normalize_code(str(c)) for c in (pool_codes or []) if str(c or "").strip()]
+        pool_codes = list(dict.fromkeys(pool_codes))
+        if not pool_codes:
+            return {"error": "No pool codes."}
+
+        freq = str(kwargs.get("frequency", "1d") or "1d").strip().lower()
+        freq_map = {
+            "1d": KL_TYPE.K_DAY,
+            "30m": KL_TYPE.K_30M,
+            "60m": KL_TYPE.K_60M,
+            "15m": KL_TYPE.K_15M,
+            "5m": KL_TYPE.K_5M,
+            "1m": KL_TYPE.K_1M,
+            "1w": KL_TYPE.K_WEEK,
+            "1mo": KL_TYPE.K_MON,
+        }
+        kl_type = freq_map.get(freq, KL_TYPE.K_DAY)
+
+        data_src_raw = str(kwargs.get("data_src", "clickhouse") or "clickhouse").strip().lower()
+        src_map = {
+            "baostock": DATA_SRC.BAO_STOCK,
+            "akshare": DATA_SRC.AK_SHARE,
+            "ccxt": DATA_SRC.CCXT,
+            "csv": DATA_SRC.CSV,
+            "clickhouse": DATA_SRC.CLICK_HOUSE,
+        }
+        data_src = src_map.get(data_src_raw, DATA_SRC.CLICK_HOUSE)
+
+        raw_autype = str(kwargs.get("autype", "qfq") or "qfq").strip().lower()
+        autype_map = {
+            "qfq": AUTYPE.QFQ,
+            "hfq": AUTYPE.HFQ,
+            "none": AUTYPE.NONE,
+        }
+        autype = autype_map.get(raw_autype, AUTYPE.QFQ)
+        enable_rolling_lookback = bool(kwargs.get("enable_rolling_lookback", True))
+
+        score_feature = str(kwargs.get("score_feature") or "").strip()
+
+        # 1. Load Model (unless factor backtest)
         model_bundle = None
-        if model_key:
-            model_bundle = load_pretrained_model_bundle_by_key(model_key)
-        else:
-            # TODO: Auto find model
-            # For now, require model_key or fail/mock
-            pass
-            
-        if not model_bundle:
-            # Fallback: Mock or Error
-            # For "Simple Vector Backtest" requested by user, if they haven't trained a model, this will fail.
-            # I should probably warn.
-            # But let's assume there is a model or we can use a dummy one if needed.
-            return {"error": "No model found. Please train a model first."}
+        if not score_feature:
+            if model_key:
+                model_bundle = load_pretrained_model_bundle_by_key(model_key)
+            else:
+                pass
+            if not model_bundle:
+                return {"error": "No model found. Please train a model first."}
 
         # 2. Parallel Compute Signals
         # 50 stocks is small enough for ThreadPool/ProcessPool
         all_signals = []
-        with concurrent.futures.ProcessPoolExecutor(max_workers=min(10, len(pool_codes))) as executor:
+        try:
+            max_workers = int(kwargs.get("max_workers", 8))
+        except Exception:
+            max_workers = 8
+        max_workers = max(1, min(int(max_workers), int(len(pool_codes))))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(_calc_stock_signals, code, start_date, end_date, model_bundle): code 
+                executor.submit(
+                    _calc_stock_signals,
+                    code,
+                    start_date,
+                    end_date,
+                    model_bundle,
+                    kl_type,
+                    data_src,
+                    autype,
+                    enable_rolling_lookback,
+                    score_feature,
+                ): code
                 for code in pool_codes
             }
             for future in concurrent.futures.as_completed(futures):
@@ -222,14 +296,37 @@ class VectorBacktester:
         
         # Fill NaNs? Forward fill price, fill 0 for score
         price_df = price_df.ffill()
-        score_df = score_df.fillna(0)
+        score_df = score_df.astype(float)
+
+        score_mode = str(kwargs.get("score_mode", "raw") or "raw").strip().lower()
+        score_higher_is_better = bool(kwargs.get("score_higher_is_better", True))
+        if score_mode in ["rank", "cross_section_rank", "cross_sectional_rank", "cs_rank"]:
+            score_df = score_df.rank(axis=1, pct=True, ascending=not bool(score_higher_is_better))
+        score_df = score_df.fillna(float("-inf"))
         
         # 4. Vector Simulation
         # Parameters
-        HOLD_PERIODS = int(kwargs.get("holding_period", 3)) # 90 mins / 30 mins
+        HOLD_PERIODS = int(kwargs.get("holding_period", 5))
         TOP_N = int(kwargs.get("portfolio_top_n", 2))
-        SCORE_THR = float(kwargs.get("min_signal_score", 0.6))
-        CAPITAL = 100000.0
+        top_frac = kwargs.get("portfolio_top_frac", None)
+        if (top_frac is not None) and (TOP_N <= 0):
+            try:
+                tf = float(top_frac)
+            except Exception:
+                tf = None
+            if tf is not None and tf > 0:
+                TOP_N = max(1, int(np.ceil(tf * float(len(pool_codes)))))
+        min_signal_score = kwargs.get("min_signal_score", None)
+        if min_signal_score in ["", "null", "None"]:
+            min_signal_score = None
+        try:
+            SCORE_THR = float(min_signal_score) if min_signal_score is not None else float("-inf")
+        except Exception:
+            SCORE_THR = float("-inf")
+        try:
+            CAPITAL = float(kwargs.get("initial_capital", 100000.0))
+        except Exception:
+            CAPITAL = 100000.0
         
         # State
         positions = {} # code -> {entry_price, entry_time_idx, shares}
@@ -262,7 +359,9 @@ class VectorBacktester:
             for code in to_exit:
                 pos = positions.pop(code)
                 exit_price = todays_prices.get(code)
-                cash += pos['shares'] * exit_price
+                if pd.isna(exit_price):
+                    exit_price = pos["entry_price"]
+                cash += pos['shares'] * float(exit_price)
             
             # 2. Rank and Buy
             # Available slots
@@ -316,7 +415,9 @@ class VectorBacktester:
             step_equity = cash
             for code, pos in positions.items():
                 p = todays_prices.get(code)
-                step_equity += pos['shares'] * p
+                if pd.isna(p):
+                    p = pos["entry_price"]
+                step_equity += pos['shares'] * float(p)
             
             equity_curve.append({"time": t, "equity": step_equity})
             
@@ -327,7 +428,18 @@ class VectorBacktester:
         total_ret = (eq_df['equity'].iloc[-1] / CAPITAL) - 1
         sharpe = 0
         if eq_df['ret'].std() > 0:
-            sharpe = (eq_df['ret'].mean() / eq_df['ret'].std()) * np.sqrt(250 * 8) # Annualized (assuming 8 30m bars/day * 250 days? roughly)
+            annual = 250.0
+            if kl_type == KL_TYPE.K_30M:
+                annual = 250.0 * 8.0
+            elif kl_type == KL_TYPE.K_60M:
+                annual = 250.0 * 4.0
+            elif kl_type == KL_TYPE.K_15M:
+                annual = 250.0 * 16.0
+            elif kl_type == KL_TYPE.K_5M:
+                annual = 250.0 * 48.0
+            elif kl_type == KL_TYPE.K_1M:
+                annual = 250.0 * 240.0
+            sharpe = (eq_df['ret'].mean() / eq_df['ret'].std()) * np.sqrt(float(annual))
             
         # Max Drawdown
         eq_df['cummax'] = eq_df['equity'].cummax()
@@ -343,4 +455,3 @@ class VectorBacktester:
             },
             "equity_curve": eq_df['equity'].reset_index().to_dict(orient='records')
         }
-

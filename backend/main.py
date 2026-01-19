@@ -272,6 +272,7 @@ def _shrink_accuracy_result(result):
         "accuracy",
         "roc_auc",
         "pr_auc",
+        "yearly_auc",
         "brier_score",
         "ece",
         "logloss",
@@ -973,6 +974,37 @@ class VectorBacktestRequest(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     model_key: Optional[str] = None
+    frequency: str = "1d"
+    data_src: str = "clickhouse"
+    autype: str = "qfq"
+    enable_rolling_lookback: bool = True
+    portfolio_top_n: int = 2
+    portfolio_top_frac: Optional[float] = None
+    holding_period: int = 5
+    min_signal_score: Optional[float] = None
+    initial_capital: float = 100000.0
+    max_workers: int = 8
+    score_feature: Optional[str] = None
+    score_mode: str = "raw"
+    score_higher_is_better: bool = True
+
+class WolfpackBacktestRequest(BaseModel):
+    pool_id: str = "index:IDX399673"
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    frequency: str = "30m"
+    data_src: str = "clickhouse"
+    autype: str = "qfq"
+    enable_rolling_lookback: bool = True
+    holding_period: int = 3
+    min_prob: float = 0.25
+    trade_cost: float = 0.0002
+    portfolio_top_n: int = 3
+    index_filter_enabled: bool = True
+    index_code: str = "399006"
+    index_ma_window: int = 20
+    stop_loss: float = -0.03
+    max_workers: int = 8
 
 @app.post("/api/backtest/vector")
 async def run_vector_backtest(req: VectorBacktestRequest):
@@ -1004,9 +1036,11 @@ async def run_vector_backtest(req: VectorBacktestRequest):
     
     # Determine pool
     pool_codes = []
-    if req.pool_id == "chinext50":
+    if req.pool_id in ["chinext50", "chinext10"]:
         from backend.vector_backtest import get_chinext50_stocks
         pool_codes = get_chinext50_stocks()
+        if req.pool_id == "chinext10":
+            pool_codes = list(pool_codes or [])[:10]
     else:
         # TODO: Support other pools
         pass
@@ -1017,8 +1051,77 @@ async def run_vector_backtest(req: VectorBacktestRequest):
          
     # Run
     # Warning: This is blocking. In production, use background task.
-    result = tester.run(pool_codes, start, end, req.model_key)
+    result = tester.run(
+        pool_codes,
+        start,
+        end,
+        req.model_key,
+        frequency=req.frequency,
+        data_src=req.data_src,
+        autype=req.autype,
+        enable_rolling_lookback=req.enable_rolling_lookback,
+        portfolio_top_n=req.portfolio_top_n,
+        portfolio_top_frac=req.portfolio_top_frac,
+        holding_period=req.holding_period,
+        min_signal_score=req.min_signal_score,
+        initial_capital=req.initial_capital,
+        max_workers=req.max_workers,
+        score_feature=req.score_feature,
+        score_mode=req.score_mode,
+        score_higher_is_better=req.score_higher_is_better,
+    )
     return result
+
+@app.post("/api/backtest/wolfpack")
+async def run_wolfpack_backtest(req: WolfpackBacktestRequest):
+    import datetime
+    end = req.end_date
+    if not end:
+        end = datetime.datetime.now().strftime("%Y-%m-%d")
+    start = req.start_date
+    if not start:
+        start = (datetime.datetime.now() - datetime.timedelta(days=365 * 5)).strftime("%Y-%m-%d")
+
+    from DataAPI.ClickHouseAPI import CClickHouseAPI
+    pool_codes = CClickHouseAPI.get_pool_members(req.pool_id)
+    if not pool_codes:
+        try:
+            pools = CClickHouseAPI.list_stock_pools(table="stock_constituent")
+        except Exception:
+            pools = []
+        picked = None
+        for p in (pools or []):
+            pid = str((p or {}).get("pool_id") or "")
+            nm = str((p or {}).get("pool_name") or "")
+            if "399673" in pid or "399673" in nm or "创业板50" in nm:
+                picked = pid
+                break
+        if picked:
+            pool_codes = CClickHouseAPI.get_pool_members(picked)
+        if not pool_codes:
+            from backend.vector_backtest import get_chinext50_stocks
+            pool_codes = get_chinext50_stocks()
+
+    from backend.wolfpack_backtest import WolfpackBacktester
+    tester = WolfpackBacktester()
+    return tester.run(
+        pool_codes,
+        start,
+        end,
+        frequency=req.frequency,
+        data_src=req.data_src,
+        autype=req.autype,
+        enable_rolling_lookback=req.enable_rolling_lookback,
+        min_prob=req.min_prob,
+        holding_period=req.holding_period,
+        trade_cost=req.trade_cost,
+        portfolio_top_n=req.portfolio_top_n,
+        index_filter_enabled=req.index_filter_enabled,
+        index_code=req.index_code,
+        index_ma_window=req.index_ma_window,
+        stop_loss=req.stop_loss,
+        max_workers=req.max_workers,
+    )
 
 @app.post("/api/analyze")
 async def analyze_stock(req: AnalyzeRequest):
