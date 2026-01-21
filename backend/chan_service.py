@@ -1075,6 +1075,8 @@ def extract_state_features_from_cur_lv(cur_lv_chan, last_klu):
             out["zs_last_mid_r"] = float(mid / denom)
             out["zs_last_pos"] = float((close - low) / (width + 1e-12))
             out["zs_last_is_sure"] = 1 if bool(getattr(last_zs, "is_sure", False)) else 0
+            if low > 0:
+                out["zs_last_height"] = float(width / (low + 1e-12))
             try:
                 end_klu = getattr(last_zs, "end", None)
                 end_idx = int(getattr(end_klu, "idx", 0) or 0)
@@ -1097,7 +1099,7 @@ def extract_state_features(chan_snapshot):
     return extract_state_features_from_cur_lv(cur_lv_chan, last_klu)
 
 
-def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, data_src_type=DATA_SRC.BAO_STOCK, preloaded_data=None, do_predict=False, begin_time=None, end_time=None, enable_rolling_lookback=True, autype: AUTYPE = AUTYPE.QFQ):
+def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, data_src_type=DATA_SRC.BAO_STOCK, preloaded_data=None, do_predict=False, begin_time=None, end_time=None, enable_rolling_lookback=True, autype: AUTYPE = AUTYPE.QFQ, rolling_sample_mode: Optional[str] = None, rolling_stride: Optional[int] = None):
     code = normalize_code(code)
     
     # Adjust begin_time based on frequency to avoid fetching too much data
@@ -1169,23 +1171,25 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
         kl_count = 0
         bsp_count = 0
         rolling_count = 0
-        raw_stride = os.environ.get("MLCHAN_ROLLING_SAMPLE_STRIDE")
-        if raw_stride is None or str(raw_stride).strip() == "":
-            default_stride_by_level = {
-                KL_TYPE.K_1M: 20,
-                KL_TYPE.K_5M: 8,
-                KL_TYPE.K_15M: 4,
-                KL_TYPE.K_30M: 4,
-                KL_TYPE.K_60M: 2,
-            }
-            rolling_stride = int(default_stride_by_level.get(level, 1))
-        else:
-            try:
-                rolling_stride = int(str(raw_stride).strip() or "1")
-            except Exception:
-                rolling_stride = 1
-        rolling_stride = max(1, rolling_stride)
+        if rolling_stride is None:
+            raw_stride = os.environ.get("MLCHAN_ROLLING_SAMPLE_STRIDE")
+            if raw_stride is None or str(raw_stride).strip() == "":
+                default_stride_by_level = {
+                    KL_TYPE.K_1M: 20,
+                    KL_TYPE.K_5M: 8,
+                    KL_TYPE.K_15M: 4,
+                    KL_TYPE.K_30M: 4,
+                    KL_TYPE.K_60M: 2,
+                }
+                rolling_stride = int(default_stride_by_level.get(level, 1))
+            else:
+                try:
+                    rolling_stride = int(str(raw_stride).strip() or "1")
+                except Exception:
+                    rolling_stride = 1
+        rolling_stride = max(1, int(rolling_stride or 1))
         rolling_enabled = str(os.environ.get("MLCHAN_ROLLING_SAMPLE_ENABLED", "1") or "1").strip().lower() not in ["0", "false", "no", "off"]
+        rolling_mode = str(rolling_sample_mode or os.environ.get("MLCHAN_ROLLING_SAMPLE_MODE", "bsp") or "bsp").strip().lower()
         rolling_key_base = 10_000_000_000
         
         # Iterate through steps to collect training samples
@@ -1197,16 +1201,12 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
             
             last_klu = chan_snapshot[0][-1][-1]
             bsp_list = chan_snapshot.get_latest_bsp()
-            
-            if not bsp_list:
-                continue
-                
-            last_bsp = bsp_list[0]
+            last_bsp = bsp_list[0] if bsp_list else None
             cur_lv_chan = chan_snapshot[0]
             state_feat = extract_state_features_from_cur_lv(cur_lv_chan, last_klu)
             
             # Record BSP when it appears
-            if last_bsp.klu.idx not in bsp_dict and cur_lv_chan[-2].idx == last_bsp.klu.klc.idx:
+            if last_bsp and last_bsp.klu.idx not in bsp_dict and cur_lv_chan[-2].idx == last_bsp.klu.klc.idx:
                 bsp_count += 1
                 feat_copy = CFeatures(dict(last_bsp.features.items()))
                 if state_feat:
@@ -1227,10 +1227,19 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
                 }
 
             if rolling_enabled and (i % rolling_stride == 0):
-                rk = rolling_key_base + int(last_klu.idx) * 2 + (1 if bool(last_bsp.is_buy) else 0)
+                is_buy = True
+                base_feat = {}
+                bsp_obj = None
+                if rolling_mode == "bsp":
+                    if not last_bsp:
+                        continue
+                    is_buy = bool(last_bsp.is_buy)
+                    base_feat = dict(last_bsp.features.items())
+                    bsp_obj = last_bsp
+                rk = rolling_key_base + int(last_klu.idx) * 2 + (1 if bool(is_buy) else 0)
                 if rk not in bsp_dict:
                     rolling_count += 1
-                    feat_copy = CFeatures(dict(last_bsp.features.items()))
+                    feat_copy = CFeatures(dict(base_feat.items()))
                     if state_feat:
                         try:
                             feat_copy.add_feat(state_feat)
@@ -1242,9 +1251,9 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
                         pass
                     bsp_dict[rk] = {
                         "feature": feat_copy,
-                        "is_buy": last_bsp.is_buy,
+                        "is_buy": bool(is_buy),
                         "open_time": last_klu.time,
-                        "bsp_obj": last_bsp,
+                        "bsp_obj": bsp_obj,
                         "decision_klu": last_klu,
                     }
 
@@ -1350,24 +1359,70 @@ def _atr_pct_from_klu(klu, period: int = 14):
         return None
     return out
 
-def _profit_for_info(info, lookahead: int = 3):
+def _day_key_from_ts(ts: int) -> Optional[int]:
+    try:
+        dt = datetime.datetime.fromtimestamp(int(ts))
+    except Exception:
+        return None
+    return int(dt.year) * 10000 + int(dt.month) * 100 + int(dt.day)
+
+
+def _t1_exit_klu(cur_klu, lookahead: int = 3):
+    if cur_klu is None:
+        return None
+    future_klu = cur_klu
+    for _ in range(int(lookahead or 0)):
+        nxt = getattr(future_klu, "next", None)
+        if nxt is None:
+            break
+        future_klu = nxt
+    try:
+        entry_ts = int(getattr(getattr(cur_klu, "time", None), "ts", 0) or 0)
+    except Exception:
+        entry_ts = 0
+    if entry_ts <= 0:
+        return future_klu
+    entry_dk = _day_key_from_ts(entry_ts)
+    if entry_dk is None:
+        return future_klu
+    while future_klu is not None:
+        try:
+            ts = int(getattr(getattr(future_klu, "time", None), "ts", 0) or 0)
+        except Exception:
+            ts = 0
+        if ts <= 0:
+            return future_klu
+        dk = _day_key_from_ts(ts)
+        if dk is None or int(dk) > int(entry_dk):
+            return future_klu
+        nxt = getattr(future_klu, "next", None)
+        if nxt is None:
+            return future_klu
+        future_klu = nxt
+    return future_klu
+
+
+def _profit_for_info(info, lookahead: int = 3, enforce_t1: bool = False):
     decision_klu = info.get('decision_klu')
     cur_klu = decision_klu if decision_klu else info['bsp_obj'].klu
     base_price = cur_klu.close
-    future_klu = cur_klu
-    for _ in range(int(lookahead or 0)):
-        nxt = getattr(future_klu, 'next', None)
-        if nxt:
-            future_klu = nxt
-        else:
-            break
+    if bool(enforce_t1):
+        future_klu = _t1_exit_klu(cur_klu, lookahead=lookahead)
+    else:
+        future_klu = cur_klu
+        for _ in range(int(lookahead or 0)):
+            nxt = getattr(future_klu, 'next', None)
+            if nxt:
+                future_klu = nxt
+            else:
+                break
     if info['is_buy']:
         profit = (future_klu.close - base_price) / (base_price or 1e-12)
     else:
         profit = (base_price - future_klu.close) / (base_price or 1e-12)
     return float(profit)
 
-def _exit_ts_for_info(info, lookahead: int = 3) -> int:
+def _exit_ts_for_info(info, lookahead: int = 3, enforce_t1: bool = False) -> int:
     try:
         decision_klu = (info or {}).get("decision_klu")
     except Exception:
@@ -1378,70 +1433,89 @@ def _exit_ts_for_info(info, lookahead: int = 3) -> int:
     except Exception:
         bsp_obj = None
     cur_klu = decision_klu if decision_klu is not None else (getattr(bsp_obj, "klu", None) if bsp_obj is not None else None)
-    future_klu = cur_klu
-    for _ in range(int(lookahead or 0)):
-        nxt = getattr(future_klu, "next", None) if future_klu is not None else None
-        if nxt is None:
-            break
-        future_klu = nxt
+    if bool(enforce_t1):
+        future_klu = _t1_exit_klu(cur_klu, lookahead=lookahead)
+    else:
+        future_klu = cur_klu
+        for _ in range(int(lookahead or 0)):
+            nxt = getattr(future_klu, "next", None) if future_klu is not None else None
+            if nxt is None:
+                break
+            future_klu = nxt
     try:
         return int(getattr(getattr(future_klu, "time", None), "ts", 0) or 0)
     except Exception:
         return 0
 
-def _max_profit_for_info(info, lookahead: int = 3):
+def _max_profit_for_info(info, lookahead: int = 3, enforce_t1: bool = False):
     decision_klu = info.get('decision_klu')
     cur_klu = decision_klu if decision_klu else info['bsp_obj'].klu
     base_price = cur_klu.close
     if base_price <= 0: return 0.0
-    
+
+    exit_klu = _t1_exit_klu(cur_klu, lookahead=lookahead) if bool(enforce_t1) else None
     future_klu = cur_klu
     max_p = -999.0
-    for _ in range(int(lookahead or 0)):
+    while True:
         nxt = getattr(future_klu, 'next', None)
-        if nxt:
-            future_klu = nxt
-            if info['is_buy']:
-                gain = (future_klu.high - base_price) / base_price
-            else:
-                gain = (base_price - future_klu.low) / base_price
-            max_p = max(max_p, gain)
-        else:
+        if nxt is None:
             break
+        future_klu = nxt
+        if info['is_buy']:
+            gain = (future_klu.high - base_price) / base_price
+        else:
+            gain = (base_price - future_klu.low) / base_price
+        max_p = max(max_p, gain)
+        if exit_klu is not None and future_klu is exit_klu:
+            break
+        if exit_klu is None:
+            if int(lookahead or 0) <= 0:
+                break
+            lookahead = int(lookahead) - 1
+            if int(lookahead) <= 0:
+                break
     
     if max_p == -999.0:
         return 0.0
     return float(max_p)
 
-def _min_profit_for_info(info, lookahead: int = 3):
+def _min_profit_for_info(info, lookahead: int = 3, enforce_t1: bool = False):
     decision_klu = info.get('decision_klu')
     cur_klu = decision_klu if decision_klu else info['bsp_obj'].klu
     base_price = cur_klu.close
     if base_price <= 0:
         return 0.0
 
+    exit_klu = _t1_exit_klu(cur_klu, lookahead=lookahead) if bool(enforce_t1) else None
     future_klu = cur_klu
     min_p = 999.0
-    for _ in range(int(lookahead or 0)):
+    while True:
         nxt = getattr(future_klu, 'next', None)
-        if nxt:
-            future_klu = nxt
-            if info['is_buy']:
-                loss = (future_klu.low - base_price) / base_price
-            else:
-                loss = (base_price - future_klu.high) / base_price
-            min_p = min(min_p, loss)
-        else:
+        if nxt is None:
             break
+        future_klu = nxt
+        if info['is_buy']:
+            loss = (future_klu.low - base_price) / base_price
+        else:
+            loss = (base_price - future_klu.high) / base_price
+        min_p = min(min_p, loss)
+        if exit_klu is not None and future_klu is exit_klu:
+            break
+        if exit_klu is None:
+            if int(lookahead or 0) <= 0:
+                break
+            lookahead = int(lookahead) - 1
+            if int(lookahead) <= 0:
+                break
     if min_p == 999.0:
         return 0.0
     return float(min_p)
 
-def _auto_profit_threshold_from_infos(infos, q: float = 0.7, min_threshold: float = 0.0, profit_lookahead: int = 3):
+def _auto_profit_threshold_from_infos(infos, q: float = 0.7, min_threshold: float = 0.0, profit_lookahead: int = 3, enforce_t1: bool = False):
     profits = []
     for info in infos or []:
         try:
-            profits.append(_profit_for_info(info, lookahead=profit_lookahead))
+            profits.append(_profit_for_info(info, lookahead=profit_lookahead, enforce_t1=enforce_t1))
         except Exception:
             continue
     if not profits:
@@ -1457,6 +1531,7 @@ def build_training_data(
     use_atr_label: bool = False,
     atr_period: int = 14,
     atr_mult: float = 1.0,
+    enforce_t1: bool = False,
 ):
     X = []
     y = []
@@ -1472,13 +1547,13 @@ def build_training_data(
 
     infos = list(bsp_dict.values())
     if profit_threshold is None:
-        used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead)
+        used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1)
     else:
         used_profit_threshold = float(profit_threshold)
 
     for _, info in bsp_dict.items():
         try:
-            profit = _profit_for_info(info, lookahead=profit_lookahead)
+            profit = _profit_for_info(info, lookahead=profit_lookahead, enforce_t1=enforce_t1)
         except Exception:
             profit = 0.0
         dyn_th = float(used_profit_threshold)
@@ -1534,6 +1609,7 @@ def build_training_data_from_infos(
     use_atr_label: bool = False,
     atr_period: int = 14,
     atr_mult: float = 1.0,
+    enforce_t1: bool = False,
 ):
     X = []
     y = []
@@ -1541,13 +1617,13 @@ def build_training_data_from_infos(
         return X, y
 
     if profit_threshold is None:
-        used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead)
+        used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1)
     else:
         used_profit_threshold = float(profit_threshold)
 
     for info in infos:
         try:
-            profit = _profit_for_info(info, lookahead=profit_lookahead)
+            profit = _profit_for_info(info, lookahead=profit_lookahead, enforce_t1=enforce_t1)
         except Exception:
             profit = 0.0
         dyn_th = float(used_profit_threshold)
@@ -2427,6 +2503,56 @@ def _rank_transform_apply_sorted_cols(X, sorted_cols, missing_value: float = -99
             nr[j] = float(pct)
         out.append(nr)
     return out
+
+def cross_section_rank_transform_rows(rows, feature_names, missing_value: float = -9999999.0):
+    if not rows or not feature_names:
+        return rows
+    try:
+        mv = float(missing_value)
+    except Exception:
+        mv = -9999999.0
+    for fn in feature_names:
+        vals = []
+        idxs = []
+        for i, r in enumerate(rows):
+            if not isinstance(r, dict):
+                continue
+            feat = r.get("feature", None)
+            if not isinstance(feat, dict):
+                continue
+            v = feat.get(fn, mv)
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if not np.isfinite(fv):
+                continue
+            if float(fv) == float(mv):
+                continue
+            vals.append(float(fv))
+            idxs.append(i)
+        if not vals:
+            continue
+        order = np.argsort(np.asarray(vals, dtype=float), kind="mergesort")
+        n = int(len(vals))
+        ranks = np.empty(n, dtype=float)
+        i = 0
+        while i < n:
+            j = i
+            vi = float(vals[int(order[i])])
+            while j + 1 < n and float(vals[int(order[j + 1])]) == vi:
+                j += 1
+            avg_rank = (float(i + 1) + float(j + 1)) / 2.0
+            pct = float(avg_rank / float(n))
+            for k in range(i, j + 1):
+                ranks[int(order[k])] = pct
+            i = j + 1
+        for local_pos, row_idx in enumerate(idxs):
+            try:
+                rows[row_idx]["feature"][fn] = float(ranks[local_pos])
+            except Exception:
+                pass
+    return rows
 
 def _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=None, missing_value: float = -9999999.0, rank_transform_enabled: Optional[bool] = None):
     enabled = _rank_transform_enabled() if rank_transform_enabled is None else bool(rank_transform_enabled)
@@ -3559,6 +3685,7 @@ def _topk_vector_metrics_from_infos(
     portfolio_min_score: Optional[float] = None,
     portfolio_top_n: Optional[int] = None,
     holding_period: Optional[int] = None,
+    enforce_t1: bool = False,
 ):
     if not infos or not probs:
         return None
@@ -3639,7 +3766,7 @@ def _topk_vector_metrics_from_infos(
         for j in sel:
             try:
                 if hp is not None:
-                    pr = float(_profit_for_info(infos[j], lookahead=hp))
+                    pr = float(_profit_for_info(infos[j], lookahead=hp, enforce_t1=enforce_t1))
                 else:
                     pr = float(profits[j]) if j < len(profits) else 0.0
             except Exception:
@@ -4026,6 +4153,7 @@ def _walk_forward_eval_infos(
     quantile_bin_count: int = 5,
     rank_transform_enabled: Optional[bool] = None,
     only_features=None,
+    enforce_t1: bool = False,
 ):
     n = len(infos or [])
     if n <= 0:
@@ -4162,13 +4290,13 @@ def _walk_forward_eval_infos(
             continue
 
         if profit_threshold is None:
-            used_profit_threshold = _auto_profit_threshold_from_infos(train_infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead)
+            used_profit_threshold = _auto_profit_threshold_from_infos(train_infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1)
         else:
             used_profit_threshold = float(profit_threshold)
 
-        X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-        X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-        X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
+        X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
+        X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
+        X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
 
         if not X_train or not X_test or len(set(y_train)) < 2:
             train_end += step
@@ -4202,23 +4330,23 @@ def _walk_forward_eval_infos(
                 filtered_meta, sign_map = _ic_filter_feature_meta(X_train, y_train, feature_meta, abs_ic_threshold=abs_th, top_n=ic_top_n, min_n=ic_min_n)
                 if filtered_meta and len(filtered_meta) >= 2 and filtered_meta != list(feature_meta or []):
                     feature_meta = list(filtered_meta)
-                    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-                    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-                    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
+                    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
+                    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
+                    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
                 drop_features = _env_csv_list("MLCHAN_DROP_FEATURES", "zs_last_is_sure")
                 feature_meta2, changed = _apply_drop_features(feature_meta, drop_features)
                 if changed:
                     feature_meta = list(feature_meta2)
-                    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-                    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-                    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
+                    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
+                    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
+                    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
                 if forced_features:
                     merged = _merge_forced_features(feature_meta, forced_features, max_n=max(2, int(len(feature_meta or [])) + int(len(forced_features or []))))
                     if merged and merged != list(feature_meta or []):
                         feature_meta = list(merged)
-                        X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-                        X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-                        X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
+                        X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
+                        X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
+                        X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
                 monotone_constraints = _build_monotone_constraints(feature_meta, sign_map=sign_map)
 
         dbg_feats = _debug_feature_list()
@@ -4285,9 +4413,9 @@ def _walk_forward_eval_infos(
             feature_meta = list(feature_meta2)
         selected_features = list(feature_sel_meta.get("selected_features") or feature_meta or [])
 
-        X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-        X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-        X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
+        X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
+        X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
+        X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
         if not X_train or not X_test or len(set(y_train)) < 2:
             train_end += step
             used_folds += 1
@@ -4548,6 +4676,7 @@ def _walk_forward_eval_infos(
         portfolio_min_score=portfolio_min_score,
         portfolio_top_n=portfolio_top_n,
         holding_period=profit_lookahead,
+        enforce_t1=enforce_t1,
     )
     if vec_all is not None:
         trading["topk_vector"] = vec_all
@@ -4572,12 +4701,12 @@ def _walk_forward_eval_infos(
     predictions = [
         {
             "ts": int(getattr(infos_all[i].get("open_time"), "ts", 0) or 0) if i < len(infos_all) and infos_all[i] else 0,
-            "exit_ts": (int(_exit_ts_for_info(infos_all[i], lookahead=profit_lookahead)) if i < len(infos_all) and infos_all[i] else 0),
+            "exit_ts": (int(_exit_ts_for_info(infos_all[i], lookahead=profit_lookahead, enforce_t1=enforce_t1)) if i < len(infos_all) and infos_all[i] else 0),
             "prob": float(p_all[i]),
             "label": int(y_all[i]),
             "is_buy": (bool(infos_all[i].get("is_buy")) if i < len(infos_all) and infos_all[i] else False),
-            "profit": (float(_profit_for_info(infos_all[i], lookahead=profit_lookahead)) if i < len(infos_all) and infos_all[i] else 0.0),
-            "min_profit": (float(_min_profit_for_info(infos_all[i], lookahead=profit_lookahead)) if i < len(infos_all) and infos_all[i] else 0.0),
+            "profit": (float(_profit_for_info(infos_all[i], lookahead=profit_lookahead, enforce_t1=enforce_t1)) if i < len(infos_all) and infos_all[i] else 0.0),
+            "min_profit": (float(_min_profit_for_info(infos_all[i], lookahead=profit_lookahead, enforce_t1=enforce_t1)) if i < len(infos_all) and infos_all[i] else 0.0),
         }
         for i in range(len(p_all))
     ]
@@ -4723,7 +4852,7 @@ def evaluate_model_accuracy(model, X, y, threshold=0.5):
 
     return correct, total, (correct / total if total > 0 else 0.0)
 
-def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, val_ratio=0.2, threshold=0.5, calibrate_method="none", min_train=200, min_val=200, min_test=500, n_jobs=-1, profit_threshold: Optional[float] = 0.02, auto_profit_quantile: float = 0.7, profit_lookahead: int = 3, use_atr_label: bool = False, atr_period: int = 14, atr_mult: float = 1.0, use_scale_pos_weight: bool = False, xgb_max_depth: Optional[int] = None, xgb_reg_alpha: Optional[float] = None, xgb_reg_lambda: Optional[float] = None, lgb_max_depth: Optional[int] = None, lgb_reg_alpha: Optional[float] = None, lgb_reg_lambda: Optional[float] = None, backtest_mode: str = "auto", walk_forward_max_folds: int = 20, walk_forward_test_window: Optional[int] = None, walk_forward_val_window: Optional[int] = None, walk_forward_step: Optional[int] = None, trade_cost: float = 0.0, topk_frac: float = 0.2, quantile_bin_count: int = 5, rank_transform_enabled: Optional[bool] = None, only_features=None):
+def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, val_ratio=0.2, threshold=0.5, calibrate_method="none", min_train=200, min_val=200, min_test=500, n_jobs=-1, profit_threshold: Optional[float] = 0.02, auto_profit_quantile: float = 0.7, profit_lookahead: int = 3, use_atr_label: bool = False, atr_period: int = 14, atr_mult: float = 1.0, use_scale_pos_weight: bool = False, xgb_max_depth: Optional[int] = None, xgb_reg_alpha: Optional[float] = None, xgb_reg_lambda: Optional[float] = None, lgb_max_depth: Optional[int] = None, lgb_reg_alpha: Optional[float] = None, lgb_reg_lambda: Optional[float] = None, backtest_mode: str = "auto", walk_forward_max_folds: int = 20, walk_forward_test_window: Optional[int] = None, walk_forward_val_window: Optional[int] = None, walk_forward_step: Optional[int] = None, trade_cost: float = 0.0, topk_frac: float = 0.2, quantile_bin_count: int = 5, rank_transform_enabled: Optional[bool] = None, only_features=None, enforce_t1: bool = False):
     empty_model = None
     empty_meta = []
     if not bsp_dict:
@@ -4847,16 +4976,17 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             quantile_bin_count=quantile_bin_count,
             rank_transform_enabled=rank_transform_enabled,
             only_features=only_features_list,
+            enforce_t1=enforce_t1,
         )
 
         feature_meta = build_feature_meta(bsp_dict)
         if only_features_list:
             feature_meta = list(only_features_list or [])
         if profit_threshold is None:
-            used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead)
+            used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1)
         else:
             used_profit_threshold = float(profit_threshold)
-        X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+        X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1)
 
         monotone_constraints = None
         monotone_sign_map = None
@@ -6012,11 +6142,12 @@ def delete_pretrained_model_bundle_by_key(key: str):
         "missing": missing,
     }
 
-def load_pretrained_model_bundle(model_type: str, frequency: str, data_src: str, autype: Optional[object] = None):
+def load_pretrained_model_bundle(model_type: str, frequency: str, data_src: str, autype: Optional[object] = None, rank_mode: Optional[str] = None):
     items = list_pretrained_model_metas(limit=None)
     mt = str(model_type or "")
     freq = str(frequency or "")
     src = str(data_src or "")
+    want_rank_mode = str(rank_mode).strip().lower() if rank_mode is not None else None
     want_autype = None
     if autype is not None:
         try:
@@ -6060,6 +6191,14 @@ def load_pretrained_model_bundle(model_type: str, frequency: str, data_src: str,
                     continue
             except Exception:
                 pass
+        if want_rank_mode:
+            try:
+                meta = m.get("meta", {}) if isinstance(m.get("meta", {}), dict) else {}
+                got_rm = str(meta.get("rank_mode") or "").strip().lower()
+                if got_rm != want_rank_mode:
+                    continue
+            except Exception:
+                continue
         candidates.append(m)
 
     if not candidates and want_autype:
@@ -6079,6 +6218,14 @@ def load_pretrained_model_bundle(model_type: str, frequency: str, data_src: str,
                     continue
             except Exception:
                 continue
+            if want_rank_mode:
+                try:
+                    meta = m.get("meta", {}) if isinstance(m.get("meta", {}), dict) else {}
+                    got_rm = str(meta.get("rank_mode") or "").strip().lower()
+                    if got_rm != want_rank_mode:
+                        continue
+                except Exception:
+                    continue
             candidates.append(m)
 
     if not candidates:
@@ -6434,6 +6581,19 @@ def _process_code_for_pretrain(args):
             except Exception:
                 return code, latest_time, [], set(), {"atr_pct": vol_atr_pct, "high_vol_filtered": True}
         
+        rolling_mode = None
+        stride_override = None
+        if isinstance(args, (list, tuple)) and len(args) >= 12:
+            try:
+                rolling_mode = args[11]
+            except Exception:
+                rolling_mode = None
+        if isinstance(args, (list, tuple)) and len(args) >= 13:
+            try:
+                stride_override = args[12]
+            except Exception:
+                stride_override = None
+
         _, bsp_dict, _, _ = get_chan_data(
             code=code,
             trigger_step=True,
@@ -6444,6 +6604,8 @@ def _process_code_for_pretrain(args):
             do_predict=True,
             begin_time=begin_time,
             autype=autype,
+            rolling_sample_mode=rolling_mode,
+            rolling_stride=stride_override,
         )
         
         local_samples = []
@@ -6451,11 +6613,11 @@ def _process_code_for_pretrain(args):
         
         if bsp_dict:
             for info in bsp_dict.values():
-                bsp_obj = info.get("bsp_obj", None)
-                if not bsp_obj or not getattr(bsp_obj, "klu", None):
-                    continue
                 decision_klu = info.get("decision_klu", None)
-                cur_klu = decision_klu if decision_klu is not None else bsp_obj.klu
+                bsp_obj = info.get("bsp_obj", None)
+                cur_klu = decision_klu if decision_klu is not None else (getattr(bsp_obj, "klu", None) if bsp_obj else None)
+                if not cur_klu:
+                    continue
                 future_klu = cur_klu
                 for _ in range(int(profit_lookahead or 0)):
                     nxt = getattr(future_klu, "next", None)
@@ -6535,6 +6697,10 @@ def pretrain_and_persist_model(
     use_atr_label: bool = False,
     atr_period: int = 14,
     atr_mult: float = 1.0,
+    rank_mode: str = "sample",
+    rolling_sample_mode: Optional[str] = None,
+    rolling_stride: Optional[int] = None,
+    only_features: Optional[list] = None,
 ):
     if not codes:
         return None, {
@@ -6607,7 +6773,7 @@ def pretrain_and_persist_model(
                 autype_name = "HFQ"
 
             tasks = [
-                (code, level, begin_time, data_src_type, profit_threshold, profit_lookahead, autype_name, bool(use_atr_label), atr_period, atr_mult, high_vol_atr_pct_min)
+                (code, level, begin_time, data_src_type, profit_threshold, profit_lookahead, autype_name, bool(use_atr_label), atr_period, atr_mult, high_vol_atr_pct_min, rolling_sample_mode, rolling_stride)
                 for code in codes
             ]
             future_to_code = {executor.submit(_process_code_for_pretrain, t): t[0] for t in tasks}
@@ -6653,7 +6819,33 @@ def pretrain_and_persist_model(
         report("training", 0.85, "training")
 
         feature_meta = sorted(feature_keys)
+        if only_features:
+            keep = []
+            seen = set()
+            for f in only_features or []:
+                s = str(f or "").strip()
+                if not s or s in seen:
+                    continue
+                if s in feature_meta:
+                    keep.append(s)
+                    seen.add(s)
+            if keep:
+                feature_meta = keep
         samples.sort(key=lambda s: int(s.get("open_ts", 0) or 0))
+
+        rm = str(rank_mode or "sample").strip().lower()
+        if rm == "cross_section":
+            by_ts = {}
+            for r in samples:
+                try:
+                    ts = int(r.get("open_ts", 0) or 0)
+                except Exception:
+                    ts = 0
+                if ts <= 0:
+                    continue
+                by_ts.setdefault(ts, []).append(r)
+            for _, rows in by_ts.items():
+                cross_section_rank_transform_rows(rows, feature_meta, missing_value=-9999999.0)
 
         def build_xy(rows, used_profit_threshold: float):
             X = []
@@ -6944,6 +7136,10 @@ def pretrain_and_persist_model(
             "atr_mult": float(atr_mult),
             "profit_threshold": used_profit_threshold,
             "profit_lookahead": int(profit_lookahead or 0),
+            "rank_mode": rm,
+            "rolling_sample_mode": (str(rolling_sample_mode or "").strip().lower() if rolling_sample_mode is not None else None),
+            "rolling_stride": (int(rolling_stride) if rolling_stride is not None else None),
+            "only_features": (list(feature_meta) if feature_meta else None),
         }
         report("saving", 0.95, "saving")
         path, model_key, trained_at = save_pretrained_model_bundle(

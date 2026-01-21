@@ -2,10 +2,28 @@ import os
 import json
 import hashlib
 import datetime
-from sqlalchemy import create_engine, Column, String, Integer, Float, Text, DateTime, Index, text
+import uuid
+from typing import Optional
+from sqlalchemy import create_engine, Column, String, Integer, Float, Text, DateTime, Index, text, or_
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 Base = declarative_base()
+
+def _normalize_sim_id(sim_id):
+    sid = str(sim_id or "").strip()
+    return sid if sid else "default"
+
+def _is_default_sim(sim_id):
+    return _normalize_sim_id(sim_id) == "default"
+
+def _normalize_portfolio_id(portfolio_id):
+    if portfolio_id is None:
+        return None
+    try:
+        pid = int(portfolio_id)
+    except Exception:
+        return None
+    return pid if pid > 0 else None
 
 def _dt_to_utc_iso(dt):
     if dt is None:
@@ -129,6 +147,120 @@ class StrategyRun(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     completed_at = Column(DateTime)
 
+class PositionStatus(Base):
+    __tablename__ = 'position_status'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    stock_code = Column(String(20), unique=True, index=True)
+    entry_time = Column(Integer)
+    entry_day = Column(Integer, index=True)
+    entry_price = Column(Float)
+    bars_held = Column(Integer)
+    updated_at = Column(String(40), index=True)
+
+class LiveOrder(Base):
+    __tablename__ = 'live_order'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sim_id = Column(String(40), index=True)
+    portfolio_id = Column(Integer, index=True)
+    stock_code = Column(String(20), index=True)
+    side = Column(String(10), index=True)  # buy/sell
+    status = Column(String(20), index=True)  # pending/executed/blocked/canceled
+    requested_ts = Column(Integer, index=True)
+    execute_after_ts = Column(Integer, index=True)
+    min_day = Column(Integer, index=True)
+    price = Column(Float)
+    reason = Column(Text)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+class LiveTrade(Base):
+    __tablename__ = 'live_trade'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sim_id = Column(String(40), index=True)
+    portfolio_id = Column(Integer, index=True)
+    stock_code = Column(String(20), index=True)
+    side = Column(String(10), index=True)  # buy/sell
+    status = Column(String(20), index=True)  # executed/pending/canceled
+    trade_ts = Column(Integer, index=True)
+    price = Column(Float)
+    meta_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+class LiveSim(Base):
+    __tablename__ = "live_sim"
+
+    sim_id = Column(String(40), primary_key=True)
+    name = Column(String(120), index=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+class LiveRun(Base):
+    __tablename__ = "live_run"
+
+    run_id = Column(String(40), primary_key=True)
+    name = Column(String(120), index=True)
+    sim_id = Column(String(40), index=True)
+    portfolio_id = Column(Integer, index=True)
+    status = Column(String(20), index=True)
+    steps = Column(Integer, default=0)
+    last_step_ts = Column(Integer, index=True)
+    next_exec_ts = Column(Integer, index=True)
+    offset_seconds = Column(Integer, default=5)
+    auto_resume = Column(Integer, default=1)
+    notify_enabled = Column(Integer, default=0)
+    params_json = Column(Text)
+    last_result_json = Column(Text)
+    error = Column(Text)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    stopped_at = Column(DateTime)
+
+class LiveStepRecord(Base):
+    __tablename__ = "live_step_record"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sim_id = Column(String(40), index=True)
+    portfolio_id = Column(Integer, index=True)
+    run_id = Column(String(40), index=True)
+    step_ts = Column(Integer, index=True)
+    day = Column(Integer, index=True)
+    risk_json = Column(Text)
+    targets_json = Column(Text)
+    sell_json = Column(Text)
+    buy_json = Column(Text)
+    blocked_json = Column(Text)
+    summary_json = Column(Text)
+    result_json = Column(Text)
+    error = Column(Text)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+    __table_args__ = (
+        Index("idx_live_step_sim_ts", "sim_id", "step_ts"),
+        Index("idx_live_step_run_ts", "run_id", "step_ts"),
+        Index("idx_live_step_sim_day", "sim_id", "day"),
+    )
+
+class LivePosition(Base):
+    __tablename__ = "live_position"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sim_id = Column(String(40), index=True)
+    portfolio_id = Column(Integer, index=True)
+    stock_code = Column(String(20), index=True)
+    entry_time = Column(Integer)
+    entry_day = Column(Integer, index=True)
+    entry_price = Column(Float)
+    bars_held = Column(Integer)
+    updated_at = Column(String(40), index=True)
+
+    __table_args__ = (
+        Index("idx_live_position_sim_pid_code_unique", "sim_id", "portfolio_id", "stock_code", unique=True),
+        Index("idx_live_position_sim_pid_entry_day", "sim_id", "portfolio_id", "entry_day"),
+    )
+
 class StorageManager:
     def __init__(self, db_path='analysis.db'):
         if not os.path.isabs(db_path):
@@ -164,8 +296,1127 @@ class StorageManager:
                             conn.connection.commit()
                         except Exception:
                             pass
+                cols = conn.execute(text("PRAGMA table_info(position_status)")).fetchall()
+                names = [c[1] for c in cols] if cols else []
+                if "entry_day" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE position_status ADD COLUMN entry_day INTEGER"))
+                    except Exception:
+                        pass
+                conn.execute(text("CREATE TABLE IF NOT EXISTS position_status (id INTEGER PRIMARY KEY AUTOINCREMENT, stock_code VARCHAR(20) UNIQUE, entry_time INTEGER, entry_day INTEGER, entry_price FLOAT, bars_held INTEGER, updated_at VARCHAR(40))"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_position_status_code ON position_status(stock_code)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_position_status_updated ON position_status(updated_at)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_position_status_entry_day ON position_status(entry_day)"))
+
+                cols = conn.execute(text("PRAGMA table_info(live_order)")).fetchall()
+                names = [c[1] for c in cols] if cols else []
+                if "sim_id" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_order ADD COLUMN sim_id VARCHAR(40)"))
+                    except Exception:
+                        pass
+                if "portfolio_id" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_order ADD COLUMN portfolio_id INTEGER"))
+                    except Exception:
+                        pass
+                if "execute_after_ts" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_order ADD COLUMN execute_after_ts INTEGER"))
+                    except Exception:
+                        pass
+                if "min_day" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_order ADD COLUMN min_day INTEGER"))
+                    except Exception:
+                        pass
+                if "reason" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_order ADD COLUMN reason TEXT"))
+                    except Exception:
+                        pass
+                conn.execute(text("CREATE TABLE IF NOT EXISTS live_order (id INTEGER PRIMARY KEY AUTOINCREMENT, sim_id VARCHAR(40), portfolio_id INTEGER, stock_code VARCHAR(20), side VARCHAR(10), status VARCHAR(20), requested_ts INTEGER, execute_after_ts INTEGER, min_day INTEGER, price FLOAT, reason TEXT, created_at DATETIME, updated_at DATETIME)"))
+                try:
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_order_sim_id ON live_order(sim_id)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_order_portfolio_id ON live_order(portfolio_id)"))
+                except Exception:
+                    pass
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_order_code ON live_order(stock_code)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_order_status ON live_order(status)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_order_requested_ts ON live_order(requested_ts)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_order_execute_after_ts ON live_order(execute_after_ts)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_order_min_day ON live_order(min_day)"))
+
+                cols = conn.execute(text("PRAGMA table_info(live_trade)")).fetchall()
+                names = [c[1] for c in cols] if cols else []
+                if "sim_id" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_trade ADD COLUMN sim_id VARCHAR(40)"))
+                    except Exception:
+                        pass
+                if "portfolio_id" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_trade ADD COLUMN portfolio_id INTEGER"))
+                    except Exception:
+                        pass
+                conn.execute(text("CREATE TABLE IF NOT EXISTS live_trade (id INTEGER PRIMARY KEY AUTOINCREMENT, sim_id VARCHAR(40), portfolio_id INTEGER, stock_code VARCHAR(20), side VARCHAR(10), status VARCHAR(20), trade_ts INTEGER, price FLOAT, meta_json TEXT, created_at DATETIME)"))
+                try:
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_trade_sim_id ON live_trade(sim_id)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_trade_portfolio_id ON live_trade(portfolio_id)"))
+                except Exception:
+                    pass
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_trade_code ON live_trade(stock_code)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_trade_status ON live_trade(status)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_trade_trade_ts ON live_trade(trade_ts)"))
+
+                conn.execute(text("CREATE TABLE IF NOT EXISTS live_sim (sim_id VARCHAR(40) PRIMARY KEY, name VARCHAR(120), created_at DATETIME, updated_at DATETIME)"))
+                try:
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_sim_name ON live_sim(name)"))
+                except Exception:
+                    pass
+
+                cols = conn.execute(text("PRAGMA table_info(live_run)")).fetchall()
+                names = [c[1] for c in cols] if cols else []
+                if "name" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_run ADD COLUMN name VARCHAR(120)"))
+                    except Exception:
+                        pass
+                if "portfolio_id" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_run ADD COLUMN portfolio_id INTEGER"))
+                    except Exception:
+                        pass
+                if "next_exec_ts" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_run ADD COLUMN next_exec_ts INTEGER"))
+                    except Exception:
+                        pass
+                if "offset_seconds" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_run ADD COLUMN offset_seconds INTEGER"))
+                    except Exception:
+                        pass
+                if "auto_resume" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_run ADD COLUMN auto_resume INTEGER"))
+                    except Exception:
+                        pass
+                if "notify_enabled" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_run ADD COLUMN notify_enabled INTEGER"))
+                    except Exception:
+                        pass
+                conn.execute(text("""CREATE TABLE IF NOT EXISTS live_run (
+                    run_id VARCHAR(40) PRIMARY KEY,
+                    name VARCHAR(120),
+                    sim_id VARCHAR(40),
+                    portfolio_id INTEGER,
+                    status VARCHAR(20),
+                    steps INTEGER,
+                    last_step_ts INTEGER,
+                    next_exec_ts INTEGER,
+                    offset_seconds INTEGER,
+                    auto_resume INTEGER,
+                    notify_enabled INTEGER,
+                    params_json TEXT,
+                    last_result_json TEXT,
+                    error TEXT,
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    stopped_at DATETIME
+                )"""))
+                try:
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_run_sim_id ON live_run(sim_id)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_run_portfolio_id ON live_run(portfolio_id)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_run_status ON live_run(status)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_run_next_exec_ts ON live_run(next_exec_ts)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_run_updated_at ON live_run(updated_at)"))
+                except Exception:
+                    pass
+
+                cols = conn.execute(text("PRAGMA table_info(live_step_record)")).fetchall()
+                names = [c[1] for c in cols] if cols else []
+                if "portfolio_id" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_step_record ADD COLUMN portfolio_id INTEGER"))
+                    except Exception:
+                        pass
+                conn.execute(text("""CREATE TABLE IF NOT EXISTS live_step_record (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sim_id VARCHAR(40),
+                    portfolio_id INTEGER,
+                    run_id VARCHAR(40),
+                    step_ts INTEGER,
+                    day INTEGER,
+                    risk_json TEXT,
+                    targets_json TEXT,
+                    sell_json TEXT,
+                    buy_json TEXT,
+                    blocked_json TEXT,
+                    summary_json TEXT,
+                    result_json TEXT,
+                    error TEXT,
+                    created_at DATETIME
+                )"""))
+                try:
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_step_sim_id ON live_step_record(sim_id)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_step_portfolio_id ON live_step_record(portfolio_id)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_step_run_id ON live_step_record(run_id)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_step_step_ts ON live_step_record(step_ts)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_step_day ON live_step_record(day)"))
+                except Exception:
+                    pass
+
+                cols = conn.execute(text("PRAGMA table_info(live_position)")).fetchall()
+                names = [c[1] for c in cols] if cols else []
+                if "portfolio_id" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_position ADD COLUMN portfolio_id INTEGER"))
+                    except Exception:
+                        pass
+                conn.execute(text("""CREATE TABLE IF NOT EXISTS live_position (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sim_id VARCHAR(40),
+                    portfolio_id INTEGER,
+                    stock_code VARCHAR(20),
+                    entry_time INTEGER,
+                    entry_day INTEGER,
+                    entry_price FLOAT,
+                    bars_held INTEGER,
+                    updated_at VARCHAR(40)
+                )"""))
+                try:
+                    conn.execute(text("DROP INDEX IF EXISTS idx_live_position_sim_code_unique"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_position_sim_id ON live_position(sim_id)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_position_portfolio_id ON live_position(portfolio_id)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_position_code ON live_position(stock_code)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_position_entry_day ON live_position(entry_day)"))
+                    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_live_position_sim_pid_code_unique ON live_position(sim_id, portfolio_id, stock_code)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_position_sim_pid_entry_day ON live_position(sim_id, portfolio_id, entry_day)"))
+                except Exception:
+                    pass
+                try:
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.connection.commit()
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"Failed to ensure schema: {e}")
+
+    def list_positions(self, sim_id: str = None, portfolio_id: int = None):
+        sid = _normalize_sim_id(sim_id)
+        pid = _normalize_portfolio_id(portfolio_id)
+        with self.Session() as session:
+            out = []
+            if _is_default_sim(sid) and pid is None:
+                rows = session.query(PositionStatus).all()
+                for r in rows or []:
+                    out.append({
+                        "stock_code": r.stock_code,
+                        "entry_time": int(r.entry_time or 0),
+                        "entry_day": int(r.entry_day or 0),
+                        "entry_price": float(r.entry_price or 0.0),
+                        "bars_held": int(r.bars_held or 0),
+                        "updated_at": str(r.updated_at or ""),
+                    })
+                return out
+
+            q = session.query(LivePosition).filter(LivePosition.sim_id == sid)
+            if pid is not None:
+                q = q.filter(LivePosition.portfolio_id == pid)
+            rows = q.all()
+            for r in rows or []:
+                out.append({
+                    "stock_code": r.stock_code,
+                    "entry_time": int(r.entry_time or 0),
+                    "entry_day": int(r.entry_day or 0),
+                    "entry_price": float(r.entry_price or 0.0),
+                    "bars_held": int(r.bars_held or 0),
+                    "updated_at": str(r.updated_at or ""),
+                })
+            return out
+
+    def upsert_position(self, stock_code: str, entry_time: int, entry_price: float, bars_held: int = 0, sim_id: str = None, portfolio_id: int = None):
+        now = datetime.datetime.utcnow().isoformat() + "Z"
+        sid = _normalize_sim_id(sim_id)
+        pid = _normalize_portfolio_id(portfolio_id)
+        stock_code = str(stock_code or "").strip()
+        if not stock_code:
+            return
+        try:
+            entry_time = int(entry_time or 0)
+        except Exception:
+            entry_time = 0
+        entry_day = None
+        if entry_time > 0:
+            try:
+                dt = datetime.datetime.fromtimestamp(int(entry_time), tz=datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=8)
+                entry_day = int(dt.year) * 10000 + int(dt.month) * 100 + int(dt.day)
+            except Exception:
+                entry_day = None
+        with self.Session() as session:
+            if _is_default_sim(sid) and pid is None:
+                row = session.query(PositionStatus).filter_by(stock_code=stock_code).first()
+                if row is None:
+                    row = PositionStatus(stock_code=stock_code)
+                    session.add(row)
+            else:
+                row = session.query(LivePosition).filter_by(sim_id=sid, portfolio_id=pid, stock_code=stock_code).first()
+                if row is None:
+                    row = LivePosition(sim_id=sid, portfolio_id=pid, stock_code=stock_code)
+                    session.add(row)
+
+            row.entry_time = int(entry_time or 0)
+            if entry_day is not None:
+                row.entry_day = int(entry_day)
+            row.entry_price = float(entry_price or 0.0)
+            row.bars_held = int(bars_held or 0)
+            row.updated_at = now
+            session.commit()
+
+    def increment_bars_held(self, inc: int = 1, sim_id: str = None, portfolio_id: int = None):
+        now = datetime.datetime.utcnow().isoformat() + "Z"
+        sid = _normalize_sim_id(sim_id)
+        pid = _normalize_portfolio_id(portfolio_id)
+        try:
+            inc = int(inc)
+        except Exception:
+            inc = 1
+        if inc <= 0:
+            inc = 1
+        with self.Session() as session:
+            if _is_default_sim(sid) and pid is None:
+                rows = session.query(PositionStatus).all()
+            else:
+                q = session.query(LivePosition).filter(LivePosition.sim_id == sid)
+                if pid is not None:
+                    q = q.filter(LivePosition.portfolio_id == pid)
+                rows = q.all()
+            for r in rows or []:
+                r.bars_held = int(r.bars_held or 0) + int(inc)
+                r.updated_at = now
+            session.commit()
+
+    def delete_positions(self, stock_codes, sim_id: str = None, portfolio_id: int = None):
+        sid = _normalize_sim_id(sim_id)
+        pid = _normalize_portfolio_id(portfolio_id)
+        codes = [str(c).strip() for c in (stock_codes or []) if str(c or "").strip()]
+        if not codes:
+            return
+        with self.Session() as session:
+            if _is_default_sim(sid) and pid is None:
+                session.query(PositionStatus).filter(PositionStatus.stock_code.in_(codes)).delete(synchronize_session=False)
+            else:
+                q = session.query(LivePosition).filter(LivePosition.sim_id == sid, LivePosition.stock_code.in_(codes))
+                if pid is not None:
+                    q = q.filter(LivePosition.portfolio_id == pid)
+                q.delete(synchronize_session=False)
+            session.commit()
+
+    def list_live_orders(self, status: str = None, limit: int = 200, sim_id: str = None, portfolio_id: int = None):
+        sid = _normalize_sim_id(sim_id)
+        pid = _normalize_portfolio_id(portfolio_id)
+        with self.Session() as session:
+            q = session.query(LiveOrder)
+            if pid is not None:
+                q = q.filter(LiveOrder.portfolio_id == pid)
+            if _is_default_sim(sid):
+                q = q.filter(or_(LiveOrder.sim_id == None, LiveOrder.sim_id == "", LiveOrder.sim_id == "default"))
+            else:
+                q = q.filter(LiveOrder.sim_id == sid)
+            if status:
+                q = q.filter(LiveOrder.status == str(status))
+            q = q.order_by(LiveOrder.created_at.desc(), LiveOrder.id.desc())
+            try:
+                limit = int(limit or 200)
+            except Exception:
+                limit = 200
+            limit = max(1, min(limit, 1000))
+            rows = q.limit(limit).all()
+            out = []
+            for r in rows or []:
+                out.append({
+                    "id": int(r.id),
+                    "stock_code": str(r.stock_code or ""),
+                    "side": str(r.side or ""),
+                    "status": str(r.status or ""),
+                    "requested_ts": int(r.requested_ts or 0),
+                    "execute_after_ts": int(r.execute_after_ts or 0),
+                    "min_day": int(r.min_day or 0),
+                    "price": float(r.price or 0.0),
+                    "reason": r.reason,
+                    "created_at": _dt_to_utc_iso(r.created_at),
+                    "updated_at": _dt_to_utc_iso(r.updated_at),
+                })
+            return out
+
+    def replace_pending_live_orders(self, orders: list, requested_ts: int, sim_id: str = None, portfolio_id: int = None):
+        sid = _normalize_sim_id(sim_id)
+        pid = _normalize_portfolio_id(portfolio_id)
+        requested_ts = int(requested_ts or 0)
+        now = datetime.datetime.utcnow()
+        with self.Session() as session:
+            q = session.query(LiveOrder).filter(LiveOrder.status == "pending")
+            if pid is not None:
+                q = q.filter(LiveOrder.portfolio_id == pid)
+            if _is_default_sim(sid):
+                q = q.filter(or_(LiveOrder.sim_id == None, LiveOrder.sim_id == "", LiveOrder.sim_id == "default"))
+            else:
+                q = q.filter(LiveOrder.sim_id == sid)
+            q.delete(synchronize_session=False)
+            for o in orders or []:
+                if not isinstance(o, dict):
+                    continue
+                code = str(o.get("stock_code") or "").strip()
+                side = str(o.get("side") or "").strip().lower()
+                if not code or side not in ["buy", "sell"]:
+                    continue
+                try:
+                    price = float(o.get("price")) if o.get("price") is not None else 0.0
+                except Exception:
+                    price = 0.0
+                try:
+                    execute_after_ts = int(o.get("execute_after_ts") or 0)
+                except Exception:
+                    execute_after_ts = 0
+                try:
+                    min_day = int(o.get("min_day") or 0)
+                except Exception:
+                    min_day = 0
+                reason = o.get("reason")
+                row = LiveOrder(
+                    sim_id=sid,
+                    portfolio_id=pid,
+                    stock_code=code,
+                    side=side,
+                    status="pending",
+                    requested_ts=requested_ts,
+                    execute_after_ts=execute_after_ts,
+                    min_day=min_day,
+                    price=price,
+                    reason=reason,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(row)
+            session.commit()
+
+    def mark_orders_executed(self, order_ids: list, executed_ts: int, sim_id: str = None, portfolio_id: int = None):
+        sid = _normalize_sim_id(sim_id)
+        pid = _normalize_portfolio_id(portfolio_id)
+        now = datetime.datetime.utcnow()
+        try:
+            ids = [int(x) for x in (order_ids or [])]
+        except Exception:
+            ids = []
+        ids = [x for x in ids if x > 0]
+        if not ids:
+            return
+        with self.Session() as session:
+            q = session.query(LiveOrder).filter(LiveOrder.id.in_(ids))
+            if pid is not None:
+                q = q.filter(LiveOrder.portfolio_id == pid)
+            if _is_default_sim(sid):
+                q = q.filter(or_(LiveOrder.sim_id == None, LiveOrder.sim_id == "", LiveOrder.sim_id == "default"))
+            else:
+                q = q.filter(LiveOrder.sim_id == sid)
+            rows = q.all()
+            for r in rows or []:
+                r.status = "executed"
+                r.updated_at = now
+                if executed_ts and not r.requested_ts:
+                    r.requested_ts = int(executed_ts)
+            session.commit()
+
+    def replace_blocked_live_orders(self, orders: list, requested_ts: int, sim_id: str = None, portfolio_id: int = None):
+        sid = _normalize_sim_id(sim_id)
+        pid = _normalize_portfolio_id(portfolio_id)
+        requested_ts = int(requested_ts or 0)
+        now = datetime.datetime.utcnow()
+        with self.Session() as session:
+            q = session.query(LiveOrder).filter(LiveOrder.status == "blocked")
+            if pid is not None:
+                q = q.filter(LiveOrder.portfolio_id == pid)
+            if _is_default_sim(sid):
+                q = q.filter(or_(LiveOrder.sim_id == None, LiveOrder.sim_id == "", LiveOrder.sim_id == "default"))
+            else:
+                q = q.filter(LiveOrder.sim_id == sid)
+            q.delete(synchronize_session=False)
+            for o in orders or []:
+                if not isinstance(o, dict):
+                    continue
+                code = str(o.get("stock_code") or "").strip()
+                side = str(o.get("side") or "").strip().lower()
+                if not code or side not in ["buy", "sell"]:
+                    continue
+                try:
+                    price = float(o.get("price")) if o.get("price") is not None else 0.0
+                except Exception:
+                    price = 0.0
+                try:
+                    execute_after_ts = int(o.get("execute_after_ts") or 0)
+                except Exception:
+                    execute_after_ts = 0
+                try:
+                    min_day = int(o.get("min_day") or 0)
+                except Exception:
+                    min_day = 0
+                reason = o.get("reason")
+                row = LiveOrder(
+                    sim_id=sid,
+                    portfolio_id=pid,
+                    stock_code=code,
+                    side=side,
+                    status="blocked",
+                    requested_ts=requested_ts,
+                    execute_after_ts=execute_after_ts,
+                    min_day=min_day,
+                    price=price,
+                    reason=reason,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(row)
+            session.commit()
+
+    def clear_live_orders(self, sim_id: str = None, portfolio_id: int = None):
+        sid = _normalize_sim_id(sim_id) if sim_id is not None else None
+        pid = _normalize_portfolio_id(portfolio_id)
+        with self.Session() as session:
+            q = session.query(LiveOrder)
+            if pid is not None:
+                q = q.filter(LiveOrder.portfolio_id == pid)
+            if sid is None:
+                q.delete(synchronize_session=False)
+            elif _is_default_sim(sid):
+                q.filter(or_(LiveOrder.sim_id == None, LiveOrder.sim_id == "", LiveOrder.sim_id == "default")).delete(synchronize_session=False)
+            else:
+                q.filter(LiveOrder.sim_id == sid).delete(synchronize_session=False)
+            session.commit()
+
+    def add_live_trades(self, trades: list, sim_id: str = None, portfolio_id: int = None):
+        sid = _normalize_sim_id(sim_id)
+        pid = _normalize_portfolio_id(portfolio_id)
+        if not trades:
+            return
+        now = datetime.datetime.utcnow()
+        with self.Session() as session:
+            for tr in trades or []:
+                if not isinstance(tr, dict):
+                    continue
+                code = str(tr.get("stock_code") or "").strip()
+                side = str(tr.get("side") or "").strip().lower()
+                status = str(tr.get("status") or "").strip().lower() or "executed"
+                if not code or side not in ["buy", "sell"]:
+                    continue
+                try:
+                    price = float(tr.get("price")) if tr.get("price") is not None else 0.0
+                except Exception:
+                    price = 0.0
+                try:
+                    trade_ts = int(tr.get("trade_ts") or 0)
+                except Exception:
+                    trade_ts = 0
+                meta = tr.get("meta")
+                meta_json = None
+                if meta is not None:
+                    try:
+                        meta_json = json.dumps(meta, ensure_ascii=False)
+                    except Exception:
+                        meta_json = None
+                row = LiveTrade(
+                    sim_id=sid,
+                    portfolio_id=pid,
+                    stock_code=code,
+                    side=side,
+                    status=status,
+                    trade_ts=trade_ts,
+                    price=price,
+                    meta_json=meta_json,
+                    created_at=now,
+                )
+                session.add(row)
+            session.commit()
+
+    def list_live_trades(self, limit: int = 200, sim_id: str = None, portfolio_id: int = None):
+        sid = _normalize_sim_id(sim_id)
+        pid = _normalize_portfolio_id(portfolio_id)
+        with self.Session() as session:
+            q = session.query(LiveTrade)
+            if pid is not None:
+                q = q.filter(LiveTrade.portfolio_id == pid)
+            if _is_default_sim(sid):
+                q = q.filter(or_(LiveTrade.sim_id == None, LiveTrade.sim_id == "", LiveTrade.sim_id == "default"))
+            else:
+                q = q.filter(LiveTrade.sim_id == sid)
+            q = q.order_by(LiveTrade.created_at.desc(), LiveTrade.id.desc())
+            try:
+                limit = int(limit or 200)
+            except Exception:
+                limit = 200
+            limit = max(1, min(limit, 2000))
+            rows = q.limit(limit).all()
+            out = []
+            for r in rows or []:
+                meta = None
+                if r.meta_json:
+                    try:
+                        meta = json.loads(r.meta_json)
+                    except Exception:
+                        meta = None
+                out.append({
+                    "id": int(r.id),
+                    "stock_code": str(r.stock_code or ""),
+                    "side": str(r.side or ""),
+                    "status": str(r.status or ""),
+                    "trade_ts": int(r.trade_ts or 0),
+                    "price": float(r.price or 0.0),
+                    "meta": meta,
+                    "created_at": _dt_to_utc_iso(r.created_at),
+                })
+            return out
+
+    def list_live_trades_paged(self, page: int = 1, page_size: int = 50, sim_id: str = None, portfolio_id: int = None):
+        sid = _normalize_sim_id(sim_id)
+        pid = _normalize_portfolio_id(portfolio_id)
+        with self.Session() as session:
+            try:
+                p = int(page or 1)
+            except Exception:
+                p = 1
+            if p < 1:
+                p = 1
+            try:
+                ps = int(page_size or 50)
+            except Exception:
+                ps = 50
+            if ps < 1:
+                ps = 1
+            if ps > 500:
+                ps = 500
+
+            q = session.query(LiveTrade)
+            if pid is not None:
+                q = q.filter(LiveTrade.portfolio_id == pid)
+            if _is_default_sim(sid):
+                q = q.filter(or_(LiveTrade.sim_id == None, LiveTrade.sim_id == "", LiveTrade.sim_id == "default"))
+            else:
+                q = q.filter(LiveTrade.sim_id == sid)
+            total = q.count()
+            q = q.order_by(LiveTrade.created_at.desc(), LiveTrade.id.desc())
+            q = q.offset((p - 1) * ps).limit(ps)
+            rows = q.all()
+
+            out = []
+            for r in rows or []:
+                meta = None
+                if r.meta_json:
+                    try:
+                        meta = json.loads(r.meta_json)
+                    except Exception:
+                        meta = None
+                out.append({
+                    "id": int(r.id),
+                    "stock_code": str(r.stock_code or ""),
+                    "side": str(r.side or ""),
+                    "status": str(r.status or ""),
+                    "trade_ts": int(r.trade_ts or 0),
+                    "price": float(r.price or 0.0),
+                    "meta": meta,
+                    "created_at": _dt_to_utc_iso(r.created_at),
+                })
+
+            return {"items": out, "total": int(total), "page": int(p), "page_size": int(ps)}
+
+    def clear_live_trades(self, sim_id: str = None, portfolio_id: int = None):
+        sid = _normalize_sim_id(sim_id) if sim_id is not None else None
+        pid = _normalize_portfolio_id(portfolio_id)
+        with self.Session() as session:
+            q = session.query(LiveTrade)
+            if pid is not None:
+                q = q.filter(LiveTrade.portfolio_id == pid)
+            if sid is None:
+                q.delete(synchronize_session=False)
+            elif _is_default_sim(sid):
+                q.filter(or_(LiveTrade.sim_id == None, LiveTrade.sim_id == "", LiveTrade.sim_id == "default")).delete(synchronize_session=False)
+            else:
+                q.filter(LiveTrade.sim_id == sid).delete(synchronize_session=False)
+            session.commit()
+
+    def clear_positions(self, sim_id: str = None, portfolio_id: int = None):
+        sid = _normalize_sim_id(sim_id)
+        pid = _normalize_portfolio_id(portfolio_id)
+        with self.Session() as session:
+            if _is_default_sim(sid) and pid is None:
+                session.query(PositionStatus).delete(synchronize_session=False)
+            else:
+                q = session.query(LivePosition).filter(LivePosition.sim_id == sid)
+                if pid is not None:
+                    q = q.filter(LivePosition.portfolio_id == pid)
+                q.delete(synchronize_session=False)
+            session.commit()
+
+    def upsert_live_sim(self, sim_id: str, name: str = None) -> dict:
+        sid = _normalize_sim_id(sim_id)
+        nm = str(name or "").strip() or None
+        now = datetime.datetime.utcnow()
+        with self.Session() as session:
+            row = session.query(LiveSim).filter(LiveSim.sim_id == sid).first()
+            if row is None:
+                row = LiveSim(sim_id=sid)
+                session.add(row)
+                row.created_at = now
+            row.name = nm
+            row.updated_at = now
+            session.commit()
+            return {"sim_id": sid, "name": nm, "created_at": _dt_to_utc_iso(row.created_at), "updated_at": _dt_to_utc_iso(row.updated_at)}
+
+    def list_live_sims(self, limit: int = 200) -> list:
+        try:
+            lim = int(limit or 200)
+        except Exception:
+            lim = 200
+        lim = max(1, min(lim, 2000))
+        with self.Session() as session:
+            q = session.query(LiveSim).order_by(LiveSim.updated_at.desc(), LiveSim.created_at.desc())
+            rows = q.limit(lim).all()
+            out = []
+            for r in rows or []:
+                out.append({"sim_id": str(r.sim_id or ""), "name": str(r.name or ""), "created_at": _dt_to_utc_iso(r.created_at), "updated_at": _dt_to_utc_iso(r.updated_at)})
+            return out
+
+    def upsert_live_run(
+        self,
+        run_id: str,
+        sim_id: str,
+        name: str,
+        status: str,
+        params: dict,
+        portfolio_id: int = None,
+        next_exec_ts: int = 0,
+        offset_seconds: int = 5,
+        auto_resume: bool = True,
+        notify_enabled: bool = False,
+        error: str = None,
+        last_result: dict = None,
+    ) -> dict:
+        rid = str(run_id or "").strip()
+        if not rid:
+            rid = uuid.uuid4().hex[:32]
+        sid = _normalize_sim_id(sim_id)
+        pid = _normalize_portfolio_id(portfolio_id)
+        nm = str(name or "").strip() or None
+        st = str(status or "").strip().lower() or "stopped"
+        now = datetime.datetime.utcnow()
+        try:
+            nxt = int(next_exec_ts or 0)
+        except Exception:
+            nxt = 0
+        try:
+            off = int(offset_seconds or 5)
+        except Exception:
+            off = 5
+        off = max(0, min(int(off), 120))
+        ar = 1 if bool(auto_resume) else 0
+        ne = 1 if bool(notify_enabled) else 0
+        params_json = json.dumps(params or {}, ensure_ascii=False)
+        last_result_json = json.dumps(last_result or {}, ensure_ascii=False) if last_result is not None else None
+        with self.Session() as session:
+            row = session.query(LiveRun).filter(LiveRun.run_id == rid).first()
+            if row is None:
+                row = LiveRun(run_id=rid)
+                session.add(row)
+                row.created_at = now
+                row.steps = 0
+            row.name = nm
+            row.sim_id = sid
+            row.portfolio_id = pid
+            row.status = st
+            row.next_exec_ts = int(nxt or 0)
+            row.offset_seconds = int(off)
+            row.auto_resume = int(ar)
+            row.notify_enabled = int(ne)
+            row.params_json = params_json
+            if error is not None:
+                row.error = str(error)
+            if last_result_json is not None:
+                row.last_result_json = last_result_json
+            row.updated_at = now
+            if st != "running":
+                row.stopped_at = now
+            session.commit()
+            return self.get_live_run(rid)
+
+    def get_live_run(self, run_id: str) -> Optional[dict]:
+        rid = str(run_id or "").strip()
+        if not rid:
+            return None
+        with self.Session() as session:
+            r = session.query(LiveRun).filter(LiveRun.run_id == rid).first()
+            if not r:
+                return None
+            params = None
+            if r.params_json:
+                try:
+                    params = json.loads(r.params_json)
+                except Exception:
+                    params = None
+            last = None
+            if r.last_result_json:
+                try:
+                    last = json.loads(r.last_result_json)
+                except Exception:
+                    last = None
+            return {
+                "run_id": str(r.run_id or ""),
+                "name": str(r.name or ""),
+                "sim_id": str(r.sim_id or ""),
+                "portfolio_id": int(r.portfolio_id or 0) or None,
+                "status": str(r.status or ""),
+                "steps": int(r.steps or 0),
+                "last_step_ts": int(r.last_step_ts or 0),
+                "next_exec_ts": int(r.next_exec_ts or 0),
+                "offset_seconds": int(r.offset_seconds or 0),
+                "auto_resume": bool(int(r.auto_resume or 0)),
+                "notify_enabled": bool(int(r.notify_enabled or 0)),
+                "params": params,
+                "last_result": last,
+                "error": str(r.error or ""),
+                "created_at": _dt_to_utc_iso(r.created_at),
+                "updated_at": _dt_to_utc_iso(r.updated_at),
+                "stopped_at": _dt_to_utc_iso(r.stopped_at),
+            }
+
+    def list_live_runs(self, status: str = None, limit: int = 200, portfolio_id: int = None) -> list:
+        st = str(status or "").strip().lower() or None
+        pid = _normalize_portfolio_id(portfolio_id)
+        try:
+            lim = int(limit or 200)
+        except Exception:
+            lim = 200
+        lim = max(1, min(lim, 2000))
+        with self.Session() as session:
+            q = session.query(LiveRun)
+            if pid is not None:
+                q = q.filter(LiveRun.portfolio_id == pid)
+            if st:
+                q = q.filter(LiveRun.status == st)
+            q = q.order_by(LiveRun.updated_at.desc(), LiveRun.created_at.desc())
+            rows = q.limit(lim).all()
+            out = []
+            for r in rows or []:
+                out.append({
+                    "run_id": str(r.run_id or ""),
+                    "name": str(r.name or ""),
+                    "sim_id": str(r.sim_id or ""),
+                    "portfolio_id": int(r.portfolio_id or 0) or None,
+                    "status": str(r.status or ""),
+                    "steps": int(r.steps or 0),
+                    "last_step_ts": int(r.last_step_ts or 0),
+                    "next_exec_ts": int(r.next_exec_ts or 0),
+                    "offset_seconds": int(r.offset_seconds or 0),
+                    "auto_resume": bool(int(r.auto_resume or 0)),
+                    "notify_enabled": bool(int(r.notify_enabled or 0)),
+                    "error": str(r.error or ""),
+                    "created_at": _dt_to_utc_iso(r.created_at),
+                    "updated_at": _dt_to_utc_iso(r.updated_at),
+                })
+            return out
+
+    def update_live_run_fields(self, run_id: str, fields: dict) -> Optional[dict]:
+        rid = str(run_id or "").strip()
+        if not rid:
+            return None
+        now = datetime.datetime.utcnow()
+        with self.Session() as session:
+            r = session.query(LiveRun).filter(LiveRun.run_id == rid).first()
+            if not r:
+                return None
+            for k, v in (fields or {}).items():
+                if k in ["name", "sim_id", "status", "error", "params_json", "last_result_json"]:
+                    setattr(r, k, v)
+                elif k in ["portfolio_id", "steps", "last_step_ts", "next_exec_ts", "offset_seconds", "auto_resume", "notify_enabled"]:
+                    try:
+                        setattr(r, k, int(v))
+                    except Exception:
+                        continue
+                elif k in ["stopped_at"]:
+                    setattr(r, k, v)
+            r.updated_at = now
+            session.commit()
+        return self.get_live_run(rid)
+
+    def delete_live_run(self, run_id: str) -> bool:
+        rid = str(run_id or "").strip()
+        if not rid:
+            return False
+        with self.Session() as session:
+            q = session.query(LiveRun).filter(LiveRun.run_id == rid)
+            if q.first() is None:
+                return False
+            session.query(LiveStepRecord).filter(LiveStepRecord.run_id == rid).delete(synchronize_session=False)
+            q.delete(synchronize_session=False)
+            session.commit()
+            return True
+
+    def add_live_step_record(
+        self,
+        sim_id: str,
+        run_id: str,
+        step_ts: int,
+        day: int,
+        portfolio_id: int = None,
+        risk: dict = None,
+        targets: list = None,
+        sell: list = None,
+        buy: list = None,
+        blocked: list = None,
+        summary: dict = None,
+        result: dict = None,
+        error: str = None,
+    ) -> bool:
+        sid = _normalize_sim_id(sim_id)
+        rid = str(run_id or "").strip() or None
+        pid = _normalize_portfolio_id(portfolio_id)
+        try:
+            st = int(step_ts or 0)
+        except Exception:
+            st = 0
+        try:
+            dk = int(day or 0)
+        except Exception:
+            dk = 0
+        now = datetime.datetime.utcnow()
+        with self.Session() as session:
+            row = LiveStepRecord(
+                sim_id=sid,
+                portfolio_id=pid,
+                run_id=rid,
+                step_ts=int(st),
+                day=int(dk),
+                risk_json=json.dumps(risk or {}, ensure_ascii=False),
+                targets_json=json.dumps(targets or [], ensure_ascii=False),
+                sell_json=json.dumps(sell or [], ensure_ascii=False),
+                buy_json=json.dumps(buy or [], ensure_ascii=False),
+                blocked_json=json.dumps(blocked or [], ensure_ascii=False),
+                summary_json=json.dumps(summary or {}, ensure_ascii=False),
+                result_json=json.dumps(result or {}, ensure_ascii=False) if result is not None else None,
+                error=str(error or "") or None,
+                created_at=now,
+            )
+            session.add(row)
+            session.commit()
+            return True
+
+    def list_live_steps_paged(
+        self,
+        sim_id: str = None,
+        run_id: str = None,
+        portfolio_id: int = None,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict:
+        sid = _normalize_sim_id(sim_id) if sim_id is not None else None
+        rid = str(run_id or "").strip() if run_id is not None else None
+        pid = _normalize_portfolio_id(portfolio_id)
+        try:
+            p = int(page or 1)
+        except Exception:
+            p = 1
+        if p < 1:
+            p = 1
+        try:
+            ps = int(page_size or 50)
+        except Exception:
+            ps = 50
+        if ps < 1:
+            ps = 1
+        if ps > 500:
+            ps = 500
+        with self.Session() as session:
+            q = session.query(LiveStepRecord)
+            if pid is not None:
+                q = q.filter(LiveStepRecord.portfolio_id == pid)
+            if sid is not None:
+                q = q.filter(LiveStepRecord.sim_id == sid)
+            if rid:
+                q = q.filter(LiveStepRecord.run_id == rid)
+            total = q.count()
+            q = q.order_by(LiveStepRecord.step_ts.desc(), LiveStepRecord.id.desc())
+            q = q.offset((p - 1) * ps).limit(ps)
+            rows = q.all()
+            items = []
+            for r in rows or []:
+                def _loads(x):
+                    if not x:
+                        return None
+                    try:
+                        return json.loads(x)
+                    except Exception:
+                        return None
+                items.append({
+                    "id": int(r.id),
+                    "sim_id": str(r.sim_id or ""),
+                    "portfolio_id": int(r.portfolio_id or 0) or None,
+                    "run_id": str(r.run_id or ""),
+                    "step_ts": int(r.step_ts or 0),
+                    "day": int(r.day or 0),
+                    "risk": _loads(r.risk_json) or {},
+                    "targets": _loads(r.targets_json) or [],
+                    "sell": _loads(r.sell_json) or [],
+                    "buy": _loads(r.buy_json) or [],
+                    "blocked": _loads(r.blocked_json) or [],
+                    "summary": _loads(r.summary_json) or {},
+                    "error": str(r.error or ""),
+                    "created_at": _dt_to_utc_iso(r.created_at),
+                })
+            return {"items": items, "total": int(total), "page": int(p), "page_size": int(ps)}
+
+    def clear_live_steps(self, sim_id: str = None, portfolio_id: int = None):
+        sid = _normalize_sim_id(sim_id) if sim_id is not None else None
+        pid = _normalize_portfolio_id(portfolio_id)
+        with self.Session() as session:
+            q = session.query(LiveStepRecord)
+            if pid is not None:
+                q = q.filter(LiveStepRecord.portfolio_id == pid)
+            if sid is None:
+                q.delete(synchronize_session=False)
+            else:
+                q.filter(LiveStepRecord.sim_id == sid).delete(synchronize_session=False)
+            session.commit()
+
+    def list_live_step_stocks_paged(
+        self,
+        sim_id: str = None,
+        run_id: str = None,
+        portfolio_id: int = None,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> dict:
+        sid = _normalize_sim_id(sim_id) if sim_id is not None else None
+        rid = str(run_id or "").strip() if run_id is not None else None
+        pid = _normalize_portfolio_id(portfolio_id)
+        try:
+            p = int(page or 1)
+        except Exception:
+            p = 1
+        if p < 1:
+            p = 1
+        try:
+            ps = int(page_size or 10)
+        except Exception:
+            ps = 10
+        if ps < 1:
+            ps = 1
+        if ps > 200:
+            ps = 200
+
+        def _loads(x):
+            if not x:
+                return None
+            try:
+                return json.loads(x)
+            except Exception:
+                return None
+
+        with self.Session() as session:
+            q = session.query(LiveStepRecord)
+            if pid is not None:
+                q = q.filter(LiveStepRecord.portfolio_id == pid)
+            if sid is not None:
+                q = q.filter(LiveStepRecord.sim_id == sid)
+            if rid:
+                q = q.filter(LiveStepRecord.run_id == rid)
+            q = q.order_by(LiveStepRecord.step_ts.desc(), LiveStepRecord.id.desc())
+            rows = q.all()
+
+            all_items = []
+            for r in rows or []:
+                buy = _loads(r.buy_json) or []
+                sell = _loads(r.sell_json) or []
+                blocked = _loads(r.blocked_json) or []
+                err = str(r.error or "")
+
+                seq = []
+                side_by_code = {}
+                state_by_code = {}
+
+                def _add_code(code: str, side: str):
+                    c = str(code or "").strip()
+                    if not c:
+                        return
+                    if c not in side_by_code:
+                        seq.append(c)
+                    if side in ["buy", "sell"]:
+                        if c not in side_by_code:
+                            side_by_code[c] = side
+                        elif side_by_code[c] not in ["buy", "sell"]:
+                            side_by_code[c] = side
+                    if c not in state_by_code:
+                        state_by_code[c] = {"status": "executed", "reason": ""}
+
+                for c in sell:
+                    _add_code(c, "sell")
+                for c in buy:
+                    _add_code(c, "buy")
+                for b in blocked:
+                    if not isinstance(b, dict):
+                        continue
+                    code = str(b.get("stock_code") or "").strip()
+                    side = str(b.get("side") or "").strip().lower()
+                    _add_code(code, side if side in ["buy", "sell"] else "-")
+
+                for b in blocked:
+                    if not isinstance(b, dict):
+                        continue
+                    code = str(b.get("stock_code") or "").strip()
+                    if not code:
+                        continue
+                    if code not in state_by_code:
+                        state_by_code[code] = {"status": "unexecuted", "reason": str(b.get("reason") or "")}
+                        if code not in side_by_code:
+                            side = str(b.get("side") or "").strip().lower()
+                            side_by_code[code] = side if side in ["buy", "sell"] else "-"
+                        if code not in seq:
+                            seq.append(code)
+                    else:
+                        state_by_code[code]["status"] = "unexecuted"
+                        state_by_code[code]["reason"] = str(b.get("reason") or "")
+
+                if err:
+                    if not seq:
+                        seq = ["-"]
+                        side_by_code["-"] = "-"
+                        state_by_code["-"] = {"status": "failed", "reason": err}
+                    else:
+                        for code in list(state_by_code.keys()):
+                            state_by_code[code]["status"] = "failed"
+                            state_by_code[code]["reason"] = err
+
+                for code in seq:
+                    st = state_by_code.get(code) or {}
+                    all_items.append({
+                        "step_id": int(r.id),
+                        "sim_id": str(r.sim_id or ""),
+                        "portfolio_id": int(r.portfolio_id or 0) or None,
+                        "run_id": str(r.run_id or ""),
+                        "step_ts": int(r.step_ts or 0),
+                        "day": int(r.day or 0),
+                        "stock_code": str(code or ""),
+                        "side": str(side_by_code.get(code) or ""),
+                        "status": str(st.get("status") or ""),
+                        "reason": str(st.get("reason") or ""),
+                        "created_at": _dt_to_utc_iso(r.created_at),
+                    })
+
+            total = len(all_items)
+            begin = (p - 1) * ps
+            end = begin + ps
+            items = all_items[begin:end] if begin < total else []
+            return {"items": items, "total": int(total), "page": int(p), "page_size": int(ps)}
 
     def is_duplicate_pretrain(self, model_type, frequency, data_src, params):
         session = self.Session()
@@ -597,7 +1848,7 @@ class StorageManager:
             run = session.query(StrategyRun).filter(StrategyRun.id == rid).first()
             if not run:
                 return {"deleted": False, "reason": "not_found"}
-            if str(run.status) in ["running", "pending"]:
+            if str(run.status) in ["running", "pending", "queued"]:
                 return {"deleted": False, "reason": "running"}
             session.delete(run)
             session.commit()
@@ -629,7 +1880,7 @@ class StorageManager:
                 if not run:
                     failed.append({"run_id": rid, "reason": "not_found"})
                     continue
-                if str(run.status) in ["running", "pending"]:
+                if str(run.status) in ["running", "pending", "queued"]:
                     failed.append({"run_id": rid, "reason": "running"})
                     continue
                 session.delete(run)

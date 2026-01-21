@@ -36,6 +36,9 @@
               <UButton size="xs" color="gray" :loading="listLoading" @click="fetchRuns">
                 {{ t('strategy.refreshList') }}
               </UButton>
+              <UButton size="xs" color="primary" variant="soft" @click="emit('open-live-tools')">
+                {{ t('strategy.liveTools') }}
+              </UButton>
             </div>
           </div>
 
@@ -116,7 +119,17 @@
                     {{ t('strategy.viewDetail') }}
                   </UButton>
                   <UButton
-                    v-if="isRunCancellable(row)"
+                    v-if="isRunStoppable(row)"
+                    size="xs"
+                    variant="link"
+                    color="gray"
+                    :loading="stoppingRunId === row.id"
+                    @click="stopRun(row)"
+                  >
+                    {{ t('app.cancel') }}
+                  </UButton>
+                  <UButton
+                    v-else-if="isRunCancellable(row)"
                     size="xs"
                     variant="link"
                     color="gray"
@@ -303,6 +316,7 @@
         </UCard>
       </div>
     </div>
+
   </div>
 </template>
 
@@ -312,7 +326,7 @@ import axios from 'axios'
 import { useI18n } from '../composables/useI18n'
 
 const { t, formatTime } = useI18n()
-const emit = defineEmits(['view-stock'])
+const emit = defineEmits(['view-stock', 'open-live-tools'])
 
 const columns = [
   { key: 'code', label: t('sidebar.stockCode') },
@@ -376,7 +390,179 @@ const selectedRunIds = ref([])
 const batchDeleting = ref(false)
 const deletingRunId = ref(null)
 const cancelingRunId = ref(null)
+const stoppingRunId = ref(null)
 let pollTimer = null
+
+const liveModalOpen = ref(false)
+const liveTab = ref('scan')
+const scanLoading = ref(false)
+const scanError = ref('')
+const scanMeta = ref(null)
+const scanItems = ref([])
+const stepLoading = ref(false)
+const stepError = ref('')
+const stepResult = ref(null)
+const positionsLoading = ref(false)
+const resettingPositions = ref(false)
+const positions = ref([])
+
+const liveConfig = ref({
+  pool_id: 'index:IDX399673',
+  data_src: 'clickhouse',
+  autype: 'qfq',
+  frequency: '30m'
+})
+
+const liveScan = ref({
+  lookback_days: 120,
+  bsp_feature_mode: 'skip',
+  limit: 0
+})
+
+const livePaper = ref({
+  lookback_days: 365 * 5,
+  top_n: 2,
+  min_prob: 0.25,
+  holding_period: 3,
+  trade_cost: 0.0002,
+  limit: 0,
+  pretrained_model_key: ''
+})
+
+const poolOptionsForLive = computed(() => {
+  const items = []
+  for (const [k, v] of Object.entries(poolMap.value || {})) {
+    items.push({ value: k, label: v })
+  }
+  items.sort((a, b) => String(a.label).localeCompare(String(b.label)))
+  if (!items.find(x => x.value === 'index:IDX399673')) {
+    items.unshift({ value: 'index:IDX399673', label: '创业板50 (50)' })
+  }
+  return items
+})
+
+const frequencyOptions = computed(() => ([
+  { label: t('periods.30m'), value: '30m' },
+  { label: t('periods.60m'), value: '60m' },
+  { label: t('periods.15m'), value: '15m' },
+  { label: t('periods.5m'), value: '5m' },
+  { label: t('periods.1m'), value: '1m' }
+]))
+
+const dataSrcOptions = computed(() => ([
+  { label: t('app.dataSrcOptions.clickhouse'), value: 'clickhouse' },
+  { label: t('app.dataSrcOptions.baostock'), value: 'baostock' },
+  { label: t('app.dataSrcOptions.akshare'), value: 'akshare' }
+]))
+
+const autypeOptions = computed(() => ([
+  { label: t('sidebar.autypeQfq'), value: 'qfq' },
+  { label: t('sidebar.autypeHfq'), value: 'hfq' },
+  { label: 'None', value: 'none' }
+]))
+
+const bspFeatureModeOptions = computed(() => ([
+  { label: t('strategy.bspModeSkip'), value: 'skip' },
+  { label: t('strategy.bspModeLatest'), value: 'latest_bsp' }
+]))
+
+const scanColumns = computed(() => ([
+  { key: 'code', label: t('sidebar.stockCode') },
+  { key: 'volatility_250', label: 'volatility_250' },
+  { key: 'volatility_250_rank', label: 'volatility_250_rank' },
+  { key: 'zs_last_height', label: 'zs_last_height' },
+  { key: 'zs_last_height_rank', label: 'zs_last_height_rank' },
+  { key: 'bsp3_zs_height', label: 'bsp3_zs_height' },
+  { key: 'ok', label: t('strategy.status') }
+]))
+
+const positionColumns = computed(() => ([
+  { key: 'stock_code', label: t('sidebar.stockCode') },
+  { key: 'bars_held', label: t('strategy.barsHeld') },
+  { key: 'entry_time', label: t('strategy.entryTime') },
+  { key: 'entry_price', label: t('strategy.entryPrice') }
+]))
+
+const openLiveTools = async () => {
+  try {
+    if (props?.form?.pool_id) liveConfig.value.pool_id = String(props.form.pool_id)
+    if (props?.form?.frequency) liveConfig.value.frequency = String(props.form.frequency)
+    if (props?.form?.autype) liveConfig.value.autype = String(props.form.autype)
+    if (props?.form?.data_src) liveConfig.value.data_src = String(props.form.data_src)
+  } catch (e) {
+    // ignore
+  }
+  liveModalOpen.value = true
+  await loadPositions()
+}
+
+const runLiveScan = async () => {
+  scanError.value = ''
+  scanMeta.value = null
+  scanLoading.value = true
+  try {
+    const payload = {
+      ...liveConfig.value,
+      ...liveScan.value,
+      enable_rolling_lookback: props?.form?.enable_rolling_lookback !== false
+    }
+    const res = await axios.post('/api/live/scan_features', payload)
+    const data = res.data || {}
+    scanItems.value = Array.isArray(data.items) ? data.items : []
+    scanMeta.value = { n: scanItems.value.length, ts: data.ts }
+  } catch (e) {
+    scanError.value = String(e?.response?.data?.detail || e?.message || e)
+  } finally {
+    scanLoading.value = false
+  }
+}
+
+const loadPositions = async () => {
+  positionsLoading.value = true
+  try {
+    const res = await axios.get('/api/live/positions')
+    positions.value = Array.isArray(res.data?.items) ? res.data.items : []
+  } catch (e) {
+    // ignore
+  } finally {
+    positionsLoading.value = false
+  }
+}
+
+const resetPositions = async () => {
+  resettingPositions.value = true
+  stepError.value = ''
+  try {
+    await axios.post('/api/live/positions/reset')
+    await loadPositions()
+  } catch (e) {
+    stepError.value = String(e?.response?.data?.detail || e?.message || e)
+  } finally {
+    resettingPositions.value = false
+  }
+}
+
+const runPaperStep = async () => {
+  stepLoading.value = true
+  stepError.value = ''
+  try {
+    const payload = {
+      ...liveConfig.value,
+      ...livePaper.value,
+      enable_rolling_lookback: props?.form?.enable_rolling_lookback !== false,
+      rank_mode: 'cross_section',
+      rolling_sample_mode: 'every_bar',
+      rolling_stride: 1
+    }
+    const res = await axios.post('/api/live/paper_trade_step', payload)
+    stepResult.value = res.data
+    positions.value = Array.isArray(res.data?.positions) ? res.data.positions : positions.value
+  } catch (e) {
+    stepError.value = String(e?.response?.data?.detail || e?.message || e)
+  } finally {
+    stepLoading.value = false
+  }
+}
 
 // Use props in runStrategy
 const runStrategy = async () => {
@@ -577,6 +763,11 @@ const isRunDeletable = (run) => {
   return !['running', 'pending', 'queued'].includes(st)
 }
 
+const isRunStoppable = (run) => {
+  const st = String(run?.status || '')
+  return ['running'].includes(st)
+}
+
 const isRunCancellable = (run) => {
   const st = String(run?.status || '')
   return ['pending', 'queued'].includes(st)
@@ -698,6 +889,25 @@ const cancelRun = async (run) => {
     console.error(e)
   } finally {
     cancelingRunId.value = null
+  }
+}
+
+const stopRun = async (run) => {
+  const id = run?.id
+  if (!isRunStoppable(run)) return
+  if (!confirm(t('strategy.cancelConfirm'))) return
+  stoppingRunId.value = id
+  try {
+    await axios.post(`/api/strategy/runs/${id}/stop`)
+    if (selectedRunId.value === id) {
+      selectedRunId.value = null
+      selectedRunDetail.value = null
+    }
+    await fetchRuns()
+  } catch (e) {
+    console.error(e)
+  } finally {
+    stoppingRunId.value = null
   }
 }
 

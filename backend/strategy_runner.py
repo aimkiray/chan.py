@@ -471,6 +471,18 @@ class StrategyRunner:
     def __init__(self, storage: StorageManager):
         self.storage = storage
 
+    def _is_run_canceled(self, run_id: int) -> bool:
+        session = self.storage.Session()
+        try:
+            run = session.query(StrategyRun).filter(StrategyRun.id == int(run_id)).first()
+            if not run:
+                return True
+            return str(run.status or "") == "canceled"
+        except Exception:
+            return False
+        finally:
+            session.close()
+
     def _update_progress(self, run_id: int, processed: int, total: int, status: str = "running", result_json: str = None, result_count: int = None):
         session = self.storage.Session()
         try:
@@ -478,7 +490,8 @@ class StrategyRunner:
             if run:
                 run.processed_stocks = processed
                 run.total_stocks = total
-                run.status = status
+                if str(run.status or "") != "canceled":
+                    run.status = status
                 run.progress = int((processed / total) * 100) if total > 0 else 0
                 if result_json:
                     run.result_json = result_json
@@ -487,7 +500,7 @@ class StrategyRunner:
                         run.result_count = int(result_count)
                     except Exception:
                         run.result_count = 0
-                if status in ["completed", "failed"]:
+                if status in ["completed", "failed", "canceled"]:
                     run.completed_at = datetime.datetime.utcnow()
                 session.commit()
         except Exception as e:
@@ -497,6 +510,8 @@ class StrategyRunner:
 
     def run_strategy_sync(self, run_id: int, params: Dict[str, Any]):
         try:
+            if self._is_run_canceled(run_id):
+                return
             self._update_progress(run_id, 0, 0, "pending")
             scope = params.get('scope', 'hs300')
             model_type = params.get('model', 'xgboost')
@@ -764,17 +779,14 @@ class StrategyRunner:
             
             print(f"Starting strategy execution with {max_workers} workers for {len(stocks)} stocks.")
 
-            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-                # Sliding window submission to avoid overloading DB with thousands of pending tasks
-                # Use a set to keep track of active futures
+            executor = concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
+            try:
                 active_futures = set()
-                # Iterator for stocks
                 stock_iter = iter(stocks)
                 future_to_code = {}
-                
-                # Keep a buffer of e.g. 2 * max_workers to ensure CPU is always busy
                 target_active = max_workers * 2
-                
+                cancelled = False
+
                 def submit_next():
                     try:
                         code = next(stock_iter)
@@ -811,43 +823,74 @@ class StrategyRunner:
                     except StopIteration:
                         return False
 
-                # Initial fill
                 for _ in range(target_active):
                     if not submit_next():
                         break
-                
-                # Process as they complete
+
                 while active_futures:
-                    # Wait for at least one future to complete
+                    if processed % 5 == 0 and self._is_run_canceled(run_id):
+                        cancelled = True
+                        break
+
                     done, _ = concurrent.futures.wait(active_futures, return_when=concurrent.futures.FIRST_COMPLETED)
-                    
+
                     for future in done:
                         active_futures.remove(future)
-                        orig_code = future_to_code.pop(future)
+                        orig_code = future_to_code.pop(future, None)
                         processed += 1
-                        
+
                         try:
                             r_code, r_result, r_samples, r_acc, r_method, r_info = future.result()
-                            
+
                             if r_info and isinstance(r_info, dict) and "predictions" in r_info:
                                 all_predictions[r_code] = r_info["predictions"]
 
                             if processed % 10 == 0:
                                 print(f"[Strategy] {r_code} samples={r_samples} accuracy={r_acc:.3f} {r_method}")
                                 self._update_progress(run_id, processed, len(stocks), "running")
-                                
+
                             if r_result:
                                 print(f"[Match] {r_code} samples={r_samples} acc={r_acc:.3f}")
                                 results.append(r_result)
-                                
+
                         except Exception as e:
-                            print(f"Exception for {orig_code}: {e}")
+                            if orig_code:
+                                print(f"Exception for {orig_code}: {e}")
+                            else:
+                                print(f"Exception in worker: {e}")
                             traceback.print_exc()
-                        
-                        # Submit a new task to replace the completed one
+
+                        if processed % 5 == 0 and self._is_run_canceled(run_id):
+                            cancelled = True
+                            break
+
                         submit_next()
+
+                    if cancelled:
+                        break
+            finally:
+                if self._is_run_canceled(run_id):
+                    try:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    except Exception:
+                        pass
+                else:
+                    executor.shutdown(wait=True, cancel_futures=False)
+
+            if self._is_run_canceled(run_id):
+                try:
+                    self._update_progress(run_id, processed, len(stocks), "canceled", json.dumps(results), len(results))
+                except Exception:
+                    pass
+                return
             
             # Portfolio Backtest
+            if self._is_run_canceled(run_id):
+                try:
+                    self._update_progress(run_id, processed, len(stocks), "canceled", json.dumps(results), len(results))
+                except Exception:
+                    pass
+                return
             if portfolio_top_n and all_predictions:
                 try:
                     # 1. Prepare Data

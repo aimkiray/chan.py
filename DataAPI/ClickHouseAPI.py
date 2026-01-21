@@ -402,8 +402,8 @@ class CClickHouseAPI(CCommonStockApi):
         return [str(r[0]) for r in rows]
 
     def _ensure_connection(self):
-        if self._client is None:
-            self.do_init()
+        client = self.get_client()
+        self._client = client
 
     @classmethod
     def _parse_ymd(cls, value) -> Optional[datetime.date]:
@@ -432,6 +432,10 @@ class CClickHouseAPI(CCommonStockApi):
         return None
 
     def _get_qfq_factors_by_date(self, normalized_code: str, begin_date: str, end_date: str):
+        self._ensure_connection()
+        if not self._client:
+            result = ([], {})
+            return result
         begin_dt = self._parse_ymd(begin_date) or datetime.date(1990, 1, 1)
         end_dt = self._parse_ymd(end_date) or datetime.date.today()
         begin_lookback_dt = begin_dt - datetime.timedelta(days=120)
@@ -646,6 +650,10 @@ class CClickHouseAPI(CCommonStockApi):
         return result
 
     def _get_hfq_factors_by_date(self, normalized_code: str, begin_date: str, end_date: str):
+        self._ensure_connection()
+        if not self._client:
+            result = ([], {})
+            return result
         begin_dt = self._parse_ymd(begin_date) or datetime.date(1990, 1, 1)
         end_dt = self._parse_ymd(end_date) or datetime.date.today()
         begin_lookback_dt = self._get_min_daily_date(normalized_code)
@@ -1017,7 +1025,11 @@ class CClickHouseAPI(CCommonStockApi):
                 ORDER BY {time_col} ASC
             """
             try:
-                return self._client.execute(q, params)
+                client = self._client or self.get_client()
+                if not client:
+                    return None
+                self._client = client
+                return client.execute(q, params)
             except Exception as e:
                 print(f"Query failed: {e}")
                 return None

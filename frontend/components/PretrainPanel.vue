@@ -1099,7 +1099,11 @@ const runPretrain = async () => {
       data_length_years: props.config.dataLengthMode === 'years' ? Number(props.config.dataLengthYears) : null,
       force_refresh: !!props.config.forceRefresh,
       autype: props.config.autype || 'hfq',
-      pool_name: props.config.poolName || null
+      pool_name: props.config.poolName || null,
+      rank_mode: props.config.rankMode || 'sample',
+      rolling_sample_mode: props.config.rollingSampleMode ? String(props.config.rollingSampleMode) : null,
+      rolling_stride: props.config.rollingStride !== '' && props.config.rollingStride !== null && props.config.rollingStride !== undefined ? Number(props.config.rollingStride) : null,
+      only_features: props.config.onlyFeatures ? String(props.config.onlyFeatures).split(',').map(s => s.trim()).filter(Boolean) : null
     }
 
     try {

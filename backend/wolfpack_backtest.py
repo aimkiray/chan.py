@@ -169,12 +169,16 @@ def _load_index_filter_day_set(
     kl_list = fetch_stock_data(code, KL_TYPE.K_DAY, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
     if (not kl_list) or len(kl_list) < mw + 5:
         alt_src = None
-        if data_src != DATA_SRC.AK_SHARE:
-            alt_src = DATA_SRC.AK_SHARE
-        elif data_src != DATA_SRC.BAO_STOCK:
-            alt_src = DATA_SRC.BAO_STOCK
+        if data_src in (DATA_SRC.AK_SHARE, DATA_SRC.BAO_STOCK):
+            if data_src == DATA_SRC.AK_SHARE:
+                alt_src = DATA_SRC.BAO_STOCK
+            else:
+                alt_src = DATA_SRC.AK_SHARE
         if alt_src is not None:
-            kl_list = fetch_stock_data(code, KL_TYPE.K_DAY, start_date, end_date, alt_src, autype=autype, use_online_latest=True)
+            try:
+                kl_list = fetch_stock_data(code, KL_TYPE.K_DAY, start_date, end_date, alt_src, autype=autype, use_online_latest=True)
+            except Exception:
+                kl_list = None
     if not kl_list or len(kl_list) < mw + 5:
         return None
 
@@ -211,6 +215,245 @@ def _load_index_filter_day_set(
     return allow
 
 
+def _load_index_risk_day_map(
+    index_code: str,
+    start_date: str,
+    end_date: str,
+    data_src: DATA_SRC,
+    autype: AUTYPE,
+    atr_window: int = 14,
+    drop_threshold: float = -0.03,
+    atr_pct_threshold: float = 0.04,
+    flat_drop_threshold: float = -0.05,
+    flat_atr_pct_threshold: float = 0.06,
+    gap_down_threshold: Optional[float] = None,
+    mode: str = "both",
+) -> Optional[Dict[int, str]]:
+    raw_mode = str(mode or "").strip().lower()
+    use_drop = raw_mode in ["both", "drop", "ret", "return"]
+    use_atr = raw_mode in ["both", "atr", "vol", "volatility"]
+    if not use_drop and not use_atr:
+        return None
+
+    try:
+        win = int(atr_window)
+    except Exception:
+        win = 14
+    win = max(2, win)
+
+    code = normalize_code(str(index_code or "399006"))
+    if str(code).endswith("399006") and (not (code.startswith("sz.") or code.startswith("sh."))):
+        code = "sz.399006"
+    kl_list = fetch_stock_data(code, KL_TYPE.K_DAY, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
+    if not kl_list:
+        kl_list = fetch_stock_data(code, KL_TYPE.K_30M, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
+    if not kl_list:
+        return None
+
+    by_day = {}
+    for k in kl_list:
+        try:
+            ts = int(getattr(getattr(k, "time", None), "ts", 0) or 0)
+        except Exception:
+            ts = 0
+        if ts <= 0:
+            continue
+        dk = _day_key_from_ts(ts)
+        if dk is None:
+            continue
+        try:
+            hi = float(getattr(k, "high", 0.0) or 0.0)
+            lo = float(getattr(k, "low", 0.0) or 0.0)
+            c = float(getattr(k, "close", 0.0) or 0.0)
+            o = float(getattr(k, "open", 0.0) or 0.0)
+        except Exception:
+            continue
+        if c <= 0.0:
+            continue
+        if o <= 0.0:
+            o = c
+        if hi <= 0.0:
+            hi = c
+        if lo <= 0.0:
+            lo = c
+        dd = by_day.get(int(dk))
+        if dd is None:
+            dd = {
+                "day": int(dk),
+                "open": float(o),
+                "high": float(hi),
+                "low": float(lo),
+                "close": float(c),
+                "ts_first": int(ts),
+                "ts_last": int(ts),
+            }
+            by_day[int(dk)] = dd
+        else:
+            dd["high"] = float(max(float(dd["high"]), float(hi)))
+            dd["low"] = float(min(float(dd["low"]), float(lo)))
+            if int(ts) <= int(dd.get("ts_first") or 0):
+                dd["ts_first"] = int(ts)
+                dd["open"] = float(o)
+            if int(ts) >= int(dd.get("ts_last") or 0):
+                dd["ts_last"] = int(ts)
+                dd["close"] = float(c)
+
+    daily = [by_day[k] for k in sorted(by_day.keys())]
+    if len(daily) < max(5, win + 2):
+        return None
+
+    dks = [int(d.get("day") or 0) for d in daily]
+    opens = [float(d.get("open") or 0.0) for d in daily]
+    highs = [float(d.get("high") or 0.0) for d in daily]
+    lows = [float(d.get("low") or 0.0) for d in daily]
+    closes = [float(d.get("close") or 0.0) for d in daily]
+
+    if len(closes) < max(5, win + 2):
+        return None
+
+    def tr(h: float, l: float, pc: float) -> float:
+        return float(max(h - l, abs(h - pc), abs(l - pc)))
+
+    out = {}
+    for i in range(1, len(closes)):
+        dk_today = int(dks[i])
+        c_prev = float(closes[i - 1])
+        o_today = float(opens[i])
+        gap_open_pct = float(o_today / c_prev - 1.0) if c_prev > 0.0 and o_today > 0.0 else None
+        if gap_down_threshold is not None and gap_open_pct is not None:
+            if float(gap_open_pct) <= float(gap_down_threshold):
+                out[dk_today] = "flat"
+                continue
+
+        if i < 2:
+            continue
+
+        c_2 = float(closes[i - 2])
+        c_y = float(closes[i - 1])
+        ret1d_y = float(c_y / c_2 - 1.0) if c_2 > 0.0 else None
+
+        trs = []
+        start = max(1, (i - 1) - win + 1)
+        for j in range(start, i):
+            pc = float(closes[j - 1])
+            trs.append(tr(float(highs[j]), float(lows[j]), pc))
+        atr_pct_y = float((sum(trs) / float(len(trs))) / c_y) if trs and c_y > 0.0 else None
+
+        flat = False
+        reduce = False
+        if use_drop and ret1d_y is not None:
+            if float(ret1d_y) <= float(flat_drop_threshold):
+                flat = True
+            elif float(ret1d_y) <= float(drop_threshold):
+                reduce = True
+        if use_atr and atr_pct_y is not None:
+            if float(atr_pct_y) >= float(flat_atr_pct_threshold):
+                flat = True
+            elif float(atr_pct_y) >= float(atr_pct_threshold):
+                reduce = True if not flat else reduce
+
+        if flat:
+            out[dk_today] = "flat"
+        elif reduce:
+            out[dk_today] = "reduce"
+    return out
+
+
+def _load_index_daily_ohlc(
+    index_code: str,
+    start_date: str,
+    end_date: str,
+    data_src: DATA_SRC,
+    autype: AUTYPE,
+) -> List[dict]:
+    code = normalize_code(str(index_code or "399006"))
+    if str(code).endswith("399006") and (not (code.startswith("sz.") or code.startswith("sh."))):
+        code = "sz.399006"
+    kl_list = fetch_stock_data(code, KL_TYPE.K_DAY, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
+    if not kl_list:
+        kl_list = fetch_stock_data(code, KL_TYPE.K_30M, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
+    if not kl_list:
+        return []
+
+    by_day = {}
+    for k in kl_list:
+        try:
+            ts = int(getattr(getattr(k, "time", None), "ts", 0) or 0)
+        except Exception:
+            ts = 0
+        if ts <= 0:
+            continue
+        dk = _day_key_from_ts(ts)
+        if dk is None:
+            continue
+        try:
+            o = float(getattr(k, "open", 0.0) or 0.0)
+            hi = float(getattr(k, "high", 0.0) or 0.0)
+            lo = float(getattr(k, "low", 0.0) or 0.0)
+            c = float(getattr(k, "close", 0.0) or 0.0)
+        except Exception:
+            continue
+        if c <= 0.0:
+            continue
+        if o <= 0.0:
+            o = c
+        if hi <= 0.0:
+            hi = c
+        if lo <= 0.0:
+            lo = c
+        dd = by_day.get(int(dk))
+        if dd is None:
+            by_day[int(dk)] = {
+                "day": int(dk),
+                "open": float(o),
+                "high": float(hi),
+                "low": float(lo),
+                "close": float(c),
+                "ts_first": int(ts),
+                "ts_last": int(ts),
+            }
+        else:
+            dd["high"] = float(max(float(dd["high"]), float(hi)))
+            dd["low"] = float(min(float(dd["low"]), float(lo)))
+            if int(ts) <= int(dd.get("ts_first") or 0):
+                dd["ts_first"] = int(ts)
+                dd["open"] = float(o)
+            if int(ts) >= int(dd.get("ts_last") or 0):
+                dd["ts_last"] = int(ts)
+                dd["close"] = float(c)
+    return [by_day[k] for k in sorted(by_day.keys())]
+
+
+def _load_index_intraday_close_series(
+    index_code: str,
+    start_date: str,
+    end_date: str,
+    data_src: DATA_SRC,
+    autype: AUTYPE,
+) -> List[tuple]:
+    code = normalize_code(str(index_code or "399006"))
+    if str(code).endswith("399006") and (not (code.startswith("sz.") or code.startswith("sh."))):
+        code = "sz.399006"
+    kl_list = fetch_stock_data(code, KL_TYPE.K_30M, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
+    out = []
+    for k in (kl_list or []):
+        try:
+            ts = int(getattr(getattr(k, "time", None), "ts", 0) or 0)
+        except Exception:
+            ts = 0
+        if ts <= 0:
+            continue
+        try:
+            c = float(getattr(k, "close", 0.0) or 0.0)
+        except Exception:
+            c = 0.0
+        if c <= 0.0:
+            continue
+        out.append((int(ts), float(c)))
+    out.sort(key=lambda x: int(x[0]))
+    return out
+
+
 def _simulate_universe_daily_topn(
     candidates: List[dict],
     start_date: str,
@@ -218,6 +461,8 @@ def _simulate_universe_daily_topn(
     trade_cost: float = 0.0,
     top_n: int = 3,
     index_allow_by_day: Optional[Dict[int, bool]] = None,
+    risk_by_day: Optional[Dict[int, str]] = None,
+    intraday_cfg: Optional[dict] = None,
 ) -> dict:
     try:
         tc = float(trade_cost or 0.0)
@@ -254,9 +499,82 @@ def _simulate_universe_daily_topn(
                 eq = float(eq) * 1.0
                 curve.append({"day": int(dk), "equity": float(eq), "r": 0.0, "codes": [], "probs": []})
                 continue
+        if risk_by_day is not None:
+            s = str(risk_by_day.get(int(dk)) or "").strip().lower()
+            if s == "flat":
+                rets.append(0.0)
+                eq = float(eq) * 1.0
+                curve.append({"day": int(dk), "equity": float(eq), "r": 0.0, "codes": [], "probs": []})
+                continue
+            day_tn = 1 if s == "reduce" else tn
+        else:
+            day_tn = tn
         rows = by_day.get(int(dk)) or []
+        if intraday_cfg and bool(intraday_cfg.get("enabled")) and rows:
+            try:
+                bear_th = float(intraday_cfg.get("bear_threshold"))
+            except Exception:
+                bear_th = -0.015
+            try:
+                bull_th = float(intraday_cfg.get("bull_threshold"))
+            except Exception:
+                bull_th = -0.03
+            fail_mode = str(intraday_cfg.get("data_fail_mode") or "reduce").strip().lower()
+            prev_close = (intraday_cfg.get("prev_close_by_day") or {}).get(int(dk))
+            ma20 = (intraday_cfg.get("ma20_by_day") or {}).get(int(dk))
+            get_px = intraday_cfg.get("get_index_close_at_ts")
+            daily_low = (intraday_cfg.get("daily_low_by_day") or {}).get(int(dk))
+            missing = []
+            if prev_close is None:
+                missing.append("prev_close")
+            if ma20 is None:
+                missing.append("ma20")
+            if (not callable(get_px)) and daily_low is None:
+                missing.append("current_price")
+            if missing:
+                if fail_mode == "flat":
+                    rets.append(0.0)
+                    eq = float(eq) * 1.0
+                    curve.append({"day": int(dk), "equity": float(eq), "r": 0.0, "codes": [], "probs": []})
+                    continue
+                if fail_mode == "reduce":
+                    day_tn = 1
+
+            next_rows = []
+            for r in rows:
+                try:
+                    ts = int(r.get("ts") or 0)
+                except Exception:
+                    ts = 0
+                cur_px = None
+                if callable(get_px) and ts > 0:
+                    try:
+                        cur_px = get_px(ts)
+                    except Exception:
+                        cur_px = None
+                if cur_px is None:
+                    cur_px = daily_low
+                if prev_close is None or ma20 is None or cur_px is None:
+                    next_rows.append(r)
+                    continue
+                try:
+                    pc = float(prev_close)
+                    ma = float(ma20)
+                    cp = float(cur_px)
+                except Exception:
+                    next_rows.append(r)
+                    continue
+                if pc <= 0.0 or cp <= 0.0 or ma <= 0.0:
+                    next_rows.append(r)
+                    continue
+                change = float(cp / pc - 1.0)
+                threshold = float(bear_th) if bool(cp < ma) else float(bull_th)
+                if float(change) <= float(threshold):
+                    continue
+                next_rows.append(r)
+            rows = next_rows
         rows.sort(key=lambda x: float(x.get("prob", float("-inf"))), reverse=True)
-        sel = rows[:tn]
+        sel = rows[: int(day_tn)]
         if not sel:
             rets.append(0.0)
             curve.append({"day": int(dk), "equity": float(eq), "r": 0.0, "codes": [], "probs": []})
@@ -344,6 +662,7 @@ def _calc_code_candidates(
     trade_cost: float,
     walk_forward_max_folds: int,
     stop_loss: float = -0.03,
+    enforce_t1: bool = True,
 ) -> Tuple[str, List[dict], Optional[dict]]:
     code = normalize_code(code)
     use_online_latest = bool(data_src == DATA_SRC.CLICK_HOUSE)
@@ -377,6 +696,7 @@ def _calc_code_candidates(
         profit_threshold=profit_threshold,
         profit_lookahead=int(holding_period),
         trade_cost=float(trade_cost or 0.0),
+        enforce_t1=bool(enforce_t1),
     )
     preds = []
     if isinstance(acc, dict):
@@ -427,7 +747,11 @@ def _calc_code_candidates(
         realized = float(pr)
         if float(min_pr) <= float(stop_loss):
             realized = float(stop_loss)
-        out.append({"day": int(dk), "prob": float(r.get("prob")), "profit": float(realized), "code": code})
+        try:
+            ts = int(r.get("ts") or 0)
+        except Exception:
+            ts = 0
+        out.append({"day": int(dk), "ts": int(ts), "prob": float(r.get("prob")), "profit": float(realized), "code": code})
     return code, out, {"detail": "ok", "candidates": int(len(out))}
 
 
@@ -452,6 +776,21 @@ class WolfpackBacktester:
         index_code: str = "399006",
         index_ma_window: int = 20,
         stop_loss: float = -0.03,
+        enforce_t1: bool = True,
+        risk_filter_enabled: bool = False,
+        risk_mode: str = "both",
+        risk_drop_threshold: float = -0.03,
+        risk_flat_drop_threshold: float = -0.05,
+        risk_atr_window: int = 14,
+        risk_atr_pct_threshold: float = 0.04,
+        risk_flat_atr_pct_threshold: float = 0.06,
+        risk_gap_down_threshold: float = -0.015,
+        risk_intraday_enabled: bool = True,
+        risk_intraday_bear_threshold: float = -0.015,
+        risk_intraday_bull_threshold: float = -0.03,
+        risk_trend_ma_window: int = 20,
+        risk_data_fail_mode: str = "reduce",
+        risk_intraday_data_fail_mode: str = "reduce",
     ) -> Dict[str, Any]:
         pool_codes = [normalize_code(str(c)) for c in (pool_codes or []) if str(c or "").strip()]
         pool_codes = list(dict.fromkeys(pool_codes))
@@ -487,6 +826,93 @@ class WolfpackBacktester:
         allow_by_day = None
         if bool(index_filter_enabled):
             allow_by_day = _load_index_filter_day_set(index_code, start_date, end_date, src, au, ma_window=int(index_ma_window))
+        risk_by_day = None
+        if bool(risk_filter_enabled):
+            risk_by_day = _load_index_risk_day_map(
+                index_code,
+                start_date,
+                end_date,
+                src,
+                au,
+                atr_window=int(risk_atr_window),
+                drop_threshold=float(risk_drop_threshold),
+                atr_pct_threshold=float(risk_atr_pct_threshold),
+                flat_drop_threshold=float(risk_flat_drop_threshold),
+                flat_atr_pct_threshold=float(risk_flat_atr_pct_threshold),
+                gap_down_threshold=float(risk_gap_down_threshold),
+                mode=str(risk_mode or "both"),
+            )
+            if not risk_by_day:
+                raw_fail = str(risk_data_fail_mode or "reduce").strip().lower()
+                if raw_fail in ("reduce", "flat"):
+                    risk_by_day = {int(dk): str(raw_fail) for dk in _date_range_days(start_date, end_date)}
+
+        intraday_cfg = None
+        if bool(risk_intraday_enabled):
+            daily = _load_index_daily_ohlc(index_code, start_date, end_date, src, au)
+            if daily:
+                try:
+                    w = int(risk_trend_ma_window or 20)
+                except Exception:
+                    w = 20
+                w = max(2, int(w))
+                closes = [float(d.get("close") or 0.0) for d in daily]
+                days = [int(d.get("day") or 0) for d in daily]
+                lows = [float(d.get("low") or 0.0) for d in daily]
+                prev_close_by_day = {}
+                ma20_by_day = {}
+                daily_low_by_day = {}
+                for i in range(len(days)):
+                    dk = int(days[i])
+                    if dk <= 0:
+                        continue
+                    daily_low_by_day[dk] = float(lows[i]) if lows[i] and lows[i] > 0.0 else None
+                    if i - 1 >= 0 and closes[i - 1] and closes[i - 1] > 0.0:
+                        prev_close_by_day[dk] = float(closes[i - 1])
+                    if i >= w:
+                        seg = closes[i - w : i]
+                        if seg and all((x and x > 0.0) for x in seg):
+                            ma20_by_day[dk] = float(sum(seg) / float(w))
+
+                ts_close = _load_index_intraday_close_series(index_code, start_date, end_date, src, au)
+                ts_list = [int(x[0]) for x in ts_close]
+                close_list = [float(x[1]) for x in ts_close]
+
+                def _get_index_close_at_ts(ts: int):
+                    if not ts_list:
+                        return None
+                    try:
+                        t = int(ts)
+                    except Exception:
+                        return None
+                    if t <= 0:
+                        return None
+                    idx = bisect_right(ts_list, int(t)) - 1
+                    if idx < 0:
+                        return None
+                    return float(close_list[idx])
+
+                intraday_cfg = {
+                    "enabled": True,
+                    "bear_threshold": float(risk_intraday_bear_threshold),
+                    "bull_threshold": float(risk_intraday_bull_threshold),
+                    "data_fail_mode": str(risk_intraday_data_fail_mode or "reduce"),
+                    "ma20_by_day": ma20_by_day,
+                    "prev_close_by_day": prev_close_by_day,
+                    "daily_low_by_day": daily_low_by_day,
+                    "get_index_close_at_ts": _get_index_close_at_ts,
+                }
+            else:
+                intraday_cfg = {
+                    "enabled": True,
+                    "bear_threshold": float(risk_intraday_bear_threshold),
+                    "bull_threshold": float(risk_intraday_bull_threshold),
+                    "data_fail_mode": str(risk_intraday_data_fail_mode or "reduce"),
+                    "ma20_by_day": {},
+                    "prev_close_by_day": {},
+                    "daily_low_by_day": {},
+                    "get_index_close_at_ts": None,
+                }
         with concurrent.futures.ThreadPoolExecutor(max_workers=mw) as executor:
             futures = {
                 executor.submit(
@@ -504,6 +930,7 @@ class WolfpackBacktester:
                     float(trade_cost or 0.0),
                     int(walk_forward_max_folds),
                     float(stop_loss),
+                    bool(enforce_t1),
                 ): code
                 for code in pool_codes
             }
@@ -526,6 +953,8 @@ class WolfpackBacktester:
             trade_cost=float(trade_cost or 0.0),
             top_n=int(portfolio_top_n),
             index_allow_by_day=allow_by_day,
+            risk_by_day=risk_by_day,
+            intraday_cfg=intraday_cfg,
         )
         return {
             "status": "success",
@@ -547,6 +976,21 @@ class WolfpackBacktester:
                 "index_code": str(index_code),
                 "index_ma_window": int(index_ma_window),
                 "stop_loss": float(stop_loss),
+                "enforce_t1": bool(enforce_t1),
+                "risk_filter_enabled": bool(risk_filter_enabled),
+                "risk_mode": str(risk_mode or "both"),
+                "risk_drop_threshold": float(risk_drop_threshold),
+                "risk_flat_drop_threshold": float(risk_flat_drop_threshold),
+                "risk_atr_window": int(risk_atr_window),
+                "risk_atr_pct_threshold": float(risk_atr_pct_threshold),
+                "risk_flat_atr_pct_threshold": float(risk_flat_atr_pct_threshold),
+                "risk_gap_down_threshold": float(risk_gap_down_threshold),
+                "risk_intraday_enabled": bool(risk_intraday_enabled),
+                "risk_intraday_bear_threshold": float(risk_intraday_bear_threshold),
+                "risk_intraday_bull_threshold": float(risk_intraday_bull_threshold),
+                "risk_trend_ma_window": int(risk_trend_ma_window),
+                "risk_data_fail_mode": str(risk_data_fail_mode or "reduce"),
+                "risk_intraday_data_fail_mode": str(risk_intraday_data_fail_mode or "reduce"),
                 "rank_transform_enabled": True,
                 "only_features": ["volatility_250", "bsp3_zs_height"],
                 "model": "lr",

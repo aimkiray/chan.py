@@ -327,6 +327,18 @@ class VectorBacktester:
             CAPITAL = float(kwargs.get("initial_capital", 100000.0))
         except Exception:
             CAPITAL = 100000.0
+
+        enforce_t1 = bool(kwargs.get("enforce_t1", False))
+
+        def _day_key(x) -> Optional[int]:
+            try:
+                dt = pd.to_datetime(x)
+            except Exception:
+                return None
+            try:
+                return int(dt.year) * 10000 + int(dt.month) * 100 + int(dt.day)
+            except Exception:
+                return None
         
         # State
         positions = {} # code -> {entry_price, entry_time_idx, shares}
@@ -336,6 +348,7 @@ class VectorBacktester:
         times = score_df.index
         
         for t_idx, t in enumerate(times):
+            cur_day = _day_key(t)
             # 1. Update Portfolio Value
             current_equity = cash
             todays_prices = price_df.iloc[t_idx]
@@ -350,7 +363,11 @@ class VectorBacktester:
                 # Check hold period
                 held_duration = t_idx - pos['entry_time_idx']
                 
-                if held_duration >= HOLD_PERIODS:
+                entry_day = pos.get("entry_day")
+                t1_ok = True
+                if bool(enforce_t1) and (cur_day is not None) and (entry_day is not None):
+                    t1_ok = int(cur_day) > int(entry_day)
+                if held_duration >= HOLD_PERIODS and bool(t1_ok):
                     to_exit.append(code)
                 
                 current_equity += pos['shares'] * current_price
@@ -408,7 +425,8 @@ class VectorBacktester:
                             positions[code] = {
                                 'entry_price': price,
                                 'entry_time_idx': t_idx,
-                                'shares': shares
+                                'shares': shares,
+                                'entry_day': cur_day,
                             }
             
             # Recalculate Equity after trades

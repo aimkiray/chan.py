@@ -209,6 +209,76 @@ const { t } = useI18n()
             <ul class="list-disc pl-5 space-y-2 text-sm text-gray-600 dark:text-gray-300">
               <li v-html="t('help.pretrain.pool')"></li>
               <li v-html="t('help.pretrain.force')"></li>
+              <li v-html="t('help.pretrain.rankMode')"></li>
+              <li v-html="t('help.pretrain.rollingSample')"></li>
+              <li v-html="t('help.pretrain.features')"></li>
+              <li v-html="t('help.pretrain.atrLabel')"></li>
+              <li v-html="t('help.pretrain.volFilter')"></li>
+              <li v-html="t('help.pretrain.jobs')"></li>
+              <li v-html="t('help.pretrain.models')"></li>
+            </ul>
+          </section>
+
+          <!-- 8. Analysis Pro (Intraday) -->
+          <section id="intraday" class="scroll-mt-20">
+            <h2 class="text-2xl font-bold text-gray-900 dark:text-white mb-4">{{ t('help.intraday.title') }}</h2>
+            <p class="text-gray-600 dark:text-gray-300 mb-4">{{ t('help.intraday.intro') }}</p>
+            <ul class="list-disc pl-5 space-y-2 text-sm text-gray-600 dark:text-gray-300">
+              <li v-html="t('help.intraday.freq')"></li>
+              <li v-html="t('help.intraday.dataSrc')"></li>
+              <li v-html="t('help.intraday.pretrained')"></li>
+              <li v-html="t('help.intraday.blend')"></li>
+              <li v-html="t('help.intraday.refresh')"></li>
+            </ul>
+          </section>
+
+          <!-- 9. Live Tools -->
+          <section id="live" class="scroll-mt-20">
+            <h2 class="text-2xl font-bold text-gray-900 dark:text-white mb-4">{{ t('help.live.title') }}</h2>
+            <p class="text-gray-600 dark:text-gray-300 mb-4">{{ t('help.live.intro') }}</p>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div class="bg-gray-50 dark:bg-gray-800/50 p-6 rounded-xl border border-gray-100 dark:border-gray-800">
+                <h3 class="text-lg font-bold text-gray-900 dark:text-white mb-3">{{ t('help.live.scan.title') }}</h3>
+                <ul class="list-disc pl-5 space-y-2 text-sm text-gray-600 dark:text-gray-300">
+                  <li v-html="t('help.live.scan.what')"></li>
+                  <li v-html="t('help.live.scan.lookback')"></li>
+                  <li v-html="t('help.live.scan.bspMode')"></li>
+                  <li v-html="t('help.live.scan.limit')"></li>
+                </ul>
+              </div>
+              <div class="bg-gray-50 dark:bg-gray-800/50 p-6 rounded-xl border border-gray-100 dark:border-gray-800">
+                <h3 class="text-lg font-bold text-gray-900 dark:text-white mb-3">{{ t('help.live.paper.title') }}</h3>
+                <ul class="list-disc pl-5 space-y-2 text-sm text-gray-600 dark:text-gray-300">
+                  <li v-html="t('help.live.paper.what')"></li>
+                  <li v-html="t('help.live.paper.params')"></li>
+                  <li v-html="t('help.live.paper.modelKey')"></li>
+                  <li v-html="t('help.live.paper.positions')"></li>
+                </ul>
+              </div>
+            </div>
+          </section>
+
+          <!-- 10. Portfolio & Backtest -->
+          <section id="portfolio" class="scroll-mt-20">
+            <h2 class="text-2xl font-bold text-gray-900 dark:text-white mb-4">{{ t('help.portfolio.title') }}</h2>
+            <p class="text-gray-600 dark:text-gray-300 mb-4">{{ t('help.portfolio.intro') }}</p>
+            <ul class="list-disc pl-5 space-y-2 text-sm text-gray-600 dark:text-gray-300">
+              <li v-html="t('help.portfolio.create')"></li>
+              <li v-html="t('help.portfolio.positions')"></li>
+              <li v-html="t('help.portfolio.backtest')"></li>
+              <li v-html="t('help.portfolio.modelKey')"></li>
+            </ul>
+          </section>
+
+          <!-- 11. History -->
+          <section id="history" class="scroll-mt-20">
+            <h2 class="text-2xl font-bold text-gray-900 dark:text-white mb-4">{{ t('help.history.title') }}</h2>
+            <p class="text-gray-600 dark:text-gray-300 mb-4">{{ t('help.history.intro') }}</p>
+            <ul class="list-disc pl-5 space-y-2 text-sm text-gray-600 dark:text-gray-300">
+              <li v-html="t('help.history.list')"></li>
+              <li v-html="t('help.history.search')"></li>
+              <li v-html="t('help.history.view')"></li>
+              <li v-html="t('help.history.delete')"></li>
             </ul>
           </section>
 

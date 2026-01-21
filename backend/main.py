@@ -5,6 +5,7 @@ import datetime
 import threading
 import uuid
 import gc
+import time
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -42,7 +43,7 @@ from backend.chan_service import (
 from backend.portfolio_service import get_portfolio_service
 from backend.vector_backtest import VectorBacktester
 from backend.serialization import serialize_chan_data
-from backend.storage import StorageManager, StrategyRun
+from backend.storage import StorageManager, StrategyRun, PositionStatus
 from backend.strategy_runner import StrategyRunner
 from Plot.PlotMeta import CChanPlotMeta
 from Common.CEnum import KL_TYPE, DATA_SRC, AUTYPE
@@ -51,6 +52,10 @@ app = FastAPI()
 storage = StorageManager()
 strategy_runner = StrategyRunner(storage)
 
+_live_run_scheduler_started = False
+_live_run_scheduler_lock = threading.Lock()
+_live_run_running = set()
+
 _pretrain_jobs_lock = threading.Lock()
 _pretrain_jobs = {}
 _PRETRAIN_JOBS_MAX = int(os.environ.get("MLCHAN_PRETRAIN_JOBS_MAX", "50") or 50)
@@ -58,8 +63,194 @@ _PRETRAIN_JOBS_TTL_SEC = int(os.environ.get("MLCHAN_PRETRAIN_JOBS_TTL_SEC", str(
 
 _task_queue_cv = threading.Condition()
 _task_queue = []
-_task_current = None
+_task_current = {}
 _task_worker_started = False
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return int(default)
+        return int(raw)
+    except Exception:
+        return int(default)
+
+_BACKTEST_MAX_WORKERS = max(1, _env_int("MLCHAN_BACKTEST_MAX_WORKERS", 16))
+
+def _resolve_backtest_max_workers(req_max_workers: int, pool_size: int) -> int:
+    try:
+        req_mw = int(req_max_workers or 0)
+    except Exception:
+        req_mw = 0
+    base = _BACKTEST_MAX_WORKERS if (req_mw <= 0 or req_mw == 8) else req_mw
+    mw = min(int(base), int(_BACKTEST_MAX_WORKERS)) if _BACKTEST_MAX_WORKERS > 0 else int(base)
+    ps = int(pool_size or 0)
+    if ps <= 0:
+        ps = 1
+    return max(1, min(int(mw), int(ps)))
+
+def _cn_dt_from_ts(ts: int) -> datetime.datetime:
+    try:
+        return datetime.datetime.fromtimestamp(int(ts), tz=datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=8)
+    except Exception:
+        return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=8)
+
+
+def _cn_ts_from_dt(dt_cn: datetime.datetime) -> int:
+    try:
+        return int((dt_cn - datetime.timedelta(hours=8)).timestamp())
+    except Exception:
+        return int(time.time())
+
+
+def _next_weekday(d: datetime.date) -> datetime.date:
+    while d.weekday() >= 5:
+        d = d + datetime.timedelta(days=1)
+    return d
+
+
+def _next_cn_30m_exec_ts(now_ts: int, offset_seconds: int = 5) -> int:
+    try:
+        off = int(offset_seconds or 0)
+    except Exception:
+        off = 0
+    off = max(0, min(int(off), 120))
+    now = _cn_dt_from_ts(int(now_ts))
+    d = _next_weekday(now.date())
+    times = [(9, 30), (10, 0), (10, 30), (11, 0), (11, 30), (13, 0), (13, 30), (14, 0), (14, 30), (15, 0)]
+    if d != now.date():
+        dt = datetime.datetime(d.year, d.month, d.day, times[0][0], times[0][1], 0)
+        return int(_cn_ts_from_dt(dt + datetime.timedelta(seconds=int(off))))
+    for hh, mm in times:
+        dt = datetime.datetime(d.year, d.month, d.day, hh, mm, 0) + datetime.timedelta(seconds=int(off))
+        if dt > now:
+            return int(_cn_ts_from_dt(dt))
+    nd = _next_weekday(d + datetime.timedelta(days=1))
+    dt = datetime.datetime(nd.year, nd.month, nd.day, times[0][0], times[0][1], 0) + datetime.timedelta(seconds=int(off))
+    return int(_cn_ts_from_dt(dt))
+
+
+def _start_live_run_scheduler():
+    global _live_run_scheduler_started
+    with _live_run_scheduler_lock:
+        if _live_run_scheduler_started:
+            return
+        _live_run_scheduler_started = True
+
+    def _loop():
+        import asyncio as _asyncio
+        from backend.live.notifier import send_text_env
+
+        while True:
+            try:
+                now_ts = int(time.time())
+                runs = storage.list_live_runs(status="running", limit=500) or []
+                for r in runs:
+                    rid = str(r.get("run_id") or "").strip()
+                    if not rid:
+                        continue
+                    if rid in _live_run_running:
+                        continue
+                    try:
+                        nxt = int(r.get("next_exec_ts") or 0)
+                    except Exception:
+                        nxt = 0
+                    try:
+                        off = int(r.get("offset_seconds") or 5)
+                    except Exception:
+                        off = 5
+                    if nxt <= 0:
+                        nxt = _next_cn_30m_exec_ts(now_ts, off)
+                        storage.update_live_run_fields(rid, {"next_exec_ts": int(nxt)})
+                    if int(now_ts) < int(nxt):
+                        continue
+
+                    _live_run_running.add(rid)
+
+                    def _run_one(run_id: str, sim_id: str, notify_enabled: bool):
+                        nonlocal now_ts, off
+                        try:
+                            run = storage.get_live_run(run_id) or {}
+                            params = run.get("params") or {}
+                            if not isinstance(params, dict):
+                                params = {}
+                            params = dict(params)
+                            params["run_id"] = str(run_id)
+                            params["sim_id"] = str(sim_id or params.get("sim_id") or "").strip() or "default"
+                            if params.get("portfolio_id") is None:
+                                params["portfolio_id"] = run.get("portfolio_id")
+                            if "enable_rolling_lookback" not in params:
+                                params["enable_rolling_lookback"] = True
+                            req = LivePaperTradeStepRequest(**params)
+                            out = _asyncio.run(live_paper_trade_step(req))
+                            if isinstance(out, dict):
+                                step_ts = int(out.get("ts") or 0)
+                                steps = int(run.get("steps") or 0) + 1
+                                next_ts = _next_cn_30m_exec_ts(int(time.time()), int(off))
+                                storage.update_live_run_fields(run_id, {
+                                    "steps": int(steps),
+                                    "last_step_ts": int(step_ts),
+                                    "next_exec_ts": int(next_ts),
+                                    "last_result_json": json.dumps(out, ensure_ascii=False),
+                                    "error": "",
+                                })
+                                if notify_enabled:
+                                    try:
+                                        risk = out.get("risk") or {}
+                                        lvl = str(risk.get("level") or "")
+                                        reason = str(risk.get("reason") or "")
+                                        targets = out.get("targets") or []
+                                        codes = [str(t.get("code")) for t in targets if isinstance(t, dict) and t.get("code")]
+                                        msg = f"sim={params['sim_id']} pid={params.get('portfolio_id')} risk={lvl} reason={reason} top={codes} sell={(out.get('sell') or [])} buy={(out.get('buy') or [])}"
+                                        send_text_env(msg)
+                                    except Exception:
+                                        pass
+                        except Exception as e:
+                            next_ts = _next_cn_30m_exec_ts(int(time.time()), int(off))
+                            storage.update_live_run_fields(run_id, {"next_exec_ts": int(next_ts), "error": str(e)})
+                        finally:
+                            try:
+                                _live_run_running.discard(run_id)
+                            except Exception:
+                                pass
+
+                    sim_id = str(r.get("sim_id") or "").strip() or "default"
+                    notify_enabled = bool(r.get("notify_enabled"))
+                    t = threading.Thread(target=lambda rid=rid, sid=sim_id, ne=notify_enabled: _run_one(rid, sid, ne), daemon=True)
+                    t.start()
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+    th = threading.Thread(target=_loop, daemon=True)
+    th.start()
+
+
+@app.on_event("startup")
+async def _on_startup_live_runs():
+    try:
+        _start_live_run_scheduler()
+        runs = storage.list_live_runs(status="running", limit=500) or []
+        now_ts = int(time.time())
+        for r in runs:
+            rid = str(r.get("run_id") or "").strip()
+            if not rid:
+                continue
+            if not bool(r.get("auto_resume", True)):
+                storage.update_live_run_fields(rid, {"status": "stopped", "next_exec_ts": 0})
+                continue
+            try:
+                nxt = int(r.get("next_exec_ts") or 0)
+            except Exception:
+                nxt = 0
+            try:
+                off = int(r.get("offset_seconds") or 5)
+            except Exception:
+                off = 5
+            if nxt <= 0:
+                storage.update_live_run_fields(rid, {"next_exec_ts": int(_next_cn_30m_exec_ts(now_ts, off))})
+    except Exception:
+        return
 
 def _ensure_task_worker_started():
     global _task_worker_started
@@ -68,7 +259,13 @@ def _ensure_task_worker_started():
             return
         _task_worker_started = True
 
-    def _worker_loop():
+    try:
+        workers = int(os.environ.get("MLCHAN_TASK_WORKERS", "2") or 2)
+    except Exception:
+        workers = 2
+    workers = max(1, min(int(workers), 8))
+
+    def _worker_loop(worker_id: int):
         global _task_current
         while True:
             task = None
@@ -76,7 +273,7 @@ def _ensure_task_worker_started():
                 while not _task_queue:
                     _task_queue_cv.wait()
                 task = _task_queue.pop(0)
-                _task_current = task
+                _task_current[worker_id] = task
             try:
                 fn = task.get("fn")
                 if callable(fn):
@@ -85,10 +282,11 @@ def _ensure_task_worker_started():
                 pass
             finally:
                 with _task_queue_cv:
-                    _task_current = None
+                    _task_current.pop(worker_id, None)
 
-    t = threading.Thread(target=_worker_loop, daemon=True)
-    t.start()
+    for i in range(int(workers)):
+        t = threading.Thread(target=lambda wid=i: _worker_loop(wid), daemon=True)
+        t.start()
 
 def _enqueue_task(kind: str, ref_id: str, fn: Callable[[], None]):
     _ensure_task_worker_started()
@@ -103,9 +301,9 @@ def _enqueue_task(kind: str, ref_id: str, fn: Callable[[], None]):
 
 def _cancel_task_if_queued(kind: str, ref_id: str) -> bool:
     with _task_queue_cv:
-        cur = _task_current
-        if cur and cur.get("kind") == kind and str(cur.get("ref_id")) == str(ref_id):
-            return False
+        for cur in (_task_current or {}).values():
+            if cur and cur.get("kind") == kind and str(cur.get("ref_id")) == str(ref_id):
+                return False
         kept = []
         removed = False
         for t in _task_queue:
@@ -427,6 +625,10 @@ class PretrainRequest(BaseModel):
     topk_frac: float = 0.2
     portfolio_min_score: float = 0.6
     portfolio_top_n: int = 2
+    rank_mode: str = "sample"
+    rolling_sample_mode: Optional[str] = None
+    rolling_stride: Optional[int] = None
+    only_features: Optional[List[str]] = None
 
 def _default_profit_lookahead_for_frequency(freq: str) -> int:
     f = str(freq or "").strip().lower()
@@ -575,6 +777,10 @@ async def create_pretrain_job(req: PretrainRequest):
                 use_atr_label=bool(req.use_atr_label),
                 atr_period=int(req.atr_period),
                 atr_mult=float(req.atr_mult),
+                rank_mode=str(req.rank_mode or "sample"),
+                rolling_sample_mode=req.rolling_sample_mode,
+                rolling_stride=req.rolling_stride,
+                only_features=req.only_features,
             )
             if not path:
                 detail = None
@@ -983,7 +1189,7 @@ class VectorBacktestRequest(BaseModel):
     holding_period: int = 5
     min_signal_score: Optional[float] = None
     initial_capital: float = 100000.0
-    max_workers: int = 8
+    max_workers: int = _BACKTEST_MAX_WORKERS
     score_feature: Optional[str] = None
     score_mode: str = "raw"
     score_higher_is_better: bool = True
@@ -999,12 +1205,27 @@ class WolfpackBacktestRequest(BaseModel):
     holding_period: int = 3
     min_prob: float = 0.25
     trade_cost: float = 0.0002
-    portfolio_top_n: int = 3
+    portfolio_top_n: int = 2
     index_filter_enabled: bool = True
     index_code: str = "399006"
     index_ma_window: int = 20
     stop_loss: float = -0.03
-    max_workers: int = 8
+    enforce_t1: bool = True
+    risk_filter_enabled: bool = True
+    risk_mode: str = "both"
+    risk_drop_threshold: float = -0.03
+    risk_flat_drop_threshold: float = -0.05
+    risk_atr_window: int = 14
+    risk_atr_pct_threshold: float = 0.04
+    risk_flat_atr_pct_threshold: float = 0.06
+    risk_gap_down_threshold: float = -0.015
+    risk_intraday_enabled: bool = True
+    risk_intraday_bear_threshold: float = -0.015
+    risk_intraday_bull_threshold: float = -0.03
+    risk_trend_ma_window: int = 20
+    risk_data_fail_mode: str = "reduce"
+    risk_intraday_data_fail_mode: str = "reduce"
+    max_workers: int = _BACKTEST_MAX_WORKERS
 
 @app.post("/api/backtest/vector")
 async def run_vector_backtest(req: VectorBacktestRequest):
@@ -1048,6 +1269,8 @@ async def run_vector_backtest(req: VectorBacktestRequest):
     if not pool_codes:
          # Fallback for testing
          pool_codes = ["sz.300059", "sz.300750"] # Sample ChiNext stocks
+    
+    mw = _resolve_backtest_max_workers(getattr(req, "max_workers", 0), len(pool_codes))
          
     # Run
     # Warning: This is blocking. In production, use background task.
@@ -1065,7 +1288,7 @@ async def run_vector_backtest(req: VectorBacktestRequest):
         holding_period=req.holding_period,
         min_signal_score=req.min_signal_score,
         initial_capital=req.initial_capital,
-        max_workers=req.max_workers,
+        max_workers=mw,
         score_feature=req.score_feature,
         score_mode=req.score_mode,
         score_higher_is_better=req.score_higher_is_better,
@@ -1099,8 +1322,11 @@ async def run_wolfpack_backtest(req: WolfpackBacktestRequest):
         if picked:
             pool_codes = CClickHouseAPI.get_pool_members(picked)
         if not pool_codes:
-            from backend.vector_backtest import get_chinext50_stocks
-            pool_codes = get_chinext50_stocks()
+            if str(req.data_src or "").strip().lower() != "clickhouse":
+                from backend.vector_backtest import get_chinext50_stocks
+                pool_codes = get_chinext50_stocks()
+
+    mw = _resolve_backtest_max_workers(getattr(req, "max_workers", 0), len(pool_codes))
 
     from backend.wolfpack_backtest import WolfpackBacktester
     tester = WolfpackBacktester()
@@ -1120,7 +1346,22 @@ async def run_wolfpack_backtest(req: WolfpackBacktestRequest):
         index_code=req.index_code,
         index_ma_window=req.index_ma_window,
         stop_loss=req.stop_loss,
-        max_workers=req.max_workers,
+        enforce_t1=req.enforce_t1,
+        risk_filter_enabled=req.risk_filter_enabled,
+        risk_mode=req.risk_mode,
+        risk_drop_threshold=req.risk_drop_threshold,
+        risk_flat_drop_threshold=req.risk_flat_drop_threshold,
+        risk_atr_window=req.risk_atr_window,
+        risk_atr_pct_threshold=req.risk_atr_pct_threshold,
+        risk_flat_atr_pct_threshold=req.risk_flat_atr_pct_threshold,
+        risk_gap_down_threshold=req.risk_gap_down_threshold,
+        risk_intraday_enabled=req.risk_intraday_enabled,
+        risk_intraday_bear_threshold=req.risk_intraday_bear_threshold,
+        risk_intraday_bull_threshold=req.risk_intraday_bull_threshold,
+        risk_trend_ma_window=req.risk_trend_ma_window,
+        risk_data_fail_mode=req.risk_data_fail_mode,
+        risk_intraday_data_fail_mode=req.risk_intraday_data_fail_mode,
+        max_workers=mw,
     )
 
 @app.post("/api/analyze")
@@ -1966,6 +2207,1532 @@ class StrategyRequest(BaseModel):
 class StrategyRunsBatchDeleteRequest(BaseModel):
     run_ids: List[int] = []
 
+class LiveScanFeaturesRequest(BaseModel):
+    pool_id: str = "index:IDX399673"
+    frequency: str = "30m"
+    data_src: str = "clickhouse"
+    autype: str = "qfq"
+    lookback_days: int = 120
+    enable_rolling_lookback: bool = True
+    bsp_feature_mode: str = "latest_bsp"
+    rank_mode: str = "cross_section"
+    rolling_sample_mode: str = "every_bar"
+    rolling_stride: int = 1
+    max_workers: int = 0
+    limit: int = 0
+
+class LivePaperTradeStepRequest(BaseModel):
+    sim_id: Optional[str] = None
+    run_id: Optional[str] = None
+    portfolio_id: Optional[int] = None
+    pool_id: str = "index:IDX399673"
+    frequency: str = "30m"
+    data_src: str = "clickhouse"
+    autype: str = "qfq"
+    lookback_days: int = 365 * 5
+    enable_rolling_lookback: bool = True
+    top_n: int = 2
+    min_prob: float = 0.25
+    holding_period: int = 3
+    trade_cost: float = 0.0002
+    walk_forward_max_folds: int = 25
+    max_workers: int = 8
+    limit: int = 0
+    use_latest_available_day: bool = True
+    pretrained_model_key: Optional[str] = None
+    rank_mode: str = "cross_section"
+    rolling_sample_mode: str = "every_bar"
+    rolling_stride: int = 1
+    risk_filter_enabled: bool = True
+    risk_mode: str = "both"
+    risk_index_code: str = "399006"
+    risk_drop_threshold: float = -0.03
+    risk_flat_drop_threshold: float = -0.05
+    risk_atr_window: int = 14
+    risk_atr_pct_threshold: float = 0.04
+    risk_flat_atr_pct_threshold: float = 0.06
+    risk_gap_down_threshold: float = -0.015
+    risk_intraday_enabled: bool = True
+    risk_intraday_bear_threshold: float = -0.015
+    risk_intraday_bull_threshold: float = -0.03
+    risk_trend_ma_window: int = 20
+    risk_data_fail_mode: str = "reduce"
+    risk_intraday_data_fail_mode: str = "reduce"
+
+class LiveSimUpsertRequest(BaseModel):
+    sim_id: str
+    name: Optional[str] = None
+
+
+class LiveRunCreateRequest(BaseModel):
+    run_id: Optional[str] = None
+    name: str = ""
+    sim_id: str = "default"
+    portfolio_id: Optional[int] = None
+    params: dict = {}
+    offset_seconds: int = 5
+    auto_resume: bool = True
+    notify_enabled: bool = False
+    start: bool = True
+
+@app.post("/api/live/scan_features")
+async def live_scan_features(req: LiveScanFeaturesRequest):
+    try:
+        import concurrent.futures
+        import os
+        import time
+        from DataAPI.ClickHouseAPI import CClickHouseAPI
+        from backend.live.common import compute_volatility_250, parse_autype, parse_data_src, parse_frequency
+        from backend.chan_service import cross_section_rank_transform_rows, extract_state_features
+
+        pool_id = str(req.pool_id or "").strip() or "index:IDX399673"
+        raw_codes = CClickHouseAPI.get_pool_members(pool_id=pool_id, table="stock_constituent", limit=5000)
+        codes = []
+        for c in raw_codes or []:
+            try:
+                codes.append(normalize_code(str(c)))
+            except Exception:
+                continue
+        codes = list(dict.fromkeys([c for c in codes if c]))
+        if int(req.limit or 0) > 0:
+            codes = codes[: int(req.limit)]
+
+        freq_raw, level = parse_frequency(req.frequency)
+        data_src = parse_data_src(req.data_src)
+        autype = parse_autype("qfq")
+
+        end = datetime.datetime.now().strftime("%Y-%m-%d")
+        begin = (datetime.datetime.now() - datetime.timedelta(days=int(req.lookback_days or 120))).strftime("%Y-%m-%d")
+        want_bsp = str(req.bsp_feature_mode or "").strip().lower() == "latest_bsp"
+        want_rank = str(req.rank_mode or "").strip().lower() == "cross_section"
+        rolling_sample_mode = str(req.rolling_sample_mode or "").strip() or "every_bar"
+        rolling_stride = int(req.rolling_stride) if req.rolling_stride is not None else 1
+        try:
+            req_mw = int(req.max_workers or 0)
+        except Exception:
+            req_mw = 0
+        try:
+            env_mw_raw = os.environ.get("MLCHAN_LIVE_MAX_WORKERS", "").strip()
+            env_mw = int(env_mw_raw) if env_mw_raw else 0
+        except Exception:
+            env_mw = 0
+        if env_mw and env_mw > 0:
+            base_mw = req_mw if req_mw and req_mw > 0 else env_mw
+            mw = min(int(base_mw), int(env_mw))
+        else:
+            mw = req_mw if req_mw and req_mw > 0 else 1
+        mw = max(1, min(int(mw), int(len(codes) if codes else 1)))
+
+        def scan_one(code: str):
+            kl_list = fetch_stock_data(code, level, begin, end, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
+            if not kl_list:
+                return {
+                    "code": code,
+                    "ok": False,
+                    "reason": "no_data",
+                    "volatility_250": 0.0,
+                    "volatility_250_rank": None,
+                    "bsp3_zs_height": None,
+                    "zs_last_height": None,
+                    "zs_last_height_rank": None,
+                    "sample_ts": None,
+                }
+            vol = compute_volatility_250(kl_list)
+            zs = None
+            zs_last_height = None
+            sample_ts = 0
+            try:
+                if want_bsp:
+                    chan_snapshot, bsp_dict, _, _ = get_chan_data(
+                        code,
+                        True,
+                        True,
+                        level,
+                        data_src,
+                        preloaded_data=kl_list,
+                        do_predict=True,
+                        begin_time=begin,
+                        end_time=end,
+                        enable_rolling_lookback=bool(req.enable_rolling_lookback),
+                        autype=autype,
+                        rolling_sample_mode=rolling_sample_mode,
+                        rolling_stride=rolling_stride,
+                    )
+                else:
+                    chan_snapshot, _, _, _ = get_chan_data(
+                        code,
+                        True,
+                        True,
+                        level,
+                        data_src,
+                        preloaded_data=kl_list,
+                        do_predict=False,
+                        begin_time=begin,
+                        end_time=end,
+                        enable_rolling_lookback=bool(req.enable_rolling_lookback),
+                        autype=autype,
+                        rolling_sample_mode=rolling_sample_mode,
+                        rolling_stride=rolling_stride,
+                    )
+                    bsp_dict = None
+
+                try:
+                    cur_lv_chan = chan_snapshot[0]
+                    last_klu = cur_lv_chan[-1][-1]
+                    sample_ts = int(getattr(getattr(last_klu, "time", None), "ts", 0) or 0)
+                except Exception:
+                    sample_ts = 0
+                try:
+                    state_feat = extract_state_features(chan_snapshot) or {}
+                    v = state_feat.get("zs_last_height")
+                    zs_last_height = float(v) if v is not None else None
+                except Exception:
+                    zs_last_height = None
+
+                if want_bsp and bsp_dict:
+                    last_ts = 0
+                    last_v = None
+                    for _, info in (bsp_dict or {}).items():
+                        try:
+                            ot = info.get("open_time")
+                            ts = int(getattr(ot, "ts", 0) or 0)
+                        except Exception:
+                            ts = 0
+                        if ts <= 0 or ts < last_ts:
+                            continue
+                        try:
+                            feat = info.get("feature")
+                        except Exception:
+                            feat = None
+                        if not feat:
+                            continue
+                        try:
+                            v = feat.get("bsp3_zs_height")
+                        except Exception:
+                            v = None
+                        if v is None:
+                            continue
+                        try:
+                            last_v = float(v)
+                            last_ts = ts
+                        except Exception:
+                            continue
+                    zs = last_v
+            except Exception:
+                zs = None
+                zs_last_height = None
+                sample_ts = 0
+
+            return {
+                "code": code,
+                "ok": True,
+                "reason": None,
+                "volatility_250": float(vol),
+                "volatility_250_rank": None,
+                "bsp3_zs_height": (float(zs) if zs is not None else None),
+                "zs_last_height": (float(zs_last_height) if zs_last_height is not None else None),
+                "zs_last_height_rank": None,
+                "sample_ts": (int(sample_ts) if int(sample_ts or 0) > 0 else None),
+            }
+
+        items = []
+        if mw <= 1 or not codes:
+            for code in codes:
+                items.append(scan_one(code))
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=int(mw)) as ex:
+                futs = {ex.submit(scan_one, code): code for code in codes}
+                for fut in concurrent.futures.as_completed(futs):
+                    try:
+                        r = fut.result()
+                    except Exception:
+                        r = None
+                    if r:
+                        items.append(r)
+
+        if want_rank and items:
+            rows = []
+            item_idxs = []
+            for i, it in enumerate(items):
+                if not isinstance(it, dict) or not bool(it.get("ok")):
+                    continue
+                rows.append(
+                    {
+                        "feature": {
+                            "volatility_250": it.get("volatility_250", -9999999.0),
+                            "zs_last_height": it.get("zs_last_height", -9999999.0),
+                        }
+                    }
+                )
+                item_idxs.append(i)
+            if rows:
+                cross_section_rank_transform_rows(rows, ["volatility_250", "zs_last_height"], missing_value=-9999999.0)
+                for local_i, item_i in enumerate(item_idxs):
+                    try:
+                        it = items[item_i]
+                        feat = rows[local_i].get("feature") or {}
+                        v_rank = feat.get("volatility_250")
+                        z_rank = feat.get("zs_last_height")
+                        it["volatility_250_rank"] = float(v_rank) if isinstance(v_rank, (int, float)) else None
+                        it["zs_last_height_rank"] = float(z_rank) if isinstance(z_rank, (int, float)) else None
+                    except Exception:
+                        continue
+
+        items.sort(key=lambda x: float(x.get("volatility_250") or 0.0), reverse=True)
+        return {
+            "ts": int(time.time()),
+            "pool_id": pool_id,
+            "frequency": freq_raw,
+            "rank_mode": (str(req.rank_mode or "").strip() or "cross_section"),
+            "rolling_sample_mode": rolling_sample_mode,
+            "rolling_stride": rolling_stride,
+            "max_workers": int(mw),
+            "items": items,
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/live/positions")
+async def live_list_positions(sim_id: Optional[str] = None, portfolio_id: Optional[int] = None):
+    try:
+        return {"items": storage.list_positions(sim_id=sim_id, portfolio_id=portfolio_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/live/orders")
+async def live_list_orders(status: Optional[str] = "pending", limit: int = 200, sim_id: Optional[str] = None, portfolio_id: Optional[int] = None):
+    try:
+        st = str(status or "").strip()
+        if not st:
+            st = None
+        return {"items": storage.list_live_orders(status=st, limit=limit, sim_id=sim_id, portfolio_id=portfolio_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/live/trades")
+async def live_list_trades(
+    limit: int = 200,
+    page: Optional[int] = None,
+    page_size: int = 50,
+    sim_id: Optional[str] = None,
+    portfolio_id: Optional[int] = None,
+):
+    try:
+        if page is not None:
+            return storage.list_live_trades_paged(page=page, page_size=page_size, sim_id=sim_id, portfolio_id=portfolio_id)
+        return {"items": storage.list_live_trades(limit=limit, sim_id=sim_id, portfolio_id=portfolio_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/live/sims")
+async def live_upsert_sim(req: LiveSimUpsertRequest):
+    try:
+        return {"item": storage.upsert_live_sim(sim_id=req.sim_id, name=req.name)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/live/sims")
+async def live_list_sims(limit: int = 200):
+    try:
+        return {"items": storage.list_live_sims(limit=limit)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/live/runs")
+async def live_create_run(req: LiveRunCreateRequest):
+    try:
+        rid = str(req.run_id or "").strip() or uuid.uuid4().hex[:32]
+        nm = str(req.name or "").strip()
+        params = dict(req.params or {})
+        sim_id = str(req.sim_id or params.get("sim_id") or "").strip() or "default"
+        params["sim_id"] = sim_id
+        pid = req.portfolio_id
+        if pid is None:
+            pid = params.get("portfolio_id")
+        params["portfolio_id"] = pid
+        st = "running" if bool(req.start) else "stopped"
+        nxt = _next_cn_30m_exec_ts(int(time.time()), int(req.offset_seconds or 5)) if st == "running" else 0
+        out = storage.upsert_live_run(
+            run_id=rid,
+            sim_id=sim_id,
+            name=nm,
+            status=st,
+            params=params,
+            portfolio_id=pid,
+            next_exec_ts=int(nxt),
+            offset_seconds=int(req.offset_seconds or 5),
+            auto_resume=bool(req.auto_resume),
+            notify_enabled=bool(req.notify_enabled),
+        )
+        return {"item": out}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/live/runs")
+async def live_list_runs(status: Optional[str] = None, limit: int = 200, portfolio_id: Optional[int] = None):
+    try:
+        st = str(status or "").strip().lower() or None
+        return {"items": storage.list_live_runs(status=st, limit=limit, portfolio_id=portfolio_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/live/steps")
+async def live_list_steps(sim_id: Optional[str] = None, run_id: Optional[str] = None, portfolio_id: Optional[int] = None, page: int = 1, page_size: int = 50):
+    try:
+        return storage.list_live_steps_paged(sim_id=sim_id, run_id=run_id, portfolio_id=portfolio_id, page=page, page_size=page_size)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/live/steps/stocks")
+async def live_list_step_stocks(sim_id: Optional[str] = None, run_id: Optional[str] = None, portfolio_id: Optional[int] = None, page: int = 1, page_size: int = 10):
+    try:
+        return storage.list_live_step_stocks_paged(sim_id=sim_id, run_id=run_id, portfolio_id=portfolio_id, page=page, page_size=page_size)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/live/equity_curve")
+async def live_equity_curve(sim_id: Optional[str] = None, run_id: Optional[str] = None, portfolio_id: Optional[int] = None, limit: int = 2000):
+    try:
+        sid = str(sim_id or "").strip() or "default"
+        tn = 2
+        if run_id:
+            r = storage.get_live_run(str(run_id))
+            if r and isinstance(r.get("params"), dict):
+                try:
+                    tn = int((r.get("params") or {}).get("top_n") or 2)
+                except Exception:
+                    tn = 2
+        tn = max(1, int(tn))
+        trades = storage.list_live_trades(limit=limit, sim_id=sid, portfolio_id=portfolio_id) or []
+        trades = sorted(trades, key=lambda x: int(x.get("trade_ts") or 0))
+        last_buy = {}
+        eq = 1.0
+        pts = []
+        for tr in trades:
+            code = str(tr.get("stock_code") or "").strip()
+            side = str(tr.get("side") or "").strip().lower()
+            try:
+                px = float(tr.get("price") or 0.0)
+            except Exception:
+                px = 0.0
+            ts = int(tr.get("trade_ts") or 0)
+            if not code or px <= 0.0 or ts <= 0:
+                continue
+            if side == "buy":
+                last_buy[code] = float(px)
+                continue
+            if side == "sell":
+                bp = last_buy.get(code)
+                if bp and bp > 0.0:
+                    rret = float(px / bp - 1.0)
+                    eq = float(eq) * float(1.0 + rret / float(tn))
+                pts.append({"ts": int(ts), "equity": float(eq), "code": code, "side": side, "price": float(px)})
+        return {"sim_id": sid, "run_id": str(run_id or ""), "portfolio_id": portfolio_id, "top_n": int(tn), "points": pts}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/live/runs/{run_id}")
+async def live_get_run(run_id: str):
+    try:
+        out = storage.get_live_run(run_id)
+        if not out:
+            raise HTTPException(status_code=404, detail="run not found")
+        return {"item": out}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/live/runs/{run_id}/start")
+async def live_start_run(run_id: str):
+    try:
+        r = storage.get_live_run(run_id)
+        if not r:
+            raise HTTPException(status_code=404, detail="run not found")
+        nxt = _next_cn_30m_exec_ts(int(time.time()), int(r.get("offset_seconds") or 5))
+        out = storage.update_live_run_fields(run_id, {"status": "running", "next_exec_ts": int(nxt), "error": ""})
+        return {"item": out}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/live/runs/{run_id}/stop")
+async def live_stop_run(run_id: str):
+    try:
+        out = storage.update_live_run_fields(run_id, {"status": "stopped", "next_exec_ts": 0, "stopped_at": datetime.datetime.utcnow()})
+        if not out:
+            raise HTTPException(status_code=404, detail="run not found")
+        return {"item": out}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/live/runs/{run_id}")
+async def live_delete_run(run_id: str):
+    try:
+        ok = storage.delete_live_run(run_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="run not found")
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/live/positions_report")
+async def live_positions_report(
+    frequency: str = "30m",
+    data_src: str = "clickhouse",
+    autype: str = "qfq",
+    lookback_days: int = 30,
+    sim_id: Optional[str] = None,
+    portfolio_id: Optional[int] = None,
+):
+    try:
+        from backend.live.common import parse_autype, parse_data_src, parse_frequency
+
+        freq_raw, level = parse_frequency(frequency)
+        ds = parse_data_src(data_src)
+        au = parse_autype("qfq")
+
+        positions_raw = storage.list_positions(sim_id=sim_id, portfolio_id=portfolio_id) or []
+        now_dt = datetime.datetime.now()
+        end = now_dt.strftime("%Y-%m-%d")
+        begin_dt = now_dt - datetime.timedelta(days=int(lookback_days or 30))
+        try:
+            entry_ts_list = [int(p.get("entry_time") or 0) for p in positions_raw]
+            entry_ts_list = [ts for ts in entry_ts_list if ts > 0]
+        except Exception:
+            entry_ts_list = []
+        if entry_ts_list:
+            try:
+                earliest_dt = datetime.datetime.fromtimestamp(int(min(entry_ts_list))) - datetime.timedelta(days=7)
+                if earliest_dt < begin_dt:
+                    begin_dt = earliest_dt
+            except Exception:
+                pass
+        begin = begin_dt.strftime("%Y-%m-%d")
+
+        def _k_ts(k) -> int:
+            try:
+                return int(getattr(getattr(k, "time", None), "ts", 0) or 0)
+            except Exception:
+                return 0
+
+        def _find_entry_close(kl_list, entry_ts: int) -> float:
+            if not kl_list:
+                return 0.0
+            ts = int(entry_ts or 0)
+            if ts <= 0:
+                return 0.0
+            best = None
+            best_ts = 0
+            first_ts = 0
+            last_ts = 0
+            for k in kl_list:
+                kts = _k_ts(k)
+                if kts <= 0:
+                    continue
+                if first_ts <= 0:
+                    first_ts = kts
+                last_ts = kts
+                if kts <= ts and kts >= best_ts:
+                    best_ts = kts
+                    best = k
+            if best is not None:
+                try:
+                    return float(getattr(best, "close", 0.0) or 0.0)
+                except Exception:
+                    return 0.0
+            if first_ts > 0 and ts < first_ts:
+                try:
+                    return float(getattr(kl_list[0], "close", 0.0) or 0.0)
+                except Exception:
+                    return 0.0
+            if last_ts > 0 and ts > last_ts:
+                try:
+                    return float(getattr(kl_list[-1], "close", 0.0) or 0.0)
+                except Exception:
+                    return 0.0
+            return 0.0
+
+        items = []
+        total_cost = 0.0
+        total_mv = 0.0
+        for p in positions_raw:
+            code = str(p.get("stock_code") or "").strip()
+            if not code:
+                continue
+            last_price = 0.0
+            entry_price_qfq = 0.0
+            try:
+                kl_list = fetch_stock_data(
+                    code,
+                    level,
+                    begin,
+                    end,
+                    ds,
+                    autype=au,
+                    use_online_latest=bool(ds == DATA_SRC.CLICK_HOUSE),
+                )
+                if kl_list:
+                    last_price = float(getattr(kl_list[-1], "close", 0.0) or 0.0)
+                    entry_price_qfq = float(_find_entry_close(kl_list, int(p.get("entry_time") or 0)) or 0.0)
+            except Exception:
+                last_price = 0.0
+
+            entry_price = entry_price_qfq if entry_price_qfq > 0 else float(p.get("entry_price") or 0.0)
+            pnl = (last_price - entry_price) if (entry_price and last_price) else 0.0
+            pnl_pct = (pnl / entry_price) if entry_price else 0.0
+            total_cost += entry_price
+            total_mv += last_price
+            items.append({
+                **p,
+                "frequency": str(freq_raw or ""),
+                "entry_price": float(entry_price),
+                "current_price": float(last_price),
+                "pnl": float(pnl),
+                "pnl_pct": float(pnl_pct),
+            })
+
+        total_pnl = total_mv - total_cost
+        total_pnl_pct = (total_pnl / total_cost) if total_cost else 0.0
+        return {
+            "items": items,
+            "summary": {
+                "total_cost": float(total_cost),
+                "total_market_value": float(total_mv),
+                "total_pnl": float(total_pnl),
+                "total_pnl_pct": float(total_pnl_pct),
+            },
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/live/positions/reset")
+async def live_reset_positions(sim_id: Optional[str] = None, portfolio_id: Optional[int] = None):
+    try:
+        try:
+            storage.clear_positions(sim_id=sim_id, portfolio_id=portfolio_id)
+        except Exception:
+            pass
+        try:
+            storage.clear_live_orders(sim_id=sim_id, portfolio_id=portfolio_id)
+        except Exception:
+            pass
+        try:
+            storage.clear_live_trades(sim_id=sim_id, portfolio_id=portfolio_id)
+        except Exception:
+            pass
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/live/steps/reset")
+async def live_reset_steps(sim_id: Optional[str] = None, portfolio_id: Optional[int] = None):
+    try:
+        storage.clear_live_steps(sim_id=sim_id, portfolio_id=portfolio_id)
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/live/paper_trade_step")
+async def live_paper_trade_step(req: LivePaperTradeStepRequest):
+    try:
+        import concurrent.futures
+        import os
+        import time
+        from DataAPI.ClickHouseAPI import CClickHouseAPI
+        from backend.live.common import day_key_from_ts, get_cached_index_risk, intraday_plunge_risk, parse_autype, parse_data_src, parse_frequency
+        from backend.chan_service import cross_section_rank_transform_rows
+
+        sim_id = str(req.sim_id or "").strip() or "default"
+        pid = req.portfolio_id
+        if pid is None and getattr(req, "run_id", None):
+            try:
+                r = storage.get_live_run(str(req.run_id))
+                if r:
+                    pid = r.get("portfolio_id")
+            except Exception:
+                pid = None
+        pool_id = str(req.pool_id or "").strip() or "index:IDX399673"
+        raw_codes = CClickHouseAPI.get_pool_members(pool_id=pool_id, table="stock_constituent", limit=5000)
+        codes = []
+        for c in raw_codes or []:
+            try:
+                codes.append(normalize_code(str(c)))
+            except Exception:
+                continue
+        codes = list(dict.fromkeys([c for c in codes if c]))
+        if int(req.limit or 0) > 0:
+            codes = codes[: int(req.limit)]
+
+        freq_raw, level = parse_frequency(req.frequency)
+        data_src = parse_data_src(req.data_src)
+        autype = parse_autype("qfq")
+
+        end = datetime.datetime.now().strftime("%Y-%m-%d")
+        begin = (datetime.datetime.now() - datetime.timedelta(days=int(req.lookback_days or 365 * 5))).strftime("%Y-%m-%d")
+
+        top_n = max(1, int(req.top_n or 2))
+        holding_period = max(1, int(req.holding_period or 3))
+        min_prob = float(req.min_prob) if req.min_prob is not None else 0.25
+        trade_cost = float(req.trade_cost) if req.trade_cost is not None else 0.0
+
+        now_ts = int(time.time())
+        cur_day = None
+
+        bundle = None
+        if req.pretrained_model_key:
+            bundle = load_pretrained_model_bundle_by_key(str(req.pretrained_model_key).strip())
+        if bundle is None:
+            bundle = load_pretrained_model_bundle(
+                "logistic_regression",
+                str(req.frequency or "30m"),
+                str(req.data_src or "clickhouse"),
+                autype=autype,
+                rank_mode=str(req.rank_mode or "cross_section"),
+            )
+        if not bundle:
+            raise HTTPException(status_code=404, detail="no pretrained model for live paper trade (need rank_mode=cross_section logistic_regression)")
+        model = bundle.get("model")
+        feature_meta = bundle.get("feature_meta") or []
+        if not model or not feature_meta:
+            raise HTTPException(status_code=404, detail="pretrained model bundle is invalid")
+
+        def _cn_dt(ts: int) -> datetime.datetime:
+            try:
+                return datetime.datetime.fromtimestamp(int(ts), tz=datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=8)
+            except Exception:
+                return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=8)
+
+        def _cn_ts(dt_cn: datetime.datetime) -> int:
+            try:
+                return int((dt_cn - datetime.timedelta(hours=8)).timestamp())
+            except Exception:
+                return int(time.time())
+
+        def _next_trading_day(d: datetime.date) -> datetime.date:
+            nd = d + datetime.timedelta(days=1)
+            while nd.weekday() >= 5:
+                nd = nd + datetime.timedelta(days=1)
+            return nd
+
+        def _cn_market_session(ts: int):
+            dt = _cn_dt(ts)
+            d = dt.date()
+            if dt.weekday() >= 5:
+                nd = _next_trading_day(d)
+                return {
+                    "session": "closed",
+                    "market_open": False,
+                    "next_exec_ts": _cn_ts(datetime.datetime(nd.year, nd.month, nd.day, 9, 25)),
+                    "next_exec_day": int(nd.strftime("%Y%m%d")),
+                }
+            hm = dt.hour * 60 + dt.minute
+            if hm < (9 * 60 + 15):
+                return {
+                    "session": "closed",
+                    "market_open": False,
+                    "next_exec_ts": _cn_ts(datetime.datetime(d.year, d.month, d.day, 9, 25)),
+                    "next_exec_day": int(d.strftime("%Y%m%d")),
+                }
+            if (9 * 60 + 15) <= hm < (9 * 60 + 25):
+                return {
+                    "session": "pre_auction",
+                    "market_open": False,
+                    "next_exec_ts": _cn_ts(datetime.datetime(d.year, d.month, d.day, 9, 25)),
+                    "next_exec_day": int(d.strftime("%Y%m%d")),
+                }
+            if (9 * 60 + 25) <= hm < (9 * 60 + 30):
+                return {
+                    "session": "auction_pause",
+                    "market_open": False,
+                    "next_exec_ts": _cn_ts(datetime.datetime(d.year, d.month, d.day, 9, 30)),
+                    "next_exec_day": int(d.strftime("%Y%m%d")),
+                }
+            if (9 * 60 + 30) <= hm < (11 * 60 + 30):
+                return {
+                    "session": "continuous_am",
+                    "market_open": True,
+                    "next_exec_ts": int(ts),
+                    "next_exec_day": int(d.strftime("%Y%m%d")),
+                }
+            if (11 * 60 + 30) <= hm < (13 * 60):
+                return {
+                    "session": "lunch_break",
+                    "market_open": False,
+                    "next_exec_ts": _cn_ts(datetime.datetime(d.year, d.month, d.day, 13, 0)),
+                    "next_exec_day": int(d.strftime("%Y%m%d")),
+                }
+            if (13 * 60) <= hm < (14 * 60 + 57):
+                return {
+                    "session": "continuous_pm",
+                    "market_open": True,
+                    "next_exec_ts": int(ts),
+                    "next_exec_day": int(d.strftime("%Y%m%d")),
+                }
+            if (14 * 60 + 57) <= hm <= (15 * 60):
+                return {
+                    "session": "close_auction",
+                    "market_open": False,
+                    "next_exec_ts": _cn_ts(datetime.datetime(d.year, d.month, d.day, 15, 0)),
+                    "next_exec_day": int(d.strftime("%Y%m%d")),
+                }
+            nd = _next_trading_day(d)
+            return {
+                "session": "after_close",
+                "market_open": False,
+                "next_exec_ts": _cn_ts(datetime.datetime(nd.year, nd.month, nd.day, 9, 25)),
+                "next_exec_day": int(nd.strftime("%Y%m%d")),
+            }
+
+        sess = _cn_market_session(now_ts)
+        market_open = bool(sess.get("market_open"))
+        market_session = str(sess.get("session") or "")
+        next_exec_ts = int(sess.get("next_exec_ts") or 0)
+        next_exec_day = int(sess.get("next_exec_day") or 0)
+
+        risk = None
+        risk_level = "normal"
+        effective_top_n = int(top_n)
+        if bool(getattr(req, "risk_filter_enabled", True)):
+            raw_idx = str(getattr(req, "risk_index_code", None) or "399006").strip()
+            idx_code = raw_idx
+            if idx_code.endswith("399006") and (not (idx_code.startswith("sz.") or idx_code.startswith("sh."))):
+                idx_code = "sz.399006"
+            try:
+                atr_window = int(getattr(req, "risk_atr_window", 14) or 14)
+            except Exception:
+                atr_window = 14
+            atr_window = max(2, atr_window)
+            cache_key = (
+                str(idx_code),
+                int(day_key_from_ts(int(now_ts)) or 0),
+                str(getattr(req, "risk_mode", "both") or "both"),
+                float(getattr(req, "risk_drop_threshold", -0.03) or -0.03),
+                float(getattr(req, "risk_flat_drop_threshold", -0.05) or -0.05),
+                int(atr_window),
+                float(getattr(req, "risk_atr_pct_threshold", 0.04) or 0.04),
+                float(getattr(req, "risk_flat_atr_pct_threshold", 0.06) or 0.06),
+                float(getattr(req, "risk_gap_down_threshold", -0.015) or -0.015),
+                int(getattr(req, "risk_trend_ma_window", 20) or 20),
+                str(data_src),
+                str(autype),
+            )
+
+            def _load_idx_daily():
+                try:
+                    days = max(90, int(atr_window) * 6)
+                except Exception:
+                    days = 120
+                end_d = _cn_dt(int(now_ts)).date()
+                begin_d = end_d - datetime.timedelta(days=int(days))
+                out = fetch_stock_data(
+                    idx_code,
+                    KL_TYPE.K_DAY,
+                    begin_d.strftime("%Y-%m-%d"),
+                    end_d.strftime("%Y-%m-%d"),
+                    data_src,
+                    autype=autype,
+                    use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
+                )
+                if out:
+                    return out
+                out = fetch_stock_data(
+                    idx_code,
+                    KL_TYPE.K_30M,
+                    begin_d.strftime("%Y-%m-%d"),
+                    end_d.strftime("%Y-%m-%d"),
+                    data_src,
+                    autype=autype,
+                    use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
+                )
+                if out:
+                    return out
+                if data_src == DATA_SRC.CLICK_HOUSE:
+                    return fetch_stock_data(
+                        idx_code,
+                        KL_TYPE.K_DAY,
+                        begin_d.strftime("%Y-%m-%d"),
+                        end_d.strftime("%Y-%m-%d"),
+                        DATA_SRC.AK_SHARE,
+                        autype=AUTYPE.NONE,
+                        use_online_latest=True,
+                    )
+                return out
+
+            risk = get_cached_index_risk(
+                cache_key,
+                _load_idx_daily,
+                now_ts=int(now_ts),
+                atr_window=int(atr_window),
+                drop_threshold=float(getattr(req, "risk_drop_threshold", -0.03) or -0.03),
+                atr_pct_threshold=float(getattr(req, "risk_atr_pct_threshold", 0.04) or 0.04),
+                flat_drop_threshold=float(getattr(req, "risk_flat_drop_threshold", -0.05) or -0.05),
+                flat_atr_pct_threshold=float(getattr(req, "risk_flat_atr_pct_threshold", 0.06) or 0.06),
+                gap_down_threshold=float(getattr(req, "risk_gap_down_threshold", -0.015) or -0.015),
+                ma_window=int(getattr(req, "risk_trend_ma_window", 20) or 20),
+                mode=str(getattr(req, "risk_mode", "both") or "both"),
+            )
+            try:
+                risk_level = str((risk or {}).get("level") or "normal").strip().lower()
+            except Exception:
+                risk_level = "normal"
+            if risk_level == "flat":
+                effective_top_n = 0
+            elif risk_level == "reduce":
+                effective_top_n = min(int(effective_top_n), 1)
+            if isinstance(risk, dict):
+                missing = []
+                if (risk.get("prev_close") is None) or (float(risk.get("prev_close") or 0.0) <= 0.0):
+                    missing.append("prev_close")
+                if risk.get("ma20") is None:
+                    missing.append("ma20")
+                if missing:
+                    mode_raw = str(getattr(req, "risk_data_fail_mode", "reduce") or "reduce").strip().lower()
+                    risk = dict(risk)
+                    risk["data_missing"] = list(missing)
+                    risk["data_fail_mode"] = str(mode_raw)
+                    if not risk.get("reason"):
+                        risk["reason"] = "data_missing"
+                    if mode_raw == "flat":
+                        risk_level = "flat"
+                        effective_top_n = 0
+                        risk["level"] = "flat"
+                    elif mode_raw == "reduce":
+                        effective_top_n = min(int(effective_top_n), 1)
+
+            intraday = None
+            if bool(getattr(req, "risk_intraday_enabled", True)):
+                try:
+                    w = int(getattr(req, "risk_trend_ma_window", 20) or 20)
+                except Exception:
+                    w = 20
+                begin_d = _cn_dt(int(now_ts)).date() - datetime.timedelta(days=7)
+                end_d = _cn_dt(int(now_ts)).date()
+                cur_px = None
+
+                def _pick_intraday_close(kl):
+                    if not kl:
+                        return None
+                    picked = None
+                    for k in kl:
+                        try:
+                            ts = int(getattr(getattr(k, "time", None), "ts", 0) or 0)
+                        except Exception:
+                            ts = 0
+                        if ts <= 0 or ts > int(now_ts):
+                            continue
+                        try:
+                            c = float(getattr(k, "close", 0.0) or 0.0)
+                        except Exception:
+                            c = 0.0
+                        if c <= 0.0:
+                            continue
+                        picked = float(c)
+                    return picked
+
+                try:
+                    kl = fetch_stock_data(
+                        idx_code,
+                        KL_TYPE.K_30M,
+                        begin_d.strftime("%Y-%m-%d"),
+                        end_d.strftime("%Y-%m-%d"),
+                        data_src,
+                        autype=autype,
+                        use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
+                    )
+                    cur_px = _pick_intraday_close(kl)
+                except Exception:
+                    cur_px = None
+                if cur_px is None and data_src == DATA_SRC.CLICK_HOUSE:
+                    try:
+                        kl = fetch_stock_data(
+                            idx_code,
+                            KL_TYPE.K_30M,
+                            begin_d.strftime("%Y-%m-%d"),
+                            end_d.strftime("%Y-%m-%d"),
+                            DATA_SRC.AK_SHARE,
+                            autype=AUTYPE.NONE,
+                            use_online_latest=True,
+                        )
+                        cur_px = _pick_intraday_close(kl)
+                    except Exception:
+                        cur_px = None
+
+                intraday = intraday_plunge_risk(
+                    current_price=cur_px,
+                    prev_close=(risk or {}).get("prev_close") if isinstance(risk, dict) else None,
+                    ma_value=(risk or {}).get("ma20") if isinstance(risk, dict) else None,
+                    bear_threshold=float(getattr(req, "risk_intraday_bear_threshold", -0.015) or -0.015),
+                    bull_threshold=float(getattr(req, "risk_intraday_bull_threshold", -0.03) or -0.03),
+                )
+                if isinstance(risk, dict):
+                    risk = dict(risk)
+                    risk["intraday"] = dict(intraday) if isinstance(intraday, dict) else None
+                    risk["trend_ma_window"] = int(w)
+
+                intraday_missing = []
+                if isinstance(intraday, dict):
+                    if intraday.get("current_price") is None:
+                        intraday_missing.append("current_price")
+                    if intraday.get("prev_close") is None:
+                        intraday_missing.append("prev_close")
+                    if intraday.get("ma") is None:
+                        intraday_missing.append("ma20")
+                    if intraday.get("change") is None:
+                        intraday_missing.append("intraday_change")
+                else:
+                    intraday_missing = ["intraday_calc_failed"]
+
+                if intraday_missing:
+                    mode_raw = str(getattr(req, "risk_intraday_data_fail_mode", "reduce") or "reduce").strip().lower()
+                    if isinstance(risk, dict):
+                        risk["intraday_missing"] = list(intraday_missing)
+                        risk["intraday_data_fail_mode"] = str(mode_raw)
+                        if not risk.get("reason"):
+                            risk["reason"] = "intraday_data_missing"
+                    if mode_raw == "flat":
+                        risk_level = "flat"
+                        effective_top_n = 0
+                        if isinstance(risk, dict):
+                            risk["level"] = "flat"
+                    elif mode_raw == "reduce":
+                        effective_top_n = min(int(effective_top_n), 1)
+
+                if isinstance(intraday, dict) and bool(intraday.get("flat")):
+                    risk_level = "flat"
+                    effective_top_n = 0
+                    if isinstance(risk, dict):
+                        risk["level"] = "flat"
+                        risk["reason"] = "intraday_plunge"
+        try:
+            cur_day = int(_cn_dt(now_ts).strftime("%Y%m%d"))
+        except Exception:
+            cur_day = day_key_from_ts(now_ts)
+        if cur_day is None:
+            cur_day = int(next_exec_day or 0)
+
+        pending_orders = storage.list_live_orders(status=None, limit=1000, sim_id=sim_id, portfolio_id=pid)
+        can_execute_session = True
+        executed_pending = False
+        if can_execute_session and pending_orders:
+            quote_cache = {}
+
+            def _get_quote(code: str):
+                code = str(code or "").strip()
+                if not code:
+                    return None
+                if code in quote_cache:
+                    return quote_cache.get(code)
+                out = None
+                try:
+                    kl_list = fetch_stock_data(
+                        code,
+                        level,
+                        begin,
+                        end,
+                        data_src,
+                        autype=autype,
+                        use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
+                    )
+                    if kl_list:
+                        k = kl_list[-1]
+                        o = float(getattr(k, "open", 0.0) or 0.0)
+                        c = float(getattr(k, "close", 0.0) or 0.0)
+                        out = {"open": o, "close": c}
+                except Exception:
+                    out = None
+                quote_cache[code] = out
+                return out
+
+            def _pick_px(code: str, session_name: str):
+                q = _get_quote(code)
+                if not q:
+                    return 0.0
+                o = float(q.get("open") or 0.0)
+                c = float(q.get("close") or 0.0)
+                if session_name == "auction_pause":
+                    if o > 0:
+                        return float(o)
+                    return float(c or 0.0)
+                if session_name == "close_auction":
+                    if c > 0:
+                        return float(c)
+                    return float(o or 0.0)
+                if c > 0:
+                    return float(c)
+                return float(o or 0.0)
+
+            executable = []
+            for o in pending_orders:
+                st = str(o.get("status") or "").strip().lower()
+                if st not in ["pending", "blocked"]:
+                    continue
+                try:
+                    o_execute_after = int(o.get("execute_after_ts") or 0)
+                except Exception:
+                    o_execute_after = 0
+                try:
+                    o_min_day = int(o.get("min_day") or 0)
+                except Exception:
+                    o_min_day = 0
+                if o_execute_after and int(now_ts) < int(o_execute_after):
+                    continue
+                if o_min_day and int(cur_day or 0) < int(o_min_day):
+                    continue
+                exec_sess = None
+                if o_execute_after and int(o_execute_after) > 0:
+                    try:
+                        exec_sess = str((_cn_market_session(int(o_execute_after)) or {}).get("session") or "").strip()
+                    except Exception:
+                        exec_sess = None
+                executable.append({**o, "_exec_session": exec_sess})
+
+            if executable:
+                sell_codes = []
+                buy_items = []
+                executed_ids = []
+                for o in executable:
+                    executed_ids.append(int(o.get("id") or 0))
+                    code = str(o.get("stock_code") or "").strip()
+                    side = str(o.get("side") or "").strip().lower()
+                    if not code or side not in ["buy", "sell"]:
+                        continue
+                    px_session = str(o.get("_exec_session") or "").strip() or market_session
+                    if side == "sell":
+                        sell_codes.append((code, px_session))
+                    else:
+                        buy_items.append({"code": code, "px_session": px_session})
+
+                if market_open:
+                    storage.increment_bars_held(1, sim_id=sim_id, portfolio_id=pid)
+                sell_px = {}
+                sell_only = []
+                for c, sess_name in sell_codes:
+                    sell_only.append(c)
+                    sell_px[c] = float(_pick_px(c, sess_name))
+                if sell_only:
+                    storage.delete_positions(sell_only, sim_id=sim_id, portfolio_id=pid)
+                for bi in buy_items:
+                    if bi.get("code"):
+                        buy_px = float(_pick_px(str(bi["code"]), str(bi.get("px_session") or market_session)))
+                        storage.upsert_position(str(bi["code"]), int(now_ts), float(buy_px), 0, sim_id=sim_id, portfolio_id=pid)
+
+                trades = []
+                for c, sess_name in sell_codes:
+                    trades.append({"stock_code": c, "side": "sell", "status": "executed", "trade_ts": int(now_ts), "price": float(sell_px.get(c) or 0.0), "meta": {"source": "order", "session": sess_name or market_session}})
+                for bi in buy_items:
+                    code = str(bi.get("code") or "")
+                    sess_name = str(bi.get("px_session") or "").strip() or market_session
+                    trades.append({"stock_code": code, "side": "buy", "status": "executed", "trade_ts": int(now_ts), "price": float(_pick_px(code, sess_name)), "meta": {"source": "order", "session": sess_name}})
+                storage.add_live_trades(trades, sim_id=sim_id, portfolio_id=pid)
+                storage.mark_orders_executed([x for x in executed_ids if x], executed_ts=int(now_ts), sim_id=sim_id, portfolio_id=pid)
+                executed_pending = True
+
+        positions = storage.list_positions(sim_id=sim_id, portfolio_id=pid)
+        pos_map = {p.get("stock_code"): p for p in (positions or []) if p.get("stock_code")}
+        to_force_sell = [p["stock_code"] for p in (positions or []) if int(p.get("bars_held") or 0) >= int(holding_period)]
+
+        def score_one(code: str):
+            kl_list = fetch_stock_data(code, level, begin, end, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
+            if not kl_list or len(kl_list) < 600:
+                return None
+            _, bsp_dict, _, _ = get_chan_data(
+                code,
+                True,
+                True,
+                level,
+                data_src,
+                preloaded_data=kl_list,
+                do_predict=True,
+                begin_time=begin,
+                end_time=end,
+                enable_rolling_lookback=bool(req.enable_rolling_lookback),
+                autype=autype,
+                rolling_sample_mode=str(req.rolling_sample_mode or "every_bar"),
+                rolling_stride=int(req.rolling_stride or 1),
+            )
+            if not bsp_dict:
+                return None
+            best = None
+            best_ts = 0
+            for _, info in (bsp_dict or {}).items():
+                if not isinstance(info, dict):
+                    continue
+                if not bool(info.get("is_buy", True)):
+                    continue
+                try:
+                    ot = info.get("open_time")
+                    ts = int(getattr(ot, "ts", 0) or 0)
+                except Exception:
+                    ts = 0
+                if ts <= 0 or ts < best_ts:
+                    continue
+                best = info
+                best_ts = ts
+            if best is None or best_ts <= 0:
+                return None
+            dk = day_key_from_ts(best_ts)
+            if dk is None:
+                return None
+            feat = best.get("feature")
+            feat_dict = {}
+            try:
+                if feat is None:
+                    feat_dict = {}
+                elif isinstance(feat, dict):
+                    feat_dict = dict(feat)
+                elif hasattr(feat, "items"):
+                    feat_dict = dict(feat.items())
+                else:
+                    feat_dict = dict(feat)
+            except Exception:
+                feat_dict = {}
+            try:
+                entry_price = float(getattr(kl_list[-1], "close", 0.0) or 0.0)
+            except Exception:
+                entry_price = 0.0
+            return {"code": code, "day": int(dk), "ts": int(best_ts), "feature": feat_dict, "entry_price": float(entry_price)}
+
+        results = []
+        try:
+            req_mw = int(req.max_workers or 0)
+        except Exception:
+            req_mw = 0
+        try:
+            env_mw_raw = os.environ.get("MLCHAN_LIVE_MAX_WORKERS", "").strip()
+            env_mw = int(env_mw_raw) if env_mw_raw else 0
+        except Exception:
+            env_mw = 0
+        if env_mw and env_mw > 0:
+            base_mw = req_mw if req_mw and req_mw > 0 else env_mw
+            mw = min(int(base_mw), int(env_mw))
+        else:
+            mw = req_mw if req_mw and req_mw > 0 else 8
+        mw = max(1, min(int(mw), int(len(codes) if codes else 1)))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=int(mw)) as ex:
+            futs = {ex.submit(score_one, code): code for code in codes}
+            for fut in concurrent.futures.as_completed(futs):
+                try:
+                    r = fut.result()
+                except Exception:
+                    r = None
+                if r:
+                    results.append(r)
+
+        cross_section_rank_transform_rows(results, feature_meta, missing_value=-9999999.0)
+        X = []
+        for r in results:
+            feat = r.get("feature") if isinstance(r.get("feature"), dict) else {}
+            row = []
+            for k in feature_meta:
+                v = feat.get(k, -9999999.0)
+                try:
+                    fv = float(v)
+                except Exception:
+                    fv = -9999999.0
+                try:
+                    import numpy as _np
+                    if not _np.isfinite(fv):
+                        fv = -9999999.0
+                except Exception:
+                    pass
+                row.append(float(fv))
+            X.append(row)
+        probs = []
+        try:
+            probs = model.predict_proba(X)
+        except Exception:
+            probs = []
+        for i, r in enumerate(results):
+            p = 0.0
+            try:
+                if probs is not None and i < len(probs) and len(probs[i]) >= 2:
+                    p = float(probs[i][1])
+            except Exception:
+                p = 0.0
+            r["prob"] = float(p)
+
+        results.sort(key=lambda x: (int(x.get("day") or 0), float(x.get("prob") or 0.0)), reverse=True)
+        todays = []
+        if cur_day is not None:
+            todays = [r for r in results if int(r.get("day") or 0) == int(cur_day)]
+        if (not todays) and bool(req.use_latest_available_day) and results:
+            try:
+                cur_day = int(max(int(r.get("day") or 0) for r in results))
+            except Exception:
+                pass
+            if cur_day is not None:
+                todays = [r for r in results if int(r.get("day") or 0) == int(cur_day)]
+
+        todays = [r for r in todays if float(r.get("prob") or 0.0) >= float(min_prob)]
+        has_targets = bool(todays)
+        todays.sort(key=lambda x: float(x.get("prob") or 0.0), reverse=True)
+        targets = todays[: int(effective_top_n)] if has_targets and int(effective_top_n) > 0 else []
+        target_codes = [t["code"] for t in targets] if targets else list(pos_map.keys())
+
+        current_codes = list(pos_map.keys())
+        rebalance_out = [c for c in current_codes if c and c not in target_codes] if targets else []
+        if risk_level == "flat":
+            rebalance_out = list(current_codes)
+            target_codes = []
+        sell_codes = list(dict.fromkeys([c for c in (to_force_sell + rebalance_out) if c]))
+        buy_codes = [c for c in target_codes if c not in current_codes] if targets else []
+
+        def _pos_entry_day(p: dict) -> int:
+            try:
+                ed = int(p.get("entry_day") or 0)
+            except Exception:
+                ed = 0
+            if ed > 0:
+                return ed
+            try:
+                return int(day_key_from_ts(int(p.get("entry_time") or 0)) or 0)
+            except Exception:
+                return 0
+
+        market = str(getattr(req, "market", None) or "cn_a").strip().lower()
+        enforce_t1 = market in ["cn", "cn_a", "a", "a_share", "ashare"]
+        blocked = []
+        if enforce_t1 and sell_codes:
+            t1_next_day = _next_trading_day(_cn_dt(now_ts).date())
+            t1_min_day = int(t1_next_day.strftime("%Y%m%d"))
+            t1_exec_ts = _cn_ts(datetime.datetime(t1_next_day.year, t1_next_day.month, t1_next_day.day, 9, 25))
+            sell_ok = []
+            for c in sell_codes:
+                p = pos_map.get(c)
+                if not p:
+                    sell_ok.append(c)
+                    continue
+                ed = _pos_entry_day(p)
+                if ed and int(cur_day or 0) and int(ed) >= int(cur_day):
+                    blocked.append({"stock_code": str(c), "side": "sell", "price": float(p.get("entry_price") or 0.0), "min_day": int(t1_min_day or 0), "execute_after_ts": int(t1_exec_ts or 0), "reason": "T+1"})
+                    continue
+                sell_ok.append(c)
+            sell_codes = sell_ok
+
+        storage.replace_blocked_live_orders(blocked, requested_ts=int(now_ts), sim_id=sim_id, portfolio_id=pid)
+
+        if not market_open:
+            pending = []
+            for t in targets:
+                if t.get("code") in buy_codes:
+                    pending.append({"stock_code": str(t.get("code")), "side": "buy", "price": float(t.get("entry_price") or 0.0), "execute_after_ts": int(next_exec_ts or 0), "min_day": int(next_exec_day or 0), "reason": market_session})
+            for c in sell_codes:
+                pending.append({"stock_code": str(c), "side": "sell", "price": float((pos_map.get(c) or {}).get("entry_price") or 0.0), "execute_after_ts": int(next_exec_ts or 0), "min_day": int(next_exec_day or 0), "reason": market_session})
+            storage.replace_pending_live_orders(pending, requested_ts=int(now_ts), sim_id=sim_id, portfolio_id=pid)
+            resp = {
+                "ts": int(now_ts),
+                "day": int(cur_day or 0),
+                "pool_id": pool_id,
+                "frequency": freq_raw,
+                "model_key": str(bundle.get("key") or ""),
+                "rank_mode": str((bundle.get("meta") or {}).get("rank_mode") or ""),
+                "max_workers": int(mw),
+                "market_open": False,
+                "market_session": market_session,
+                "next_exec_ts": int(next_exec_ts or 0),
+                "executed_pending": bool(executed_pending),
+                "risk": {
+                    "enabled": bool(getattr(req, "risk_filter_enabled", True)),
+                    "level": str(risk_level),
+                    "effective_top_n": int(effective_top_n),
+                    "index_code": str(getattr(req, "risk_index_code", "399006") or "399006"),
+                    "ret1d": (risk or {}).get("ret1d") if isinstance(risk, dict) else None,
+                    "atr_pct": (risk or {}).get("atr_pct") if isinstance(risk, dict) else None,
+                    "gap_open_pct": (risk or {}).get("gap_open_pct") if isinstance(risk, dict) else None,
+                    "today_open": (risk or {}).get("today_open") if isinstance(risk, dict) else None,
+                    "prev_close": (risk or {}).get("prev_close") if isinstance(risk, dict) else None,
+                    "ma20": (risk or {}).get("ma20") if isinstance(risk, dict) else None,
+                    "trend_ma_window": int(getattr(req, "risk_trend_ma_window", 20) or 20),
+                    "intraday_enabled": bool(getattr(req, "risk_intraday_enabled", True)),
+                    "intraday_bear_threshold": float(getattr(req, "risk_intraday_bear_threshold", -0.015) or -0.015),
+                    "intraday_bull_threshold": float(getattr(req, "risk_intraday_bull_threshold", -0.03) or -0.03),
+                    "intraday": (risk or {}).get("intraday") if isinstance(risk, dict) else None,
+                    "reason": (risk or {}).get("reason") if isinstance(risk, dict) else None,
+                    "data_fail_mode": str(getattr(req, "risk_data_fail_mode", "reduce") or "reduce"),
+                    "data_missing": (risk or {}).get("data_missing") if isinstance(risk, dict) else None,
+                    "intraday_data_fail_mode": str(getattr(req, "risk_intraday_data_fail_mode", "reduce") or "reduce"),
+                    "intraday_missing": (risk or {}).get("intraday_missing") if isinstance(risk, dict) else None,
+                    "gap_down_threshold": float(getattr(req, "risk_gap_down_threshold", -0.015) or -0.015),
+                    "mode": str(getattr(req, "risk_mode", "both") or "both"),
+                },
+                "targets": targets,
+                "sell": sell_codes,
+                "buy": buy_codes,
+                "pending_orders": storage.list_live_orders(status=None, limit=1000, sim_id=sim_id, portfolio_id=pid),
+                "trades": storage.list_live_trades(limit=200, sim_id=sim_id, portfolio_id=pid),
+                "positions": storage.list_positions(sim_id=sim_id, portfolio_id=pid),
+            }
+            try:
+                storage.add_live_step_record(
+                    sim_id=sim_id,
+                    run_id=str(getattr(req, "run_id", None) or ""),
+                    step_ts=int(resp.get("ts") or 0),
+                    day=int(resp.get("day") or 0),
+                    portfolio_id=pid,
+                    risk=resp.get("risk") if isinstance(resp.get("risk"), dict) else {},
+                    targets=targets,
+                    sell=sell_codes,
+                    buy=buy_codes,
+                    blocked=blocked,
+                    summary={},
+                    result=resp,
+                    error=None,
+                )
+            except Exception:
+                pass
+            return resp
+
+        quote_cache = {}
+
+        def _get_quote(code: str):
+            code = str(code or "").strip()
+            if not code:
+                return None
+            if code in quote_cache:
+                return quote_cache.get(code)
+            out = None
+            try:
+                kl_list = fetch_stock_data(
+                    code,
+                    level,
+                    begin,
+                    end,
+                    data_src,
+                    autype=autype,
+                    use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
+                )
+                if kl_list:
+                    k = kl_list[-1]
+                    o = float(getattr(k, "open", 0.0) or 0.0)
+                    c = float(getattr(k, "close", 0.0) or 0.0)
+                    out = {"open": o, "close": c}
+            except Exception:
+                out = None
+            quote_cache[code] = out
+            return out
+
+        def _pick_px(code: str, session_name: str):
+            q = _get_quote(code)
+            if not q:
+                return 0.0
+            o = float(q.get("open") or 0.0)
+            c = float(q.get("close") or 0.0)
+            if session_name == "auction_pause":
+                if o > 0:
+                    return float(o)
+                return float(c or 0.0)
+            if session_name == "close_auction":
+                if c > 0:
+                    return float(c)
+                return float(o or 0.0)
+            if c > 0:
+                return float(c)
+            return float(o or 0.0)
+
+        if sell_codes:
+            storage.delete_positions(sell_codes, sim_id=sim_id, portfolio_id=pid)
+        for t in targets:
+            if t["code"] in buy_codes:
+                px = float(_pick_px(str(t.get("code") or ""), market_session))
+                storage.upsert_position(t["code"], int(t.get("ts") or now_ts), float(px or 0.0), 0, sim_id=sim_id, portfolio_id=pid)
+
+        trades = []
+        for c in sell_codes:
+            trades.append({"stock_code": c, "side": "sell", "status": "executed", "trade_ts": int(now_ts), "price": float(_pick_px(c, market_session)), "meta": {"source": "step", "session": market_session}})
+        for t in targets:
+            if t.get("code") in buy_codes:
+                code = str(t.get("code") or "")
+                trades.append({"stock_code": code, "side": "buy", "status": "executed", "trade_ts": int(now_ts), "price": float(_pick_px(code, market_session)), "meta": {"source": "step", "prob": float(t.get("prob") or 0.0), "session": market_session}})
+        storage.add_live_trades(trades, sim_id=sim_id, portfolio_id=pid)
+
+        after_pos = storage.list_positions(sim_id=sim_id, portfolio_id=pid)
+        resp = {
+            "ts": int(now_ts),
+            "day": int(cur_day or 0),
+            "pool_id": pool_id,
+            "frequency": freq_raw,
+            "model_key": str(bundle.get("key") or ""),
+            "rank_mode": str((bundle.get("meta") or {}).get("rank_mode") or ""),
+            "max_workers": int(mw),
+            "market_open": True,
+            "market_session": market_session,
+            "next_exec_ts": int(next_exec_ts or 0),
+            "executed_pending": bool(executed_pending),
+            "risk": {
+                "enabled": bool(getattr(req, "risk_filter_enabled", True)),
+                "level": str(risk_level),
+                "effective_top_n": int(effective_top_n),
+                "index_code": str(getattr(req, "risk_index_code", "399006") or "399006"),
+                "ret1d": (risk or {}).get("ret1d") if isinstance(risk, dict) else None,
+                "atr_pct": (risk or {}).get("atr_pct") if isinstance(risk, dict) else None,
+                "gap_open_pct": (risk or {}).get("gap_open_pct") if isinstance(risk, dict) else None,
+                "today_open": (risk or {}).get("today_open") if isinstance(risk, dict) else None,
+                "prev_close": (risk or {}).get("prev_close") if isinstance(risk, dict) else None,
+                "ma20": (risk or {}).get("ma20") if isinstance(risk, dict) else None,
+                "trend_ma_window": int(getattr(req, "risk_trend_ma_window", 20) or 20),
+                "intraday_enabled": bool(getattr(req, "risk_intraday_enabled", True)),
+                "intraday_bear_threshold": float(getattr(req, "risk_intraday_bear_threshold", -0.015) or -0.015),
+                "intraday_bull_threshold": float(getattr(req, "risk_intraday_bull_threshold", -0.03) or -0.03),
+                "intraday": (risk or {}).get("intraday") if isinstance(risk, dict) else None,
+                "reason": (risk or {}).get("reason") if isinstance(risk, dict) else None,
+                "data_fail_mode": str(getattr(req, "risk_data_fail_mode", "reduce") or "reduce"),
+                "data_missing": (risk or {}).get("data_missing") if isinstance(risk, dict) else None,
+                "intraday_data_fail_mode": str(getattr(req, "risk_intraday_data_fail_mode", "reduce") or "reduce"),
+                "intraday_missing": (risk or {}).get("intraday_missing") if isinstance(risk, dict) else None,
+                "gap_down_threshold": float(getattr(req, "risk_gap_down_threshold", -0.015) or -0.015),
+                "mode": str(getattr(req, "risk_mode", "both") or "both"),
+            },
+            "targets": targets,
+            "sell": sell_codes,
+            "buy": buy_codes,
+            "pending_orders": storage.list_live_orders(status=None, limit=1000, sim_id=sim_id, portfolio_id=pid),
+            "trades": storage.list_live_trades(limit=200, sim_id=sim_id, portfolio_id=pid),
+            "positions": after_pos,
+        }
+        try:
+            storage.add_live_step_record(
+                sim_id=sim_id,
+                run_id=str(getattr(req, "run_id", None) or ""),
+                step_ts=int(resp.get("ts") or 0),
+                day=int(resp.get("day") or 0),
+                portfolio_id=pid,
+                risk=resp.get("risk") if isinstance(resp.get("risk"), dict) else {},
+                targets=targets,
+                sell=sell_codes,
+                buy=buy_codes,
+                blocked=blocked,
+                summary={},
+                result=resp,
+                error=None,
+            )
+        except Exception:
+            pass
+        return resp
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/strategy/run")
 async def run_strategy(req: StrategyRequest):
     try:
@@ -1974,7 +3741,7 @@ async def run_strategy(req: StrategyRequest):
         run = StrategyRun(
             strategy_name=req.strategy_name,
             params_json=json.dumps(params),
-            status="pending",
+            status="queued",
             progress=0
         )
         session.add(run)
@@ -2066,9 +3833,9 @@ async def cancel_strategy_run(run_id: int):
 
         removed_from_queue = False
         with _task_queue_cv:
-            cur = _task_current
-            if cur and cur.get("kind") == "strategy_run" and str(cur.get("ref_id")) == str(rid):
-                raise HTTPException(status_code=409, detail="run is running")
+            for cur in (_task_current or {}).values():
+                if cur and cur.get("kind") == "strategy_run" and str(cur.get("ref_id")) == str(rid):
+                    raise HTTPException(status_code=409, detail="run is running")
             kept = []
             for t in _task_queue:
                 if t.get("kind") == "strategy_run" and str(t.get("ref_id")) == str(rid):
@@ -2085,6 +3852,35 @@ async def cancel_strategy_run(run_id: int):
     finally:
         session.close()
 
+@app.post("/api/strategy/runs/{run_id}/stop")
+async def stop_strategy_run(run_id: int):
+    rid = int(run_id)
+    session = storage.Session()
+    try:
+        run = session.query(StrategyRun).filter(StrategyRun.id == rid).first()
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        st = str(run.status or "")
+        if st in ["completed", "failed", "canceled"]:
+            return {"status": "success", "run_id": rid, "already_terminal": True}
+
+        removed_from_queue = False
+        with _task_queue_cv:
+            kept = []
+            for t in _task_queue:
+                if t.get("kind") == "strategy_run" and str(t.get("ref_id")) == str(rid):
+                    removed_from_queue = True
+                    continue
+                kept.append(t)
+            _task_queue[:] = kept
+
+        run.status = "canceled"
+        run.completed_at = datetime.datetime.utcnow()
+        session.commit()
+        return {"status": "success", "run_id": rid, "removed_from_queue": removed_from_queue}
+    finally:
+        session.close()
+
 @app.delete("/api/strategy/runs/{run_id}")
 async def delete_strategy_run(run_id: int):
     rid = int(run_id)
@@ -2094,11 +3890,8 @@ async def delete_strategy_run(run_id: int):
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         st = str(run.status or "")
-        if st in ["running", "pending"]:
+        if st in ["running", "pending", "queued"]:
             raise HTTPException(status_code=409, detail="run is running")
-        if st == "queued":
-            if not _cancel_task_if_queued("strategy_run", str(rid)):
-                raise HTTPException(status_code=409, detail="run is running")
     finally:
         session.close()
     return storage.delete_strategy_run(rid)

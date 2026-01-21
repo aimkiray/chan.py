@@ -37,6 +37,7 @@ class CAkShare(CCommonStockApi):
     def get_kl_data(self):
         # AkShare uses 6-digit code. Need to strip sh/sz prefix if present
         symbol = self.code.split('.')[-1]
+        is_index = symbol.startswith("399")
         
         # Simple heuristic to detect ETF (Start with 51, 52, 56, 58 for SH, 15 for SZ)
         # This is not perfect but covers most ETFs.
@@ -47,15 +48,35 @@ class CAkShare(CCommonStockApi):
         
         start_date = self.begin_date.replace("-", "") if self.begin_date else "19900101"
         end_date = self.end_date.replace("-", "") if self.end_date else "20500101"
+        start_dt = str(self.begin_date or "").strip()
+        end_dt = str(self.end_date or "").strip()
+        if start_dt and len(start_dt) == 10:
+            start_dt = f"{start_dt} 09:30:00"
+        if end_dt and len(end_dt) == 10:
+            end_dt = f"{end_dt} 15:00:00"
         
         try:
             if kltype_lt_day(self.k_type):
                 # Minute data
                 # period: '1', '5', '15', '30', '60'
-                if is_etf:
-                     df = ak.fund_etf_hist_min_em(symbol=symbol, period=period, adjust=adjust)
+                if is_index and hasattr(ak, "index_zh_a_hist_min_em"):
+                    df = ak.index_zh_a_hist_min_em(
+                        symbol=symbol,
+                        period=period,
+                        start_date=start_dt or f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]} 09:30:00",
+                        end_date=end_dt or f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]} 15:00:00",
+                    )
+                    adjust = ""
+                elif is_etf:
+                    df = ak.fund_etf_hist_min_em(symbol=symbol, period=period, adjust=adjust)
                 else:
-                     df = ak.stock_zh_a_hist_min_em(symbol=symbol, start_date=start_date, end_date=end_date, period=period, adjust=adjust)
+                    df = ak.stock_zh_a_hist_min_em(
+                        symbol=symbol,
+                        start_date=start_dt or f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]} 09:30:00",
+                        end_date=end_dt or f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]} 15:00:00",
+                        period=period,
+                        adjust=adjust,
+                    )
                 
                 # Columns: 时间, 开盘, 收盘, 最高, 最低, 成交量, 成交额, ...
                 # Standardize to: time, open, close, high, low, volume, amount

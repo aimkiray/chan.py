@@ -9,17 +9,27 @@
        </div>
        
        <!-- Custom Tabs -->
-       <div class="flex items-end self-stretch gap-1">
-          <button 
-             v-for="tab in tabs" 
-             :key="tab.name" 
-             @click="activeTab = tab.name"
-             class="px-4 h-full flex items-center gap-2 text-sm transition-colors border-b-2 outline-none select-none"
-             :class="activeTab === tab.name ? 'border-blue-600 text-blue-600 font-medium bg-white dark:bg-gray-900' : 'border-transparent text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200 hover:bg-gray-100/50 dark:hover:bg-gray-800/50'"
+       <div class="relative flex items-end self-stretch">
+          <div
+            ref="desktopTabsEl"
+            class="flex items-end self-stretch gap-1 overflow-x-auto overflow-y-hidden whitespace-nowrap px-1 scroll-px-1 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            style="-webkit-overflow-scrolling: touch;"
+            @scroll="updateDesktopTabsHint"
           >
-             <svg width="16" height="16" viewBox="0 0 24 24"><path :d="tab.icon" /></svg>
-             {{ tab.label }}
-          </button>
+            <button 
+               v-for="tab in tabs" 
+               :key="tab.name" 
+               @click="activeTab = tab.name"
+               class="shrink-0 px-4 h-full flex items-center gap-2 text-sm transition-colors border-b-2 outline-none select-none"
+               :class="activeTab === tab.name ? 'border-blue-600 text-blue-600 font-medium bg-white dark:bg-gray-900' : 'border-transparent text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200 hover:bg-gray-100/50 dark:hover:bg-gray-800/50'"
+            >
+               <svg width="16" height="16" viewBox="0 0 24 24"><path :d="tab.icon" /></svg>
+               {{ tab.label }}
+            </button>
+          </div>
+
+          <div v-show="desktopTabsCanScrollLeft" class="pointer-events-none absolute left-0 top-0 bottom-0 w-10 bg-gradient-to-r from-gray-50 dark:from-gray-950 to-transparent" />
+          <div v-show="desktopTabsCanScrollRight" class="pointer-events-none absolute right-0 top-0 bottom-0 w-10 bg-gradient-to-l from-gray-50 dark:from-gray-950 to-transparent" />
        </div>
        
        <div class="flex-1"></div>
@@ -58,6 +68,8 @@
           v-model:intradayBlend="intradayBlendModels"
           v-model:strategyForm="strategyForm"
           v-model:strategyChanConfig="strategyChanConfig"
+          v-model:paperConfig="paperConfig"
+          v-model:paperParams="paperParams"
           v-model:pretrainConfig="pretrainConfig"
           :activeTab="activeTab"
           :loading="loading"
@@ -70,6 +82,9 @@
           @analyze="analyze(true)"
           @runStrategy="strategyPanelRef.runStrategy()"
           @runPretrain="pretrainPanelRef.runPretrain()"
+          @runPaperStep="paperPanelRef.runPaperStep()"
+          @refreshPaperPositions="paperPanelRef.loadPositions()"
+          @resetPaperPositions="paperPanelRef.resetPositions()"
           @refresh="analyze(false, false, true)"
             @toggle="handleManualClose"
             @refreshPretrained="fetchIntradayPretrainedModels"
@@ -139,6 +154,8 @@
             v-model:intradayBlend="intradayBlendModels"
             v-model:strategyForm="strategyForm"
             v-model:strategyChanConfig="strategyChanConfig"
+            v-model:paperConfig="paperConfig"
+            v-model:paperParams="paperParams"
             v-model:pretrainConfig="pretrainConfig"
             :activeTab="activeTab"
             :loading="loading"
@@ -152,6 +169,9 @@
             @analyze="analyze(true); mobileSidebarCollapsed = true"
             @runStrategy="strategyPanelRef.runStrategy()"
             @runPretrain="pretrainPanelRef.runPretrain()"
+            @runPaperStep="paperPanelRef.runPaperStep(); mobileSidebarCollapsed = true"
+            @refreshPaperPositions="paperPanelRef.loadPositions(); mobileSidebarCollapsed = true"
+            @resetPaperPositions="paperPanelRef.resetPositions(); mobileSidebarCollapsed = true"
             @refresh="analyze(false, false, true); mobileSidebarCollapsed = true"
             @toggle="mobileSidebarCollapsed = !mobileSidebarCollapsed"
             @refreshPretrained="fetchIntradayPretrainedModels"
@@ -285,16 +305,51 @@
                   ref="strategyPanelRef" 
                   :form="strategyForm"
                   :chanConfig="strategyChanConfig"
+                  @open-live-tools="activeTab = 'live'"
                   @view-stock="handleViewStockFromStrategy" 
                   @add-to-portfolio="handleAddToPortfolio"
                 />
              </div>
           </div>
 
-          <!-- Portfolio Tab -->
-          <div v-show="activeTab === 'portfolio'" class="h-full w-full flex flex-col lg:overflow-hidden">
+          <!-- Live Tools Tab -->
+          <div v-show="activeTab === 'live'" class="h-full w-full flex flex-col lg:overflow-hidden">
              <div class="lg:h-full lg:overflow-hidden p-2 box-border bg-white dark:bg-gray-900 flex-1">
-                <PortfolioPanel ref="portfolioPanelRef" />
+                <LiveToolsPanel
+                  :defaultPoolId="strategyForm.pool_id || 'index:IDX399673'"
+                  :defaultDataSrc="dataSrc"
+                  :defaultAutype="autype"
+                  :defaultFrequency="intradayFreq"
+                  :enableRollingLookback="strategyForm.enable_rolling_lookback !== false"
+                />
+             </div>
+          </div>
+
+          <!-- My Portfolios Tab -->
+          <div v-show="activeTab === 'portfolios'" class="h-full w-full flex flex-col lg:overflow-hidden">
+             <div class="lg:h-full lg:overflow-hidden p-2 box-border bg-white dark:bg-gray-900 flex-1">
+               <PortfolioPanel ref="portfoliosPanelRef" fixed-mode="portfolio" />
+             </div>
+          </div>
+
+          <!-- Backtest Tab -->
+          <div v-show="activeTab === 'backtest'" class="h-full w-full flex flex-col lg:overflow-hidden">
+             <div class="lg:h-full lg:overflow-hidden p-2 box-border bg-white dark:bg-gray-900 flex-1">
+               <PortfolioPanel ref="backtestPanelRef" fixed-mode="backtest" />
+             </div>
+          </div>
+
+          <!-- Paper Trade Tab -->
+          <div v-show="activeTab === 'paper'" class="h-full w-full flex flex-col lg:overflow-hidden">
+             <div class="lg:h-full lg:overflow-hidden p-2 box-border bg-white dark:bg-gray-900 flex-1">
+               <PortfolioPanel
+                 ref="paperPanelRef"
+                 fixed-mode="paper"
+                 :paperConfig="paperConfig"
+                 :paperParams="paperParams"
+                 @selectSimId="handleSelectSimId"
+                 @applyRunParams="handleApplyRunParams"
+               />
              </div>
           </div>
 
@@ -329,9 +384,12 @@ const toast = useToast()
 const tabs = computed(() => [
   { name: 'analysis', label: t('app.stockAnalysis'), icon: MemoryChartBar },
   { name: 'intraday', label: t('app.intradayAnalysis'), icon: MemoryClock },
+  { name: 'paper', label: t('strategy.paperTrade'), icon: MemoryBriefcase },
+  { name: 'backtest', label: t('portfolio.backtest'), icon: MemoryBriefcase },
+  { name: 'portfolios', label: t('portfolio.myPortfolios'), icon: MemoryBriefcase },
   { name: 'pretrain', label: t('app.pretrain'), icon: MemoryChartBar },
   { name: 'strategy', label: t('app.strategy'), icon: MemoryFilter },
-  { name: 'portfolio', label: 'Portfolio', icon: MemoryBriefcase },
+  { name: 'live', label: t('strategy.liveTools'), icon: MemoryChevronRight },
   { name: 'history', label: t('app.history'), icon: MemoryBook },
   { name: 'help', label: t('app.guide'), icon: MemoryJournal }
 ])
@@ -340,6 +398,9 @@ const code = ref('002701')
 const mobileTabsEl = ref(null)
 const mobileTabsCanScrollLeft = ref(false)
 const mobileTabsCanScrollRight = ref(false)
+const desktopTabsEl = ref(null)
+const desktopTabsCanScrollLeft = ref(false)
+const desktopTabsCanScrollRight = ref(false)
 const mobileSidebarCollapsed = ref(false)
 const showDesktopSidebar = ref(true)
 const activeTab = ref('analysis')
@@ -358,10 +419,28 @@ const updateMobileTabsHint = () => {
   mobileTabsCanScrollRight.value = left < (maxScrollLeft - 2)
 }
 
+const updateDesktopTabsHint = () => {
+  const el = desktopTabsEl.value
+  if (!el) {
+    desktopTabsCanScrollLeft.value = false
+    desktopTabsCanScrollRight.value = false
+    return
+  }
+  const maxScrollLeft = Math.max(0, el.scrollWidth - el.clientWidth)
+  const left = el.scrollLeft
+  desktopTabsCanScrollLeft.value = left > 2
+  desktopTabsCanScrollRight.value = left < (maxScrollLeft - 2)
+}
+
+const updateTabsHint = () => {
+  updateMobileTabsHint()
+  updateDesktopTabsHint()
+}
+
 const handleManualClose = () => {
   showDesktopSidebar.value = false
   // If we are on a "Show" page, mark as manually hidden
-  if (!['pretrain', 'history', 'help', 'portfolio'].includes(activeTab.value)) {
+  if (!['pretrain', 'history', 'help', 'portfolios', 'backtest', 'paper'].includes(activeTab.value)) {
     userManuallyHidden.value = true
   }
 }
@@ -396,7 +475,63 @@ const chartRef = ref(null)
 const pretrainPanelRef = ref(null)
 const strategyPanelRef = ref(null)
 const historyPanelRef = ref(null)
-const portfolioPanelRef = ref(null)
+const portfoliosPanelRef = ref(null)
+const backtestPanelRef = ref(null)
+const paperPanelRef = ref(null)
+const paperConfig = ref({
+  sim_id: 'default',
+  pool_id: 'index:IDX399673',
+  data_src: 'akshare',
+  autype: 'qfq',
+  frequency: '30m'
+})
+const paperParams = ref({
+  lookback_days: 365 * 5,
+  top_n: 2,
+  min_prob: 0.25,
+  holding_period: 3,
+  trade_cost: 0.0002,
+  limit: 0,
+  pretrained_model_key: '',
+  risk_filter_enabled: true,
+  risk_mode: 'both',
+  risk_drop_threshold: -0.03,
+  risk_flat_drop_threshold: -0.05,
+  risk_gap_down_threshold: -0.015,
+  risk_atr_window: 14,
+  risk_atr_pct_threshold: 0.04,
+  risk_flat_atr_pct_threshold: 0.06,
+  risk_intraday_enabled: true,
+  risk_intraday_bear_threshold: -0.015,
+  risk_intraday_bull_threshold: -0.03,
+  risk_trend_ma_window: 20
+})
+
+const handleSelectSimId = (simId) => {
+  const sid = String(simId || '').trim() || 'default'
+  paperConfig.value = { ...(paperConfig.value || {}), sim_id: sid }
+}
+
+const handleApplyRunParams = (params) => {
+  const p = params && typeof params === 'object' ? params : {}
+  const cfg = paperConfig.value || {}
+  const prm = paperParams.value || {}
+  const nextCfg = { ...cfg }
+  const nextPrm = { ...prm }
+  Object.entries(p).forEach(([k, v]) => {
+    if (k === 'enable_rolling_lookback' || k === 'run_id') return
+    if (Object.prototype.hasOwnProperty.call(nextCfg, k)) {
+      nextCfg[k] = v
+      return
+    }
+    if (Object.prototype.hasOwnProperty.call(nextPrm, k)) {
+      nextPrm[k] = v
+      return
+    }
+  })
+  paperConfig.value = nextCfg
+  paperParams.value = nextPrm
+}
 const strategyForm = ref({
   strategy_name: `Strategy-${new Date().getTime()}`,
   pool_id: '',
@@ -449,7 +584,11 @@ const pretrainConfig = ref({
   dataSrc: 'clickhouse',
   dataLengthMode: 'years',
   dataLengthYears: 5.0,
-  forceRefresh: false
+  forceRefresh: false,
+  rankMode: 'sample',
+  rollingSampleMode: '',
+  rollingStride: '',
+  onlyFeatures: ''
 })
 
 const intradaySignal = ref(null)
@@ -466,6 +605,45 @@ const intradayPretrainedModels = ref([])
 let intradayPretrainedFetchedAt = 0
 
 const isInitialized = ref(false)
+const paperSimLoading = ref(false)
+
+const paperSimId = computed(() => {
+  const sid = String(paperConfig.value?.sim_id || '').trim()
+  return sid || 'default'
+})
+
+const loadPaperSimFromStorage = (sid) => {
+  const simId = String(sid || '').trim() || 'default'
+  const cfgKey = `paperSim.config.${simId}`
+  const paramsKey = `paperSim.params.${simId}`
+
+  paperSimLoading.value = true
+  try {
+    const rawCfg = localStorage.getItem(cfgKey)
+    if (rawCfg) {
+      try {
+        const parsed = JSON.parse(rawCfg)
+        if (parsed && typeof parsed === 'object') {
+          Object.assign(paperConfig.value, parsed)
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    const rawParams = localStorage.getItem(paramsKey)
+    if (rawParams) {
+      try {
+        const parsed = JSON.parse(rawParams)
+        if (parsed && typeof parsed === 'object') {
+          Object.assign(paperParams.value, parsed)
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    paperConfig.value = { ...(paperConfig.value || {}), sim_id: simId }
+  } finally {
+    paperSimLoading.value = false
+  }
+}
 
 const dataLengthMin = ref(0.1)
 const dataLengthMax = ref(10)
@@ -548,7 +726,10 @@ onMounted(() => {
   
   const savedTab = localStorage.getItem('lastActiveTab')
   if (savedTab) {
-    activeTab.value = savedTab
+    const nextTab = savedTab === 'portfolio' ? 'portfolios' : savedTab
+    if (tabs.value.some(x => x.name === nextTab)) {
+      activeTab.value = nextTab
+    }
   }
 
   const savedLang = localStorage.getItem('lastLang')
@@ -627,6 +808,24 @@ onMounted(() => {
     } catch (e) { /* ignore */ }
   }
 
+  const savedPaperConfig = localStorage.getItem('paperConfig')
+  if (savedPaperConfig) {
+    try {
+      Object.assign(paperConfig.value, JSON.parse(savedPaperConfig))
+    } catch (e) { /* ignore */ }
+  }
+
+  const savedPaperParams = localStorage.getItem('paperParams')
+  if (savedPaperParams) {
+    try {
+      Object.assign(paperParams.value, JSON.parse(savedPaperParams))
+    } catch (e) { /* ignore */ }
+  }
+
+  const initialSimId = String(paperConfig.value?.sim_id || '').trim() || 'default'
+  paperConfig.value = { ...(paperConfig.value || {}), sim_id: initialSimId }
+  loadPaperSimFromStorage(initialSimId)
+
   fetchIntradayPretrainedModels({ quiet: true })
 
   // Apply initial sidebar state
@@ -636,15 +835,24 @@ onMounted(() => {
 
   nextTick(() => {
     isInitialized.value = true
-    updateMobileTabsHint()
+    updateTabsHint()
   })
 
-  window.addEventListener('resize', updateMobileTabsHint, { passive: true })
+  window.addEventListener('resize', updateTabsHint, { passive: true })
 })
 
 onBeforeUnmount(() => {
-  window.removeEventListener('resize', updateMobileTabsHint)
+  window.removeEventListener('resize', updateTabsHint)
 })
+
+watch(
+  tabs,
+  () => {
+    if (!isInitialized.value) return
+    nextTick(() => updateTabsHint())
+  },
+  { deep: true }
+)
 
 // Watch changes and save to localStorage
 watch(code, (newVal) => {
@@ -770,6 +978,31 @@ watch(pretrainConfig, (newVal) => {
   if (!isInitialized.value) return
   localStorage.setItem('pretrainConfig', JSON.stringify(newVal))
 }, { deep: true })
+
+watch(paperConfig, (newVal) => {
+  if (!isInitialized.value) return
+  if (paperSimLoading.value) return
+  localStorage.setItem('paperConfig', JSON.stringify(newVal))
+  const sid = String(newVal?.sim_id || '').trim() || 'default'
+  localStorage.setItem(`paperSim.config.${sid}`, JSON.stringify(newVal))
+}, { deep: true })
+
+watch(paperParams, (newVal) => {
+  if (!isInitialized.value) return
+  if (paperSimLoading.value) return
+  localStorage.setItem('paperParams', JSON.stringify(newVal))
+  const sid = paperSimId.value
+  localStorage.setItem(`paperSim.params.${sid}`, JSON.stringify(newVal))
+}, { deep: true })
+
+watch(
+  () => paperConfig.value?.sim_id,
+  (sid) => {
+    if (!isInitialized.value) return
+    if (paperSimLoading.value) return
+    loadPaperSimFromStorage(sid)
+  }
+)
 
 watch([intradayFreq, dataSrc, model], () => {
   fetchIntradayPretrainedModels({ quiet: true })
@@ -1104,9 +1337,9 @@ const handleViewStockFromStrategy = (stockCode) => {
 }
 
 const handleAddToPortfolio = ({ code, name }) => {
-  activeTab.value = 'portfolio'
+  activeTab.value = 'portfolios'
   nextTick(() => {
-    portfolioPanelRef.value?.openAddPosition(code, name)
+    portfoliosPanelRef.value?.openAddPosition(code, name)
   })
 }
 </script>

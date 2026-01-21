@@ -240,7 +240,110 @@ export const translations = {
       batchDeleteConfirm: "确定要删除已选项吗？",
       pageInfo: "第 {page}/{pages} 页 · 共 {total} 条",
       prevPage: "上一页",
-      nextPage: "下一页"
+      nextPage: "下一页",
+      liveTools: "实盘工具",
+      liveToolsTitle: "实盘工具",
+      featureScan: "特征扫描",
+      paperTrade: "模拟盘",
+      simId: "模拟盘ID",
+      newSim: "新建",
+      simIdPlaceholder: "default 或自定义ID（用于并行隔离）",
+      poolId: "股票池",
+      lookbackDays: "回溯天数",
+      bspFeatureMode: "结构特征来源",
+      bspModeSkip: "跳过（更快）",
+      bspModeLatest: "最新BSP（更慢）",
+      limit: "限制数量(0=全量)",
+      runScan: "开始扫描",
+      scanMeta: "返回 {n} 条 · ts={ts}",
+      topN: "Top N",
+      minProb: "最小 Prob",
+      holdingBars: "持有Bar数",
+      tradeCost: "交易成本",
+      enforceT1: "强制T+1",
+      indexFilterEnabled: "指数MA滤网",
+      indexCode: "指数代码",
+      indexMaWindow: "指数MA窗口(日)",
+      stopLoss: "止损阈值",
+      runStep: "运行一轮",
+      autoRun: "自动运行",
+      createRun: "创建任务",
+      runName: "任务名",
+      autoResume: "重启自动恢复",
+      notify: "通知",
+      startImmediately: "立即启动",
+      startRun: "启动",
+      stopRun: "停止",
+      view: "查看",
+      apply: "应用参数",
+      delete: "删除",
+      refresh: "刷新",
+      refreshPositions: "刷新持仓",
+      resetPositions: "清空持仓",
+      stepMeta: "day={day} · ts={ts}",
+      targets: "目标持仓",
+      sellList: "卖出清单",
+      buyList: "买入清单",
+      positions: "当前持仓",
+      barsHeld: "已持有Bar",
+      entryTime: "入场时间",
+      entryPrice: "入场价",
+      currentPrice: "现价",
+      positionReturn: "收益",
+      marketStatus: "市场状态",
+      marketOpen: "开盘",
+      marketClosed: "未开盘",
+      pendingOrders: "挂单",
+      tradeHistory: "历史记录",
+      timeHuman: "时间",
+      effectiveTime: "生效时间",
+      side: "方向",
+      tradeType: "类型",
+      price: "价格",
+      reason: "原因",
+      pending: "挂单中",
+      executed: "已成交",
+      unexecuted: "未成交",
+      blocked: "受限",
+      error: "错误",
+      stepLog: "调仓记录",
+      equityCurve: "资金曲线",
+      equity: "净值",
+      waitingBuy: "等待买入",
+      waitingSell: "等待卖出",
+      reasonT1: "T+1（当日买入不可卖出）",
+      risk: "风控",
+      riskEnabled: "启用风控",
+      riskMode: "模式",
+      riskModeDrop: "跌幅",
+      riskModeAtr: "波动(ATR%)",
+      riskModeBoth: "跌幅+ATR%",
+      riskDropThreshold: "降仓阈值(昨跌)",
+      riskFlatDropThreshold: "清仓阈值(昨跌)",
+      riskAtrWindow: "ATR窗口(日)",
+      riskAtrPctThreshold: "降仓阈值(ATR%)",
+      riskFlatAtrPctThreshold: "清仓阈值(ATR%)",
+      riskGapDownThreshold: "低开熔断阈值(Gap)",
+      riskIntradayEnabled: "启用日内跳水熔断",
+      riskTrendMaWindow: "趋势MA窗口(日)",
+      riskIntradayBearThreshold: "熊市熔断阈值(日内)",
+      riskIntradayBullThreshold: "牛市熔断阈值(日内)",
+      marketSession: {
+        closed: "未开盘",
+        pre_auction: "集合竞价（申报）",
+        auction_pause: "集合竞价（停牌段）",
+        continuous_am: "连续竞价（上午）",
+        lunch_break: "午间休市",
+        continuous_pm: "连续竞价（下午）",
+        close_auction: "收盘集合竞价",
+        after_close: "已收盘"
+      },
+      totalPnlPct: "当前组合收益",
+      totalPnl: "当前组合盈亏",
+      totalMarketValue: "当前市值",
+      totalCost: "持仓成本",
+      pretrainedModelKey: "预训练模型Key（可选）",
+      pretrainedModelKeyPlaceholder: "留空则自动选择最新的横截面Rank逻辑回归模型"
     },
     portfolio: {
       title: "模拟交易/回测",
@@ -258,7 +361,8 @@ export const translations = {
       pnl: "盈亏",
       noPositions: "暂无持仓",
       actions: "操作",
-      backtest: "组合回测",
+      backtest: "策略回测",
+      wolfpackBacktest: "狼群回测（T+1+风控）",
       startDate: "开始日期",
       endDate: "结束日期",
       runBacktest: "运行回测",
@@ -407,6 +511,15 @@ export const translations = {
       cancel: "取消",
       save: "保存",
       renamed: "已更新名称",
+      rankMode: "Rank 口径",
+      rankModeSample: "单票样本内 Rank（旧）",
+      rankModeCrossSection: "横截面 Rank（同一时刻跨池）",
+      rollingSampleMode: "采样模式",
+      rollingModeBsp: "依赖BSP（旧）",
+      rollingModeEveryBar: "每根K线（迷雾模式）",
+      rollingStride: "采样步长",
+      onlyFeatures: "仅用特征(逗号分隔)",
+      onlyFeaturesPlaceholder: "例如：volatility_250,zs_last_height",
       pageInfo: "第 {page}/{pages} 页 · 共 {total} 条",
       prevPage: "上一页",
       nextPage: "下一页",
@@ -573,7 +686,65 @@ export const translations = {
         title: "7. 离线预训练",
         intro: "预训练功能允许您利用闲暇时间，对大量股票进行离线训练。训练好的模型会保存到本地，在日常分析时直接加载，极大提高分析速度。",
         pool: "<strong>股票池管理</strong>: 您可以创建不同的股票池（如'沪深300'、'自选股'）。支持从 ClickHouse 导入或手动输入代码。",
-        force: "<strong>强制重新训练</strong>: 默认情况下，如果已存在相同配置的模型，系统会跳过训练。勾选此项可强制覆盖旧模型。"
+        force: "<strong>强制重新训练</strong>: 默认情况下，如果已存在相同配置的模型，系统会跳过训练。勾选此项可强制覆盖旧模型。",
+        rankMode: "<strong>Rank 模式</strong>: 选择 '样本内 Rank' (单只股票历史纵向对比) 或 '横截面 Rank' (同一时刻全市场股票横向对比)。横截面模式更能反映相对强弱。",
+        rollingSample: "<strong>采样模式</strong>: '依赖 BSP' (仅在买卖点处采样) 或 '每根 K 线' (全量采样，数据量大但更全面)。",
+        features: "<strong>特征选择</strong>: 支持指定仅使用特定的特征列进行训练，以精简模型。",
+        atrLabel: "<strong>ATR 动态标签</strong>: 使用基于 ATR 的动态阈值来标记盈亏，适应不同波动率的股票。",
+        volFilter: "<strong>波动率过滤</strong>: 过滤掉波动率 (ATR%) 过低的样本，专注于活跃个股。",
+        jobs: "<strong>作业列表</strong>: 预训练以“作业”形式排队/运行/失败/完成；可在列表中查看阶段与进度。",
+        models: "<strong>模型管理</strong>: 训练成功会生成“模型”条目；支持查看详情、重命名、删除与批量删除。"
+      },
+
+      // 8. 专业分析（多周期/多数据源）
+      intraday: {
+        title: "8. 专业分析（多周期）",
+        intro: "“专业分析”用于在不同周期（如 30m/60m/日线）下快速对同一只股票重复分析，并提供数据源、模型、预训练选择等增强能力。",
+        freq: "<strong>周期选择</strong>: 短周期信号多但噪声大；长周期信号少但更稳。建议 30m 做短线、日线做波段。",
+        dataSrc: "<strong>数据源</strong>: 支持 ClickHouse / BaoStock / AkShare。建议优先使用 ClickHouse（速度快、稳定）。",
+        pretrained: "<strong>预训练模型</strong>: 可选择自动匹配/关闭/指定版本。匹配不到时会自动回退在线训练。",
+        blend: "<strong>融合预训练</strong>: 将预训练与在线训练结果加权融合，兼顾稳定性与适应性。",
+        refresh: "<strong>刷新数据</strong>: 先刷新获取最新 K 线，再执行分析，避免数据滞后。"
+      },
+
+      // 9. 实盘工具（特征扫描/模拟盘）
+      live: {
+        title: "9. 实盘工具",
+        intro: "实盘工具用于把“可执行交易”流程工程化：先做全池特征扫描找候选，再用预训练模型做 Top-N 模拟持仓滚动验证。",
+        scan: {
+          title: "A. 特征扫描",
+          what: "<strong>用途</strong>: 对股票池在最新一根K线处计算特征，并输出排序（如 volatility_250_rank）。可用于快速找“相对强势/活跃”的标的。",
+          lookback: "<strong>回溯天数</strong>: 决定计算特征的历史窗口；窗口越大越稳但越慢。",
+          bspMode: "<strong>结构特征来源</strong>: “跳过”更快；“最新BSP”会额外计算结构相关特征（更慢）。",
+          limit: "<strong>限制数量</strong>: 限制扫描股票数量（0=全量），用于快速调试或控时。"
+        },
+        paper: {
+          title: "B. 模拟盘（Top-N）",
+          what: "<strong>用途</strong>: 按固定规则每步选出 Top-N 目标持仓，并输出买入/卖出清单与当前持仓，用于验证策略在“滚动推进”下是否可执行。",
+          params: "<strong>关键参数</strong>: Top N（持仓数）、Min Prob（买入阈值）、持有Bar数（时间止损）、交易成本（trade_cost）。",
+          modelKey: "<strong>预训练模型Key</strong>: 可手工指定某个模型；留空则自动选择最新且配置匹配的模型。",
+          positions: "<strong>持仓管理</strong>: 支持刷新持仓与一键清空持仓（用于从零开始回放）。"
+        }
+      },
+
+      // 10. 组合与回测
+      portfolio: {
+        title: "10. 组合/回测",
+        intro: "组合模块用于记录你的持仓篮子；回测模块用于用指定模型Key对固定指数成分进行向量化回测，快速评估策略稳定性。",
+        create: "<strong>创建组合</strong>: 为一组持仓命名并描述，便于长期跟踪。",
+        positions: "<strong>添加持仓</strong>: 输入代码、数量、成本价；系统会展示现价、市值与盈亏。",
+        backtest: "<strong>简易向量回测</strong>: 选择起止日期与模型Key（可留空自动选择），输出资金曲线与关键指标。",
+        modelKey: "<strong>模型 Key</strong>: 建议使用与当前频率/Rank 口径一致的预训练模型，否则结果可能不可比。"
+      },
+
+      // 11. 历史记录
+      history: {
+        title: "11. 历史记录",
+        intro: "历史记录会保存你每次分析的关键结果，方便复盘与对比（例如同一只股票在不同周期/模型下的表现）。",
+        list: "<strong>记录列表</strong>: 展示代码、周期、模型、分析时间、信号与准确率等摘要信息。",
+        search: "<strong>搜索/筛选</strong>: 支持按股票代码过滤，快速定位目标记录。",
+        view: "<strong>查看图表</strong>: 一键回到当次分析的图表与指标页面。",
+        delete: "<strong>删除/批量删除</strong>: 支持清理历史记录（谨慎操作）。"
       }
     }
   },
@@ -813,7 +984,94 @@ export const translations = {
       batchDeleteConfirm: "Delete selected runs?",
       pageInfo: "Page {page}/{pages} · Total {total}",
       prevPage: "Prev",
-      nextPage: "Next"
+      nextPage: "Next",
+      liveTools: "Live Tools",
+      liveToolsTitle: "Live Tools",
+      featureScan: "Feature Scan",
+      paperTrade: "Paper Trade (Top-2)",
+      simId: "Sim ID",
+      newSim: "New",
+      simIdPlaceholder: "default or custom id (isolated runs)",
+      poolId: "Pool",
+      lookbackDays: "Lookback Days",
+      bspFeatureMode: "Structure Feature Source",
+      bspModeSkip: "Skip (Faster)",
+      bspModeLatest: "Latest BSP (Slower)",
+      limit: "Limit (0=All)",
+      runScan: "Scan",
+      scanMeta: "{n} rows · ts={ts}",
+      topN: "Top N",
+      minProb: "Min Prob",
+      holdingBars: "Holding Bars",
+      tradeCost: "Trade Cost",
+      enforceT1: "Enforce T+1",
+      indexFilterEnabled: "Index MA Filter",
+      indexCode: "Index Code",
+      indexMaWindow: "Index MA Window (Days)",
+      stopLoss: "Stop Loss",
+      runStep: "Run Step",
+      refreshPositions: "Refresh Positions",
+      resetPositions: "Reset Positions",
+      stepMeta: "day={day} · ts={ts}",
+      targets: "Targets",
+      sellList: "Sell",
+      buyList: "Buy",
+      positions: "Positions",
+      barsHeld: "Bars Held",
+      entryTime: "Entry Time",
+      entryPrice: "Entry Price",
+      currentPrice: "Current",
+      positionReturn: "Return",
+      marketStatus: "Market",
+      marketOpen: "Open",
+      marketClosed: "Closed",
+      pendingOrders: "Orders",
+      tradeHistory: "History",
+      timeHuman: "Time",
+      effectiveTime: "Effective",
+      side: "Side",
+      tradeType: "Type",
+      price: "Price",
+      reason: "Reason",
+      pending: "Pending",
+      executed: "Executed",
+      unexecuted: "Unexecuted",
+      blocked: "Blocked",
+      waitingBuy: "Waiting Buy",
+      waitingSell: "Waiting Sell",
+      reasonT1: "T+1 (can't sell same day)",
+      risk: "Risk",
+      riskEnabled: "Enable risk control",
+      riskMode: "Mode",
+      riskModeDrop: "Drop",
+      riskModeAtr: "ATR%",
+      riskModeBoth: "Drop+ATR%",
+      riskDropThreshold: "Reduce Threshold (Prev Drop)",
+      riskFlatDropThreshold: "Flat Threshold (Prev Drop)",
+      riskAtrWindow: "ATR Window (Days)",
+      riskAtrPctThreshold: "Reduce Threshold (ATR%)",
+      riskFlatAtrPctThreshold: "Flat Threshold (ATR%)",
+      riskGapDownThreshold: "Gap Down Threshold",
+      riskIntradayEnabled: "Enable Intraday Plunge Breaker",
+      riskTrendMaWindow: "Trend MA Window (Days)",
+      riskIntradayBearThreshold: "Bear Threshold (Intraday)",
+      riskIntradayBullThreshold: "Bull Threshold (Intraday)",
+      marketSession: {
+        closed: "Closed",
+        pre_auction: "Call Auction (Submit)",
+        auction_pause: "Call Auction (Pause)",
+        continuous_am: "Continuous (AM)",
+        lunch_break: "Lunch Break",
+        continuous_pm: "Continuous (PM)",
+        close_auction: "Closing Auction",
+        after_close: "After Close"
+      },
+      totalPnlPct: "Portfolio Return",
+      totalPnl: "Portfolio P&L",
+      totalMarketValue: "Market Value",
+      totalCost: "Cost",
+      pretrainedModelKey: "Pretrained Model Key (Optional)",
+      pretrainedModelKeyPlaceholder: "Leave empty to auto pick latest cross-sectional rank LR model"
     },
     portfolio: {
       title: "Simulation/Backtest",
@@ -832,6 +1090,7 @@ export const translations = {
       noPositions: "No positions",
       actions: "Actions",
       backtest: "Portfolio Backtest",
+      wolfpackBacktest: "Wolfpack Backtest (T+1+Risk)",
       startDate: "Start Date",
       endDate: "End Date",
       runBacktest: "Run Backtest",
@@ -942,6 +1201,15 @@ export const translations = {
       dataLengthMax: "Max Range",
       dataLengthYears: "Custom Years",
       forceRefresh: "Force retrain (ignore duplicate check)",
+      rankMode: "Rank Mode",
+      rankModeSample: "Per-symbol rank-in-sample (legacy)",
+      rankModeCrossSection: "Cross-sectional rank (same timestamp)",
+      rollingSampleMode: "Sampling Mode",
+      rollingModeBsp: "BSP dependent (legacy)",
+      rollingModeEveryBar: "Every bar (fog-of-war)",
+      rollingStride: "Sampling Stride",
+      onlyFeatures: "Only Features (comma)",
+      onlyFeaturesPlaceholder: "e.g. volatility_250,zs_last_height",
       success: "Pretrain completed",
       failed: "Pretrain failed",
       bundlePath: "Model Bundle",
@@ -1008,151 +1276,165 @@ export const translations = {
     help: {
       title: "Chan Quant Analysis - User Guide",
       tocTitle: "Contents",
-      section1: {
-        title: "1. Core Concepts",
+      intro: {
+        title: "1. Introduction",
+        content: "This system combines <strong>Chan Theory</strong> and <strong>Machine Learning (XGBoost)</strong> to analyze market trends. It automatically identifies structures, captures signals, and uses AI to score them."
+      },
+      chan: {
+        title: "2. Core Concepts",
         intro: "Chan Theory is a geometric analysis theory based on market trend structures. This system automatically identifies:",
         fractal: {
           title: "A. Fractal",
           top: "<strong>Top Fractal</strong>: '∧' shape, 3 K-lines, middle high is highest, low is highest.",
           bottom: "<strong>Bottom Fractal</strong>: '∨' shape, 3 K-lines, middle low is lowest, high is lowest.",
-          meaning: "<em>Meaning</em>: The embryo of trend reversal."
+          note: "Note: Fractal is the smallest unit of trend reversal. System handles K-line inclusion."
         },
         bi: {
           title: "B. Bi (Pen)",
           def: "<strong>Definition</strong>: Connection between adjacent top and bottom fractals.",
-          comp: "<strong>Composition</strong>: Must be Top+Bottom (or vice versa) with sufficient K-lines in between.",
-          strict: "<strong>Strict Bi</strong>: Requires at least <strong>3</strong> non-included K-lines between fractals. Enabling 'Strict Bi' filters noise.",
-          visual: "<em>Visual</em>: <strong>Black line</strong>. Solid = Confirmed, Dashed = Unfinished."
+          strictTitle: "Strict Bi Mode",
+          strictDesc: "System defaults to 'Strict Bi', requiring at least 3 non-included K-lines between fractals. Filters noise."
         },
         seg: {
           title: "C. Segment",
-          def: "<strong>Definition</strong>: Composed of 3 or more overlapping Bi.",
-          visual: "<em>Visual</em>: <strong>Green line</strong>. Higher level structure than Bi."
+          def: "<strong>Definition</strong>: Composed of 3 or more overlapping Bi. Higher level structure."
         },
-        center: {
+        pivot: {
           title: "D. Center/Pivot",
-          def: "<strong>Definition</strong>: Overlapping part of at least 3 consecutive sub-level trends.",
-          visual: "<em>Visual</em>: <strong>Orange rectangle</strong>.",
-          meaning: "<em>Meaning</em>: Balance area of buyer/seller forces. All buy/sell points generate around it."
+          def: "<strong>Definition</strong>: Overlapping part of at least 3 consecutive sub-level trends. Shown as <strong>Orange rectangle</strong>."
         }
       },
-      section2: {
-        title: "2. Buy/Sell Point Types",
-        intro: "Analysis results show different types of signals with different meanings:",
+      bs: {
+        title: "3. Buy/Sell Points",
         table: {
           type: "Type",
           name: "Name",
           desc: "Description",
-          risk: "Risk/Reward",
-          t1: { type: "Type 1 (1B/1S)", name: "Trend Reversal", desc: "Reversal at end of trend due to divergence. Usually the extreme point.", risk: "High Risk, Max Reward" },
-          t2: { type: "Type 2 (2B/2S)", name: "Pullback Confirm", desc: "First pullback after Type 1 not breaking new low/high. Confirms reversal.", risk: "Medium Risk, High Win Rate" },
-          t3: { type: "Type 3 (3B/3S)", name: "Center Destruction", desc: "Strong breakout from center without re-entering. Signals main wave.", risk: "Low Risk, Strong Momentum" },
-          t2s: { type: "Type 2s", name: "Strong Pullback", desc: "Similar to Type 2 but based on strong fractal or sub-level pullback.", risk: "-" }
+          t1: { name: "1B / 1S", desc: "Trend Reversal. Divergence at trend end. High risk, high reward." },
+          t2: { name: "2B / 2S", desc: "Pullback Confirm. First pullback not breaking new low/high." },
+          t3: { name: "3B / 3S", desc: "Center Destruction. Breakout without re-entering." },
+          l2: { name: "L2B / L2S", desc: "Strong fractal structure within consolidation." }
+        },
+        visual: {
+          title: "Chart Markers",
+          desc: "Red arrow = Buy, Green arrow = Sell. Number indicates type."
         }
       },
-      section3: {
-        title: "3. AI Signal Score",
-        intro: "This project integrates <strong>XGBoost</strong> machine learning model.",
-        desc1: "Extracts features (MACD, Volume, K-line patterns) when signal appears.",
-        desc2: "Predicts probability of future profit.",
-        score: "<strong>Confidence Score</strong>: Higher score (0~100%) = higher reliability. Scores > 50% are recommended."
+      ai: {
+        title: "4. AI Signal Score",
+        intro: "Integrates XGBoost/LightGBM to score signals.",
+        feature: "<strong>Features</strong>: MACD, Volume, K-line patterns, etc.",
+        model: "<strong>Model</strong>: Trained on historical data to identify profitable patterns.",
+        score: "<strong>Confidence Score</strong>: 0~100%. >50% recommended, >80% high confidence."
       },
-      section4: {
-        title: "4. Parameters",
-        step: "<strong>Step Calculation</strong>: Simulates real-time trading.",
-        stepDesc: "<em>On</em>: Avoids 'future function', sees state as it was.<br/><em>Off</em>: Uses full data, faster but may include future corrections.",
-        strict: "<strong>Strict Bi</strong>",
-        strictDesc: "<em>On</em>: Filters noise, good for big trends.<br/><em>Off</em>: More sensitive, good for short-term.",
-        rolling: "<strong>Rolling Lookback</strong>: Trains/predicts with a rolling window to better simulate live trading.",
-        rollingDesc: "Uses recent history for each run; more realistic but slower.",
-        blend: "<strong>Blend Pretrained</strong>: Blends pretrained model with online training (weighted).",
-        blendDesc: "Good for stability + adaptability. Falls back to online training if no matching pretrained model."
-      },
-      section5: {
-        title: "5. Tabs Overview",
-        intro: "Use the top tabs to switch workflows. Most parameters are configured in the left sidebar.",
-        tabs: {
-          analysis: "<strong>{label}</strong>: Main analysis entry. Shows structures, signals and AI scores.",
-          intraday: "<strong>{label}</strong>: Multi-timeframe / intraday analysis with source/model/pretrained options.",
-          pretrain: "<strong>{label}</strong>: Offline batch training and saving pretrained models for later reuse.",
-          strategy: "<strong>{label}</strong>: Scan a stock pool with filters and output matches. Includes presets.",
-          history: "<strong>{label}</strong>: Review past analysis records and charts.",
-          help: "<strong>{label}</strong>: User guide and explanations."
+      ui: {
+        title: "5. Interface Guide",
+        sidebar: {
+          title: "A. Sidebar",
+          stock: "<strong>Stock Code</strong>: Input code (e.g. 600000).",
+          period: "<strong>Period</strong>: K-line timeframe.",
+          model: "<strong>Model</strong>: XGBoost / LightGBM / MLP.",
+          pretrained: "<strong>Pretrained</strong>: Use offline trained models.",
+          stockDesc: "Enter to analyze.",
+          periodDesc: "Daily for trends, 30m for swing.",
+          modelDesc: "Cross-validate with different models.",
+          pretrainedDesc: "Faster and more stable."
+        },
+        chart: {
+          title: "B. Chart Interaction",
+          kline: "<strong>K-Line</strong>: Red=Up, Green=Down.",
+          bi: "<strong>Bi</strong>: Black line.",
+          seg: "<strong>Segment</strong>: Green line.",
+          center: "<strong>Center</strong>: Orange rectangle."
         }
       },
-      section6: {
-        title: "6. Sidebar Settings (Analysis/Pro)",
-        intro: "Analysis and Pro share basic settings. Pro additionally provides timeframe, data source and pretrained selection.",
-        items: {
-          stockCode: "<strong>{label}</strong>: Stock code input (e.g. 600000 / 002701).",
-          period: "<strong>{label}</strong>: Timeframe selection. Smaller timeframe = more signals and more noise.",
-          dataSrc: "<strong>{label}</strong>: Market data source.",
-          model: "<strong>{label}</strong>: ML model selection (XGBoost/LightGBM/MLP).",
-          pretrained: "<strong>{label}</strong>: Pretrained model selection (auto-match by config).",
-          dataLength: "<strong>{label}</strong>: Historical data length (years) used for training/calculation.",
-          refresh: "<strong>{label}</strong>: Refresh market data (Pro) / fetch latest.",
-          analyze: "<strong>{label}</strong>: Run analysis and generate results."
-        }
-      },
-      section7: {
+      pretrain: {
         title: "7. Pretrain: Purpose & Settings",
         intro: "Pretrain runs offline batch training and saves models. Later runs prefer matched pretrained models.",
-        items: {
-          pool: "<strong>{label}</strong>: Select stock pool (from stock_constituent). ClickHouse only.",
-          codes: "<strong>{label}</strong>: Manual code list (newline/space/comma separated).",
-          frequency: "<strong>{label}</strong>: K-line timeframe for training.",
-          dataSrc: "<strong>{label}</strong>: Data source for training.",
-          model: "<strong>{label}</strong>: Model type for training.",
-          dataLength: "<strong>{label}</strong>: Data range policy (max/years).",
-          forceRefresh: "<strong>{label}</strong>: Force retrain and ignore duplicates.",
-          run: "<strong>{label}</strong>: Submit a pretrain job (queued/running/success/fail)."
+        pool: "<strong>Pool Management</strong>: Create stock pools (e.g. 'CSI 300', 'Custom'). Supports ClickHouse import or manual input.",
+        force: "<strong>Force Retrain</strong>: Force overwrite existing models with same config.",
+        rankMode: "<strong>Rank Mode</strong>: 'In-Sample' (longitudinal rank within single stock) or 'Cross-Sectional' (horizontal rank across all stocks at same time). Cross-sectional is better for relative strength.",
+        rollingSample: "<strong>Sampling Mode</strong>: 'BSP Dependent' (sample only at Buy/Sell points) or 'Every Bar' (sample at every candle, denser data).",
+        features: "<strong>Feature Selection</strong>: Specify a subset of features to use for training.",
+        atrLabel: "<strong>ATR Dynamic Label</strong>: Use ATR-based dynamic threshold for profit labeling instead of fixed percentage.",
+        volFilter: "<strong>Volatility Filter</strong>: Filter out samples with low volatility (low ATR percentage) to focus on active stocks.",
+        jobs: "<strong>Job list</strong>: Pretrain runs as queued/running/success/fail jobs with progress stages.",
+        models: "<strong>Model management</strong>: Successful jobs create model entries. View details, rename, delete, and batch delete."
+      },
+      strategy: {
+        title: "6. Strategy",
+        intro: "Strategy scans a pool and outputs matched stocks. Start from presets and fine-tune.",
+        presets: {
+          title: "A. Presets",
+          dealer: "<strong>Ultra High Accuracy</strong>: >90% accuracy, strict.",
+          quantControl: "<strong>Recent Buy</strong>: Recent signal confirmation.",
+          practical: "<strong>Practical</strong>: Balanced accuracy and score.",
+          conservative: "<strong>Conservative</strong>: High historical win rate.",
+          aggressive: "<strong>Aggressive</strong>: High signal score."
+        },
+        basic: {
+          title: "B. Basic Settings",
+          scope: "<strong>Scope</strong>: Stock pool.",
+          accuracy: "<strong>Min Accuracy</strong>: Historical win rate filter.",
+          len: "<strong>Data Range</strong>: Years of history."
+        },
+        advanced: {
+          title: "C. Advanced",
+          recentAcc: "<strong>Recent Accuracy</strong>: Accuracy in recent years.",
+          profit: "<strong>Profit Threshold</strong>: Definition of win.",
+          rolling: "<strong>Rolling Lookback</strong>: No future function.",
+          strict: "<strong>Strict Bi</strong>: Less noise.",
+          signal: "<strong>Signal Only</strong>: Recent signals only."
+        },
+        examples: {
+          title: "D. Examples",
+          ex1: "<strong>Ex 1</strong>: Bottom fishing - Conservative + Buy 1/2.",
+          ex2: "<strong>Ex 2</strong>: Main wave - Aggressive + Buy 3.",
+          ex3: "<strong>Ex 3</strong>: Daily scan - Recent signal only."
         }
       },
-      section8: {
-        title: "8. Strategy: Settings, Presets & Examples",
-        intro: "Strategy scans a pool and outputs matched stocks. Start from presets and fine-tune.",
-        basicTitle: "A. Basic Settings",
-        basic: {
-          presets: "<strong>{label}</strong>: Apply a parameter bundle (overwrites some fields).",
-          scope: "<strong>{label}</strong>: Stock universe/pool.",
-          model: "<strong>{label}</strong>: Model algorithm for scanning.",
-          frequency: "<strong>{label}</strong>: Timeframe (Daily/60m/30m/5m).",
-          minAccuracy: "<strong>{label}</strong>: Min backtest accuracy. Higher = fewer but steadier signals.",
-          dataLength: "<strong>{label}</strong>: Historical data length (years)."
+      intraday: {
+        title: "8. Analysis Pro (Intraday)",
+        intro: "Analysis Pro helps you run analysis on different timeframes and data sources, with pretrained model options for speed and stability.",
+        freq: "<strong>Timeframe</strong>: Shorter timeframe = more signals and more noise. Daily for trends, 30m/60m for swing/short-term.",
+        dataSrc: "<strong>Data Source</strong>: ClickHouse / BaoStock / AkShare. ClickHouse is recommended for speed and stability.",
+        pretrained: "<strong>Pretrained</strong>: Auto-match / Off / Specify a version. Falls back to online training if not found.",
+        blend: "<strong>Blend</strong>: Weighted blend of pretrained + online models for stability + adaptability.",
+        refresh: "<strong>Refresh</strong>: Refresh market data before running analysis to avoid stale bars."
+      },
+      live: {
+        title: "9. Live Tools",
+        intro: "Live Tools is for actionable workflow: scan features in a pool, then run a Top-N paper trading step with pretrained models.",
+        scan: {
+          title: "A. Feature Scan",
+          what: "<strong>What it does</strong>: Computes features on the latest bar for all symbols in the pool and outputs ranks for quick filtering.",
+          lookback: "<strong>Lookback days</strong>: Larger window is more stable but slower.",
+          bspMode: "<strong>Structure features</strong>: 'Skip' is faster; 'Latest BSP' includes structure features (slower).",
+          limit: "<strong>Limit</strong>: 0 = all symbols; set a number to speed up debugging."
         },
-        advancedTitle: "B. Advanced (Show advanced)",
-        advanced: {
-          minRecentAccuracy: "<strong>{label}</strong>: Min accuracy within the recent window.",
-          recentAccuracyYears: "<strong>{label}</strong>: Recent window length (years).",
-          profitThreshold: "<strong>{label}</strong>: Label profit threshold.",
-          autoProfitQuantile: "<strong>{label}</strong>: Quantile for auto profit threshold.",
-          profitLookahead: "<strong>{label}</strong>: Bars to look ahead for labeling.",
-          macdAlgo: "<strong>{label}</strong>: MACD feature algorithm.",
-          rollingFeature: "<strong>{label}</strong>: Enable longer-horizon features.",
-          strictBi: "<strong>{label}</strong>: Reduce noise with strict Bi.",
-          gapAsKl: "<strong>{label}</strong>: Treat gaps as KL structure.",
-          signalOnly: "<strong>{label}</strong>: Require recent signals for better actionability.",
-          lookback: "<strong>{label}</strong>: Lookback bars for recent signal search.",
-          direction: "<strong>{label}</strong>: Signal direction (buy/sell/both).",
-          minSignalScore: "<strong>{label}</strong>: Min probability for the latest signal."
-        },
-        presetsTitle: "C. Presets",
-        presetsIntro: "Preset summaries (may evolve with versions):",
-        presets: {
-          custom: "<strong>{name}</strong>: No preset, fully custom.",
-          dealer: "<strong>{name}</strong>: Very conservative. min_accuracy=0.90, strict Bi on, XGBoost, rolling lookback on.",
-          quantControl: "<strong>{name}</strong>: Recent buy confirmation. min_accuracy=0.85, strict Bi on, require recent buy signals.",
-          practical: "<strong>{name}</strong>: Practical dual-filter. 5y data, recent window filter, recent signal filter and high signal score.",
-          conservative: "<strong>{name}</strong>: Conservative. min_accuracy=0.85, strict Bi on, XGBoost.",
-          aggressive: "<strong>{name}</strong>: Aggressive. min_accuracy=0.60, strict Bi off, more signals."
-        },
-        examplesTitle: "D. Examples",
-        examplesIntro: "Examples show the tuning mindset:",
-        examples: {
-          ex1: "<strong>Example 1</strong>: Start from a preset, then relax thresholds if too few results.",
-          ex2: "<strong>Example 2</strong>: Conservative swing: higher accuracy + rolling lookback + recent window filter.",
-          ex3: "<strong>Example 3</strong>: Short-term: 30m/60m + recent-signal-only + moderate accuracy threshold."
+        paper: {
+          title: "B. Paper Trade (Top-N)",
+          what: "<strong>What it does</strong>: Picks Top-N targets each step and outputs buy/sell list + positions to validate executability under rolling time.",
+          params: "<strong>Key params</strong>: Top N, Min Prob, Holding bars (time stop), Trade cost.",
+          modelKey: "<strong>Pretrained model key</strong>: Optional; leave empty to auto-pick the latest matched model.",
+          positions: "<strong>Positions</strong>: Refresh current positions or reset to start from scratch."
         }
+      },
+      portfolio: {
+        title: "10. Portfolio & Backtest",
+        intro: "Portfolio records your holding basket; backtest runs a quick vector backtest using a selected (or auto) model key.",
+        create: "<strong>Create</strong>: Name and describe a portfolio for long-term tracking.",
+        positions: "<strong>Positions</strong>: Add positions with code/volume/price and view P&L.",
+        backtest: "<strong>Vector backtest</strong>: Select date range and run. Outputs equity curve and key metrics.",
+        modelKey: "<strong>Model key</strong>: Use a model trained with compatible timeframe/rank mode for comparability."
+      },
+      history: {
+        title: "11. History",
+        intro: "History keeps past analysis results for review and comparison.",
+        list: "<strong>List</strong>: Shows code, timeframe, model, time, signal, and accuracy summary.",
+        search: "<strong>Search</strong>: Filter by stock code to quickly locate records.",
+        view: "<strong>View chart</strong>: Jump back to the chart of that run.",
+        delete: "<strong>Delete</strong>: Delete single record or batch delete."
       }
     }
   }

@@ -425,6 +425,29 @@
           </div>
         </div>
 
+        <!-- Rank Mode -->
+        <div>
+          <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('pretrain.rankMode') }}</div>
+          <USelectMenu v-model="proxyPretrainConfig.rankMode" :options="rankModeOptions" value-attribute="value" option-attribute="label" size="sm" class="w-full" />
+        </div>
+
+        <!-- Rolling Sample Mode -->
+        <div>
+          <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('pretrain.rollingSampleMode') }}</div>
+          <USelectMenu v-model="proxyPretrainConfig.rollingSampleMode" :options="rollingSampleModeOptions" value-attribute="value" option-attribute="label" size="sm" class="w-full" />
+        </div>
+
+        <div class="grid grid-cols-2 gap-2">
+          <div>
+            <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('pretrain.rollingStride') }}</div>
+            <UInput v-model="proxyPretrainConfig.rollingStride" type="number" />
+          </div>
+          <div>
+            <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('pretrain.onlyFeatures') }}</div>
+            <UInput v-model="proxyPretrainConfig.onlyFeatures" :placeholder="t('pretrain.onlyFeaturesPlaceholder')" />
+          </div>
+        </div>
+
         <!-- Force Refresh -->
         <div class="flex items-center justify-between gap-2">
           <UCheckbox v-model="proxyPretrainConfig.forceRefresh" :label="t('pretrain.forceRefresh')" />
@@ -433,6 +456,138 @@
         <UButton block color="primary" :loading="loading" @click="$emit('runPretrain')">
           {{ t('pretrain.run') }}
         </UButton>
+      </div>
+
+      <div v-if="activeTab === 'paper' && (!collapsed || mode === 'desktop')" class="space-y-3">
+        <div>
+          <div class="flex items-center justify-between gap-2 mb-2">
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.simId') }}</label>
+            <UButton size="2xs" color="gray" variant="ghost" icon="i-heroicons-plus" @click="generateSimId">{{ t('strategy.newSim') }}</UButton>
+          </div>
+          <UInput v-model="proxyPaperConfig.sim_id" :placeholder="t('strategy.simIdPlaceholder')" class="w-full" />
+        </div>
+
+        <div>
+          <div class="flex items-center gap-1 mb-2">
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.poolId') }}</label>
+          </div>
+          <USelectMenu v-model="proxyPaperConfig.pool_id" :options="poolOptions" value-attribute="value" option-attribute="label" class="w-full" />
+        </div>
+
+        <div>
+          <div class="flex items-center gap-1 mb-2">
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('sidebar.dataSrc') }}</label>
+          </div>
+          <USelectMenu v-model="proxyPaperConfig.data_src" :options="dataSrcOptions" value-attribute="value" option-attribute="label" class="w-full" />
+        </div>
+
+        <div>
+          <div class="flex items-center gap-1 mb-2">
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('sidebar.autype') }}</label>
+          </div>
+          <USelectMenu v-model="proxyPaperConfig.autype" :options="autypeOptions" value-attribute="value" option-attribute="label" class="w-full" />
+        </div>
+
+        <div>
+          <div class="flex items-center gap-1 mb-2">
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('sidebar.frequency') }}</label>
+          </div>
+          <USelectMenu v-model="proxyPaperConfig.frequency" :options="paperFrequencyOptions" value-attribute="value" option-attribute="label" class="w-full" />
+        </div>
+
+        <div class="pt-2">
+          <UButton
+            size="xs"
+            variant="ghost"
+            color="gray"
+            block
+            @click="showAdvancedPaper = !showAdvancedPaper"
+            :icon="showAdvancedPaper ? 'i-heroicons-chevron-up' : 'i-heroicons-chevron-down'"
+          >
+            {{ showAdvancedPaper ? t('sidebar.collapseAdvanced') : t('sidebar.expandAdvanced') }}
+          </UButton>
+        </div>
+
+        <div v-if="showAdvancedPaper" class="space-y-3 pt-2 border-t border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-800/50 p-2 rounded">
+          <div class="space-y-2">
+            <div>
+              <label class="text-xs text-gray-500">{{ t('strategy.topN') }}</label>
+              <UInput v-model="proxyPaperParams.top_n" type="number" class="w-full" />
+            </div>
+            <div>
+              <label class="text-xs text-gray-500">{{ t('strategy.minProb') }}</label>
+              <UInput v-model="proxyPaperParams.min_prob" type="number" class="w-full" />
+            </div>
+            <div>
+              <label class="text-xs text-gray-500">{{ t('strategy.holdingBars') }}</label>
+              <UInput v-model="proxyPaperParams.holding_period" type="number" class="w-full" />
+            </div>
+            <div>
+              <label class="text-xs text-gray-500">{{ t('strategy.tradeCost') }}</label>
+              <UInput v-model="proxyPaperParams.trade_cost" type="number" class="w-full" />
+            </div>
+            <div>
+              <label class="text-xs text-gray-500">{{ t('strategy.lookbackDays') }}</label>
+              <UInput v-model="proxyPaperParams.lookback_days" type="number" class="w-full" />
+            </div>
+            <div>
+              <label class="text-xs text-gray-500">{{ t('strategy.limit') }}</label>
+              <UInput v-model="proxyPaperParams.limit" type="number" class="w-full" />
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('strategy.pretrainedModelKey') }}</label>
+            <UInput v-model="proxyPaperParams.pretrained_model_key" :placeholder="t('strategy.pretrainedModelKeyPlaceholder')" class="w-full" />
+          </div>
+
+          <div class="pt-2 border-t border-gray-100 dark:border-gray-700 space-y-2">
+            <div class="flex items-center justify-between gap-2">
+              <UCheckbox v-model="proxyPaperParams.risk_filter_enabled" :label="t('strategy.riskEnabled')" />
+            </div>
+            <div class="space-y-2">
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.riskMode') }}</label>
+                <USelectMenu v-model="proxyPaperParams.risk_mode" :options="riskModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
+              </div>
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.riskGapDownThreshold') }}</label>
+                <UInput v-model="proxyPaperParams.risk_gap_down_threshold" type="number" class="w-full" />
+              </div>
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.riskDropThreshold') }}</label>
+                <UInput v-model="proxyPaperParams.risk_drop_threshold" type="number" class="w-full" />
+              </div>
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.riskFlatDropThreshold') }}</label>
+                <UInput v-model="proxyPaperParams.risk_flat_drop_threshold" type="number" class="w-full" />
+              </div>
+            </div>
+            <div class="pt-2 border-t border-gray-100 dark:border-gray-700">
+              <UCheckbox v-model="proxyPaperParams.risk_intraday_enabled" :label="t('strategy.riskIntradayEnabled')" />
+            </div>
+            <div class="space-y-2">
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.riskTrendMaWindow') }}</label>
+                <UInput v-model="proxyPaperParams.risk_trend_ma_window" type="number" class="w-full" />
+              </div>
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.riskIntradayBearThreshold') }}</label>
+                <UInput v-model="proxyPaperParams.risk_intraday_bear_threshold" type="number" class="w-full" />
+              </div>
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.riskIntradayBullThreshold') }}</label>
+                <UInput v-model="proxyPaperParams.risk_intraday_bull_threshold" type="number" class="w-full" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="pt-4 border-t border-gray-100 dark:border-gray-800 space-y-2">
+          <UButton block color="primary" @click="$emit('runPaperStep')">{{ t('strategy.runStep') }}</UButton>
+          <UButton block color="gray" variant="soft" @click="$emit('refreshPaperPositions')">{{ t('strategy.refreshPositions') }}</UButton>
+          <UButton block color="red" variant="soft" @click="$emit('resetPaperPositions')">{{ t('strategy.resetPositions') }}</UButton>
+        </div>
       </div>
 
       <!-- Strategy Tab Configs -->
@@ -638,6 +793,18 @@ const strategyFrequencyOptions = computed(() => [
   { label: t('periods.30m'), value: '30m' },
   { label: t('periods.5m'), value: '5m' }
 ])
+const paperFrequencyOptions = computed(() => [
+  { label: t('periods.60m'), value: '60m' },
+  { label: t('periods.30m'), value: '30m' },
+  { label: t('periods.15m'), value: '15m' },
+  { label: t('periods.5m'), value: '5m' },
+  { label: t('periods.1m'), value: '1m' }
+])
+const riskModeOptions = computed(() => [
+  { label: t('strategy.riskModeDrop'), value: 'drop' },
+  { label: t('strategy.riskModeAtr'), value: 'atr' },
+  { label: t('strategy.riskModeBoth'), value: 'both' }
+])
 
 const props = defineProps({
   activeTab: { type: String, default: 'analysis' },
@@ -667,6 +834,9 @@ const props = defineProps({
   // Strategy Props
   strategyForm: { type: Object, default: () => ({}) },
   strategyChanConfig: { type: Object, default: () => ({}) },
+
+  paperConfig: { type: Object, default: () => ({}) },
+  paperParams: { type: Object, default: () => ({}) },
   
   // Pretrain Props
   pretrainConfig: { type: Object, default: () => ({}) },
@@ -685,7 +855,9 @@ const emit = defineEmits([
   'update:dataSrc', 'update:model', 'update:intradayFreq', 'update:dataLengthYears',
   'update:pretrainedChoice', 'update:intradayBlend', 'update:enableRollingLookback',
   'update:strategyForm', 'update:strategyChanConfig', 'update:pretrainConfig',
-  'analyze', 'toggle', 'refreshPretrained', 'refresh', 'runStrategy', 'runPretrain'
+  'update:paperConfig', 'update:paperParams',
+  'analyze', 'toggle', 'refreshPretrained', 'refresh', 'runStrategy', 'runPretrain',
+  'runPaperStep', 'refreshPaperPositions', 'resetPaperPositions'
 ])
 
 const proxyCode = computed({
@@ -768,6 +940,30 @@ const proxyStrategyChanConfig = computed({
   set: (val) => emit('update:strategyChanConfig', val)
 })
 
+const proxyPaperConfig = computed({
+  get: () => props.paperConfig,
+  set: (val) => emit('update:paperConfig', val)
+})
+
+const proxyPaperParams = computed({
+  get: () => props.paperParams,
+  set: (val) => emit('update:paperParams', val)
+})
+
+const generateSimId = () => {
+  let sid = ''
+  try {
+    sid = typeof crypto?.randomUUID === 'function' ? crypto.randomUUID() : ''
+  } catch (e) {
+    sid = ''
+  }
+  if (!sid) {
+    sid = `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  }
+  const cur = proxyPaperConfig.value || {}
+  proxyPaperConfig.value = { ...cur, sim_id: sid }
+}
+
 const autoProfitThreshold = computed({
   get: () => {
     const cur = proxyStrategyForm.value || {}
@@ -807,6 +1003,7 @@ watch(
 )
 
 const showAdvancedAnalysis = ref(false)
+const showAdvancedPaper = ref(false)
 
 const autypeOptions = computed(() => [
   { label: t('sidebar.autypeQfq'), value: 'qfq' },
@@ -927,6 +1124,16 @@ const modelOptions = computed(() => [
   { label: t('app.modelOptions.logistic_regression'), value: 'logistic_regression' }
 ])
 
+const rankModeOptions = computed(() => [
+  { label: t('pretrain.rankModeSample'), value: 'sample' },
+  { label: t('pretrain.rankModeCrossSection'), value: 'cross_section' }
+])
+
+const rollingSampleModeOptions = computed(() => [
+  { label: t('pretrain.rollingModeBsp'), value: 'bsp' },
+  { label: t('pretrain.rollingModeEveryBar'), value: 'every_bar' }
+])
+
 const fillCodesFromPool = async () => {
     if (!proxyPretrainConfig.value.selectedPoolId) return
     poolMembersLoading.value = true
@@ -969,9 +1176,15 @@ onMounted(async () => {
                 value: p.pool_id,
                 name: p.pool_name
             }))
+            if (!poolOptions.value.find(x => x.value === 'index:IDX399673')) {
+              poolOptions.value.unshift({ label: '创业板50 (50)', value: 'index:IDX399673', name: '创业板50' })
+            }
             // Default to first option if not set
             if (!proxyStrategyForm.value.pool_id && poolOptions.value.length > 0) {
                 proxyStrategyForm.value.pool_id = poolOptions.value[0].value
+            }
+            if (!proxyPaperConfig.value?.pool_id) {
+              proxyPaperConfig.value.pool_id = poolOptions.value.find(x => x.value === 'index:IDX399673')?.value || poolOptions.value[0].value
             }
         }
     } catch (e) {
