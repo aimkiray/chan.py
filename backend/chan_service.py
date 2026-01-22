@@ -808,7 +808,7 @@ def _parse_time_bound_ts(raw: Optional[str], is_end: bool) -> Optional[int]:
     except Exception:
         return None
 
-def fetch_stock_data(code, level, begin_time, end_time, data_src_type, autype=AUTYPE.QFQ, use_online_latest: bool = False):
+def fetch_stock_data(code, level, begin_time, end_time, data_src_type, autype=AUTYPE.QFQ, use_online_latest: bool = False, asset_type: str = "STOCK"):
     """
     Helper to fetch raw K-line data without calculating Chan elements.
     Useful for checking data freshness for caching.
@@ -831,7 +831,7 @@ def fetch_stock_data(code, level, begin_time, end_time, data_src_type, autype=AU
     StockAPI = temp_chan.GetStockAPI()
     StockAPI.do_init()
     try:
-        stock_api = StockAPI(code=code, k_type=level, begin_date=begin_time, end_date=end_time, autype=autype)
+        stock_api = StockAPI(code=code, k_type=level, begin_date=begin_time, end_date=end_time, autype=autype, asset_type=asset_type)
         data_list = list(stock_api.get_kl_data())
         if (
             use_online_latest
@@ -1195,8 +1195,8 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
         # Iterate through steps to collect training samples
         for i, chan_snapshot in enumerate(chan.step_load()):
             kl_count += 1
-            if i % 100 == 0:
-                print(f"Processing step {i}...")
+            if i % 5000 == 0:
+                pass # print(f"Processing step {i}...")
             last_snapshot = chan_snapshot
             
             last_klu = chan_snapshot[0][-1][-1]

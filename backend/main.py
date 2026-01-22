@@ -47,6 +47,7 @@ from backend.storage import StorageManager, StrategyRun, PositionStatus
 from backend.strategy_runner import StrategyRunner
 from Plot.PlotMeta import CChanPlotMeta
 from Common.CEnum import KL_TYPE, DATA_SRC, AUTYPE
+from backend.live.common import day_key_from_ts
 
 app = FastAPI()
 storage = StorageManager()
@@ -2132,6 +2133,17 @@ async def pretrain_model(req: PretrainRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/indices")
+async def list_indices(limit: int = 2000):
+    try:
+        from DataAPI.ClickHouseAPI import CClickHouseAPI
+        items = CClickHouseAPI.list_indices(limit=limit)
+        return {"items": items}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/stock_pools")
 async def list_stock_pools():
     try:
@@ -2142,6 +2154,7 @@ async def list_stock_pools():
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/stock_pools/{pool_id}/members")
 async def get_stock_pool_members(pool_id: str, limit: int = 5000):
@@ -2161,6 +2174,7 @@ async def get_stock_pool_members(pool_id: str, limit: int = 5000):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/api/download/{code}")
 async def download_data(code: str, frequency: str = "1d"):
     try:
@@ -2173,10 +2187,12 @@ async def download_data(code: str, frequency: str = "1d"):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 class StrategyRequest(BaseModel):
     strategy_name: str
     scope: str = "hs300"
     pool_id: Optional[str] = None
+    index_code: str = "399006"
     model: str = "xgboost"
     autype: str = "hfq"
     min_accuracy: float = 0.8
@@ -2851,6 +2867,88 @@ async def live_reset_steps(sim_id: Optional[str] = None, portfolio_id: Optional[
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+class StrategyStopRequest(BaseModel):
+    run_id: str
+
+@app.post("/api/strategy/stop")
+async def stop_strategy(req: StrategyStopRequest):
+    try:
+        r = storage.get_live_run(req.run_id)
+        if not r:
+            return {"status": "error", "message": "Run not found"}
+        # Mark as stopped
+        # ... implementation ...
+        # For now, we rely on the client checking "active_runs" in live_paper_trade_step
+        # But we should update status in DB
+        storage.update_live_run_status(req.run_id, "stopped")
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def _scan_feature_worker(code, level, begin, end, data_src, autype, enable_rolling_lookback, rolling_sample_mode, rolling_stride):
+    try:
+        kl_list = fetch_stock_data(code, level, begin, end, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
+        if not kl_list or len(kl_list) < 600:
+            return None
+        _, bsp_dict, _, _ = get_chan_data(
+            code,
+            True,
+            True,
+            level,
+            data_src,
+            preloaded_data=kl_list,
+            do_predict=True,
+            begin_time=begin,
+            end_time=end,
+            enable_rolling_lookback=enable_rolling_lookback,
+            autype=autype,
+            rolling_sample_mode=rolling_sample_mode,
+            rolling_stride=rolling_stride,
+        )
+        if not bsp_dict:
+            return None
+        best = None
+        best_ts = 0
+        for _, info in (bsp_dict or {}).items():
+            if not isinstance(info, dict):
+                continue
+            if not bool(info.get("is_buy", True)):
+                continue
+            try:
+                ot = info.get("open_time")
+                ts = int(getattr(ot, "ts", 0) or 0)
+            except Exception:
+                ts = 0
+            if ts <= 0 or ts < best_ts:
+                continue
+            best = info
+            best_ts = ts
+        if best is None or best_ts <= 0:
+            return None
+        dk = day_key_from_ts(best_ts)
+        if dk is None:
+            return None
+        feat = best.get("feature")
+        feat_dict = {}
+        try:
+            if feat is None:
+                feat_dict = {}
+            elif isinstance(feat, dict):
+                feat_dict = dict(feat)
+            elif hasattr(feat, "items"):
+                feat_dict = dict(feat.items())
+            else:
+                feat_dict = dict(feat)
+        except Exception:
+            feat_dict = {}
+        try:
+            entry_price = float(getattr(kl_list[-1], "close", 0.0) or 0.0)
+        except Exception:
+            entry_price = 0.0
+        return {"code": code, "day": int(dk), "ts": int(best_ts), "feature": feat_dict, "entry_price": float(entry_price)}
+    except Exception:
+        return None
+
 @app.post("/api/live/paper_trade_step")
 async def live_paper_trade_step(req: LivePaperTradeStepRequest):
     try:
@@ -2862,6 +2960,18 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
         from backend.chan_service import cross_section_rank_transform_rows
 
         sim_id = str(req.sim_id or "").strip() or "default"
+        
+        # Check for active runs before proceeding
+        # This provides a graceful exit mechanism: if the user stops the run in UI, 
+        # the runner (client) will receive this stop signal.
+        active_runs = storage.list_live_runs(sim_id=sim_id, status="running", limit=1)
+        if not active_runs:
+             return {
+                 "status": "stopped",
+                 "cmd": "stop",
+                 "reason": "No active run found for this simulation ID"
+             }
+
         pid = req.portfolio_id
         if pid is None and getattr(req, "run_id", None):
             try:
@@ -3350,67 +3460,6 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
         pos_map = {p.get("stock_code"): p for p in (positions or []) if p.get("stock_code")}
         to_force_sell = [p["stock_code"] for p in (positions or []) if int(p.get("bars_held") or 0) >= int(holding_period)]
 
-        def score_one(code: str):
-            kl_list = fetch_stock_data(code, level, begin, end, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
-            if not kl_list or len(kl_list) < 600:
-                return None
-            _, bsp_dict, _, _ = get_chan_data(
-                code,
-                True,
-                True,
-                level,
-                data_src,
-                preloaded_data=kl_list,
-                do_predict=True,
-                begin_time=begin,
-                end_time=end,
-                enable_rolling_lookback=bool(req.enable_rolling_lookback),
-                autype=autype,
-                rolling_sample_mode=str(req.rolling_sample_mode or "every_bar"),
-                rolling_stride=int(req.rolling_stride or 1),
-            )
-            if not bsp_dict:
-                return None
-            best = None
-            best_ts = 0
-            for _, info in (bsp_dict or {}).items():
-                if not isinstance(info, dict):
-                    continue
-                if not bool(info.get("is_buy", True)):
-                    continue
-                try:
-                    ot = info.get("open_time")
-                    ts = int(getattr(ot, "ts", 0) or 0)
-                except Exception:
-                    ts = 0
-                if ts <= 0 or ts < best_ts:
-                    continue
-                best = info
-                best_ts = ts
-            if best is None or best_ts <= 0:
-                return None
-            dk = day_key_from_ts(best_ts)
-            if dk is None:
-                return None
-            feat = best.get("feature")
-            feat_dict = {}
-            try:
-                if feat is None:
-                    feat_dict = {}
-                elif isinstance(feat, dict):
-                    feat_dict = dict(feat)
-                elif hasattr(feat, "items"):
-                    feat_dict = dict(feat.items())
-                else:
-                    feat_dict = dict(feat)
-            except Exception:
-                feat_dict = {}
-            try:
-                entry_price = float(getattr(kl_list[-1], "close", 0.0) or 0.0)
-            except Exception:
-                entry_price = 0.0
-            return {"code": code, "day": int(dk), "ts": int(best_ts), "feature": feat_dict, "entry_price": float(entry_price)}
-
         results = []
         try:
             req_mw = int(req.max_workers or 0)
@@ -3428,8 +3477,22 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
             mw = req_mw if req_mw and req_mw > 0 else 8
         mw = max(1, min(int(mw), int(len(codes) if codes else 1)))
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=int(mw)) as ex:
-            futs = {ex.submit(score_one, code): code for code in codes}
+        with concurrent.futures.ProcessPoolExecutor(max_workers=int(mw)) as ex:
+            futs = {
+                ex.submit(
+                    _scan_feature_worker,
+                    code,
+                    level,
+                    begin,
+                    end,
+                    data_src,
+                    autype,
+                    bool(req.enable_rolling_lookback),
+                    str(req.rolling_sample_mode or "every_bar"),
+                    int(req.rolling_stride or 1)
+                ): code
+                for code in codes
+            }
             for fut in concurrent.futures.as_completed(futs):
                 try:
                     r = fut.result()
@@ -3623,9 +3686,13 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
                 )
                 if kl_list:
                     k = kl_list[-1]
+                    prev = kl_list[-2] if len(kl_list) > 1 else None
                     o = float(getattr(k, "open", 0.0) or 0.0)
                     c = float(getattr(k, "close", 0.0) or 0.0)
-                    out = {"open": o, "close": c}
+                    h = float(getattr(k, "high", 0.0) or 0.0)
+                    l = float(getattr(k, "low", 0.0) or 0.0)
+                    pc = float(getattr(prev, "close", 0.0) or o) if prev else o
+                    out = {"open": o, "close": c, "high": h, "low": l, "prev_close": pc}
             except Exception:
                 out = None
             quote_cache[code] = out
@@ -3649,23 +3716,109 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
                 return float(c)
             return float(o or 0.0)
 
-        if sell_codes:
-            storage.delete_positions(sell_codes, sim_id=sim_id, portfolio_id=pid)
-        for t in targets:
-            if t["code"] in buy_codes:
-                px = float(_pick_px(str(t.get("code") or ""), market_session))
-                storage.upsert_position(t["code"], int(t.get("ts") or now_ts), float(px or 0.0), 0, sim_id=sim_id, portfolio_id=pid)
+        def _get_board_rules(c: str):
+            c = str(c or "")
+            if c.startswith("688"): # STAR Market
+                return {"min_qty": 200, "inc_qty": 1, "limit_rate": 0.195}
+            if c.startswith("8") or c.startswith("43") or c.startswith("92") or c.startswith("83"): # BSE (Approx codes)
+                 return {"min_qty": 100, "inc_qty": 1, "limit_rate": 0.295}
+            if c.startswith("300"): # ChiNext
+                 return {"min_qty": 100, "inc_qty": 100, "limit_rate": 0.195}
+            # Main Board
+            return {"min_qty": 100, "inc_qty": 100, "limit_rate": 0.095}
 
+        # Execution with Cash & Rules
+        sim_info = storage.get_live_sim(sim_id)
+        current_balance = float(sim_info.get("balance", 100000.0)) if sim_info else 100000.0
         trades = []
+        
+        # 1. Process Sells
+        sold_codes = []
         for c in sell_codes:
-            trades.append({"stock_code": c, "side": "sell", "status": "executed", "trade_ts": int(now_ts), "price": float(_pick_px(c, market_session)), "meta": {"source": "step", "session": market_session}})
-        for t in targets:
-            if t.get("code") in buy_codes:
+            p = pos_map.get(c)
+            if not p: continue
+            px = float(_pick_px(c, market_session))
+            if px <= 0.01: continue # Suspension or error
+            
+            # Check Limit Down
+            rules = _get_board_rules(c)
+            q = _get_quote(c)
+            if q:
+                pc = float(q.get("prev_close") or px)
+                if pc > 0 and px <= pc * (1.0 - rules["limit_rate"]) and abs(px - float(q.get("low") or 0.0)) < 0.01:
+                    blocked.append({"stock_code": c, "side": "sell", "price": px, "reason": "Limit Down", "min_day": 0, "execute_after_ts": 0})
+                    continue
+
+            # Simple assumption: If Volume=0 (legacy), assume 100.
+            # Sell logic: Sell ALL available volume? Usually yes.
+            # But we must respect lot size? 
+            # Rule: selling has no lot size limit for "Odd Lots" (不足100股应一次性卖出).
+            # So just sell all.
+            vol = int(p.get("volume", 0) or 100)
+            revenue = px * vol * (1.0 - 0.001) # 0.1% Tax+Fee
+            
+            current_balance += revenue
+            sold_codes.append(c)
+            trades.append({"stock_code": c, "side": "sell", "status": "executed", "trade_ts": int(now_ts), "price": px, "volume": vol, "meta": {"source": "step", "session": market_session}})
+
+        if sold_codes:
+            storage.delete_positions(sold_codes, sim_id=sim_id, portfolio_id=pid)
+
+        # 2. Process Buys
+        real_buy_codes = []
+        if buy_codes:
+            alloc_per_stock = current_balance / float(len(buy_codes))
+            for t in targets:
                 code = str(t.get("code") or "")
-                trades.append({"stock_code": code, "side": "buy", "status": "executed", "trade_ts": int(now_ts), "price": float(_pick_px(code, market_session)), "meta": {"source": "step", "prob": float(t.get("prob") or 0.0), "session": market_session}})
+                if code not in buy_codes: continue
+                
+                px = float(_pick_px(code, market_session))
+                if px <= 0.01: continue
+                
+                rules = _get_board_rules(code)
+                
+                # Check Limit Up
+                q = _get_quote(code)
+                if q:
+                    pc = float(q.get("prev_close") or px)
+                    if pc > 0 and px >= pc * (1.0 + rules["limit_rate"]) and abs(px - float(q.get("high") or 0.0)) < 0.01:
+                        blocked.append({"stock_code": code, "side": "buy", "price": px, "reason": "Limit Up", "min_day": 0, "execute_after_ts": 0})
+                        continue
+
+                # Check Cash & Lot Size
+                # Cost factor: 1 + 0.0002 (Fee)
+                cost_factor = 1.0002
+                try:
+                    max_total_vol = int(alloc_per_stock / (px * cost_factor))
+                except:
+                    max_total_vol = 0
+                
+                if max_total_vol < rules["min_qty"]:
+                    blocked.append({"stock_code": code, "side": "buy", "price": px, "reason": "Insufficient Cash", "min_day": 0, "execute_after_ts": 0})
+                    continue
+
+                # Quantize volume
+                remainder = max_total_vol - rules["min_qty"]
+                mid_units = remainder // rules["inc_qty"]
+                vol = rules["min_qty"] + mid_units * rules["inc_qty"]
+                
+                cost = px * vol * cost_factor
+                current_balance -= cost
+                
+                s_name = str(get_stock_name(code) or "")
+                storage.upsert_position(code, int(t.get("ts") or now_ts), px, 0, sim_id=sim_id, portfolio_id=pid, volume=vol, stock_name=s_name)
+                real_buy_codes.append(code)
+                trades.append({"stock_code": code, "side": "buy", "status": "executed", "trade_ts": int(now_ts), "price": px, "volume": vol, "meta": {"source": "step", "prob": float(t.get("prob") or 0.0), "session": market_session}})
+
+        
+        buy_codes = real_buy_codes # Update for reporting
+        storage.update_live_sim_balance(sim_id, current_balance)
         storage.add_live_trades(trades, sim_id=sim_id, portfolio_id=pid)
 
         after_pos = storage.list_positions(sim_id=sim_id, portfolio_id=pid)
+        for p in after_pos:
+            if not p.get("stock_name"):
+                p["stock_name"] = str(get_stock_name(p.get("stock_code")) or "")
         resp = {
             "ts": int(now_ts),
             "day": int(cur_day or 0),

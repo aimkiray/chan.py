@@ -195,7 +195,10 @@ class LiveSim(Base):
     sim_id = Column(String(40), primary_key=True)
     name = Column(String(120), index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    initial_capital = Column(Float, default=100000.0)
+    balance = Column(Float, default=100000.0)
 
 class LiveRun(Base):
     __tablename__ = "live_run"
@@ -250,10 +253,12 @@ class LivePosition(Base):
     sim_id = Column(String(40), index=True)
     portfolio_id = Column(Integer, index=True)
     stock_code = Column(String(20), index=True)
+    stock_name = Column(String(50))
     entry_time = Column(Integer)
     entry_day = Column(Integer, index=True)
     entry_price = Column(Float)
     bars_held = Column(Integer)
+    volume = Column(Integer, default=0)
     updated_at = Column(String(40), index=True)
 
     __table_args__ = (
@@ -375,6 +380,19 @@ class StorageManager:
                 except Exception:
                     pass
 
+                cols = conn.execute(text("PRAGMA table_info(live_sim)")).fetchall()
+                names = [c[1] for c in cols] if cols else []
+                if "initial_capital" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_sim ADD COLUMN initial_capital FLOAT DEFAULT 100000.0"))
+                    except Exception:
+                        pass
+                if "balance" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_sim ADD COLUMN balance FLOAT DEFAULT 100000.0"))
+                    except Exception:
+                        pass
+
                 cols = conn.execute(text("PRAGMA table_info(live_run)")).fetchall()
                 names = [c[1] for c in cols] if cols else []
                 if "name" not in names:
@@ -480,12 +498,25 @@ class StorageManager:
                     sim_id VARCHAR(40),
                     portfolio_id INTEGER,
                     stock_code VARCHAR(20),
+                    stock_name VARCHAR(50),
                     entry_time INTEGER,
-                    entry_day INTEGER,
                     entry_price FLOAT,
                     bars_held INTEGER,
+                    volume INTEGER,
                     updated_at VARCHAR(40)
                 )"""))
+                cols = conn.execute(text("PRAGMA table_info(live_position)")).fetchall()
+                names = [c[1] for c in cols] if cols else []
+                if "volume" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_position ADD COLUMN volume INTEGER DEFAULT 0"))
+                    except Exception:
+                        pass
+                if "stock_name" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_position ADD COLUMN stock_name VARCHAR(50)"))
+                    except Exception:
+                        pass
                 try:
                     conn.execute(text("DROP INDEX IF EXISTS idx_live_position_sim_code_unique"))
                     conn.execute(text("CREATE INDEX IF NOT EXISTS idx_live_position_sim_id ON live_position(sim_id)"))
@@ -531,21 +562,28 @@ class StorageManager:
             for r in rows or []:
                 out.append({
                     "stock_code": r.stock_code,
+                    "stock_name": r.stock_name,
                     "entry_time": int(r.entry_time or 0),
                     "entry_day": int(r.entry_day or 0),
                     "entry_price": float(r.entry_price or 0.0),
                     "bars_held": int(r.bars_held or 0),
+                    "volume": int(r.volume or 0),
                     "updated_at": str(r.updated_at or ""),
                 })
             return out
 
-    def upsert_position(self, stock_code: str, entry_time: int, entry_price: float, bars_held: int = 0, sim_id: str = None, portfolio_id: int = None):
+    def upsert_position(self, stock_code: str, entry_time: int, entry_price: float, bars_held: int = 0, sim_id: str = None, portfolio_id: int = None, volume: int = 0, stock_name: str = ""):
         now = datetime.datetime.utcnow().isoformat() + "Z"
         sid = _normalize_sim_id(sim_id)
         pid = _normalize_portfolio_id(portfolio_id)
         stock_code = str(stock_code or "").strip()
         if not stock_code:
             return
+        
+        try:
+            vol = int(volume or 0)
+        except Exception:
+            vol = 0
         try:
             entry_time = int(entry_time or 0)
         except Exception:
@@ -574,8 +612,38 @@ class StorageManager:
                 row.entry_day = int(entry_day)
             row.entry_price = float(entry_price or 0.0)
             row.bars_held = int(bars_held or 0)
+            if vol > 0:
+                row.volume = int(vol)
+            if stock_name:
+                row.stock_name = str(stock_name)
             row.updated_at = now
             session.commit()
+
+    def get_live_sim(self, sim_id: str) -> Optional[dict]:
+        sid = _normalize_sim_id(sim_id)
+        with self.Session() as session:
+            row = session.query(LiveSim).filter(LiveSim.sim_id == sid).first()
+            if not row:
+                return None
+            return {
+                "sim_id": row.sim_id,
+                "name": row.name,
+                "created_at": _dt_to_utc_iso(row.created_at),
+                "updated_at": _dt_to_utc_iso(row.updated_at),
+                "initial_capital": float(row.initial_capital or 0.0),
+                "balance": float(row.balance or 0.0),
+            }
+
+    def update_live_sim_balance(self, sim_id: str, balance: float):
+        sid = _normalize_sim_id(sim_id)
+        now = datetime.datetime.utcnow()
+        with self.Session() as session:
+            row = session.query(LiveSim).filter(LiveSim.sim_id == sid).first()
+            if row:
+                row.balance = float(balance)
+                row.updated_at = now
+                session.commit()
+
 
     def increment_bars_held(self, inc: int = 1, sim_id: str = None, portfolio_id: int = None):
         now = datetime.datetime.utcnow().isoformat() + "Z"
@@ -1090,9 +1158,10 @@ class StorageManager:
                 "stopped_at": _dt_to_utc_iso(r.stopped_at),
             }
 
-    def list_live_runs(self, status: str = None, limit: int = 200, portfolio_id: int = None) -> list:
+    def list_live_runs(self, status: str = None, limit: int = 200, portfolio_id: int = None, sim_id: str = None) -> list:
         st = str(status or "").strip().lower() or None
         pid = _normalize_portfolio_id(portfolio_id)
+        sid = _normalize_sim_id(sim_id) if sim_id is not None else None
         try:
             lim = int(limit or 200)
         except Exception:
@@ -1102,6 +1171,8 @@ class StorageManager:
             q = session.query(LiveRun)
             if pid is not None:
                 q = q.filter(LiveRun.portfolio_id == pid)
+            if sid is not None:
+                q = q.filter(LiveRun.sim_id == sid)
             if st:
                 q = q.filter(LiveRun.status == st)
             q = q.order_by(LiveRun.updated_at.desc(), LiveRun.created_at.desc())

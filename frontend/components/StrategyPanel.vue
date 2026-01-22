@@ -652,7 +652,8 @@ const runStrategy = async () => {
       chan_config: chanConfig,
       require_signal: props.chanConfig.require_signal,
       signal_lookback: props.chanConfig.signal_lookback,
-      signal_direction: props.chanConfig.signal_direction
+      signal_direction: props.chanConfig.signal_direction,
+      index_code: f.index_code
     }
     const res = await axios.post('/api/strategy/run', params)
     if (res.data.status === 'success') {

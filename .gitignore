@@ -32,3 +32,4 @@ frontend/.cache/
 frontend/.output/
 backend/model_cache/
 mlchan_deploy/
+mlchan_deploy_old/

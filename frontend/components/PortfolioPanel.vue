@@ -1,6 +1,6 @@
 <template>
-  <div class="h-full flex flex-col gap-4 p-2">
-    <div v-if="!fixedMode" class="flex items-center gap-2 border-b border-gray-200 dark:border-gray-800 pb-2">
+  <div class="h-full flex flex-col gap-4">
+    <div v-if="!fixedMode" class="flex items-center gap-2 border-b border-gray-200 dark:border-gray-800 px-4 pt-4 pb-2">
       <UButton
         size="sm"
         :variant="mode === 'portfolio' ? 'solid' : 'ghost'"
@@ -30,7 +30,7 @@
     <!-- Portfolio Mode -->
     <div v-if="mode === 'portfolio'" class="flex-1 flex gap-4 min-h-0">
       <!-- Left: List -->
-      <div class="w-1/3 flex flex-col gap-2">
+      <div class="w-1/3 flex flex-col gap-2 pl-4 py-4">
         <div class="flex justify-between items-center">
           <h3 class="font-bold text-gray-700 dark:text-gray-200">{{ t('portfolio.myPortfolios') }}</h3>
           <UButton size="xs" icon="i-heroicons-plus" @click="showCreateModal = true">{{ t('portfolio.create') }}</UButton>
@@ -52,7 +52,7 @@
       <!-- Right: Detail -->
       <div class="flex-1 flex flex-col gap-2">
         <div v-if="selectedPortfolio" class="h-full flex flex-col">
-          <div class="flex justify-between items-center mb-2">
+          <div class="flex justify-between items-center mb-2 pt-4 pr-4">
             <div>
               <h3 class="font-bold text-lg">{{ selectedPortfolio.name }}</h3>
               <div class="text-xs text-gray-500">{{ selectedPortfolio.description }}</div>
@@ -105,34 +105,38 @@
     </div>
 
     <!-- Paper Trade Mode -->
-    <div v-else-if="mode === 'paper'" class="flex-1 min-h-0 flex flex-col">
-      <UCard :ui="{ body: { base: 'flex-1 min-h-0 flex flex-col overflow-y-auto', padding: 'p-3' } }" class="flex-1 min-h-0 h-full shadow-none border border-gray-200 dark:border-gray-800 flex flex-col overflow-hidden">
-        <div v-if="stepError" class="mt-2 text-xs text-red-500 break-all">{{ stepError }}</div>
-        <div v-if="stepResult" class="mt-2 text-xs text-gray-500 break-all">
+    <div v-else-if="mode === 'paper'" class="flex-1 min-h-0 flex flex-col overflow-y-auto p-6">
+        <div v-if="stepError" class="mb-2 text-xs text-red-500 break-all">{{ stepError }}</div>
+        <div v-if="stepResult" class="mb-2 text-xs text-gray-500 break-all">
           {{ t('strategy.stepMeta', { day: stepResult.day, ts: stepResult.ts }) }} · {{ formatTs(stepResult.ts) }} · model={{ stepResult.model_key || '-' }} · rank={{ stepResult.rank_mode || '-' }} · {{ t('strategy.marketStatus') }}={{ stepResult.market_open ? t('strategy.marketOpen') : t('strategy.marketClosed') }}
         </div>
-        <div v-if="stepResult?.risk" class="mt-1 text-xs text-gray-500 break-all">
+        <div v-if="stepResult?.risk" class="mb-4 text-xs text-gray-500 break-all">
           {{ t('strategy.risk') }}={{ stepResult.risk.level || '-' }} · topN={{ stepResult.risk.effective_top_n ?? '-' }} · gap={{ stepResult.risk.gap_open_pct === null || stepResult.risk.gap_open_pct === undefined ? '-' : formatPct(stepResult.risk.gap_open_pct) }} · d1={{ stepResult.risk.ret1d === null || stepResult.risk.ret1d === undefined ? '-' : formatPct(stepResult.risk.ret1d) }} · atr={{ stepResult.risk.atr_pct === null || stepResult.risk.atr_pct === undefined ? '-' : formatPct(stepResult.risk.atr_pct) }} · in={{ stepResult.risk.intraday?.change === null || stepResult.risk.intraday?.change === undefined ? '-' : formatPct(stepResult.risk.intraday.change) }} · trend={{ stepResult.risk.intraday?.trend || '-' }}
         </div>
 
-        <div class="mt-3">
-          <UCard>
-            <div class="flex items-center justify-between gap-2">
+        <div>
+            <div class="flex items-center justify-between gap-2 mb-4">
               <div class="text-xs text-gray-500">{{ t('strategy.autoRun') }} · sim={{ activeSimId }}</div>
               <UButton size="xs" color="gray" variant="soft" :loading="runsLoading" @click="loadRuns">{{ t('strategy.refresh') }}</UButton>
             </div>
-            <div v-if="runsError" class="mt-2 text-xs text-red-500 break-all">{{ runsError }}</div>
-            <div class="mt-2 grid grid-cols-2 gap-2">
-              <UInput v-model="newRunName" size="xs" :placeholder="t('strategy.runName')" />
-              <UInput v-model="newRunOffsetSeconds" size="xs" type="number" />
+            <div v-if="runsError" class="mb-2 text-xs text-red-500 break-all">{{ runsError }}</div>
+            <div class="grid grid-cols-2 gap-4">
+              <div>
+                <label class="block text-sm font-medium mb-1">{{ t('strategy.runName') }}</label>
+                <UInput v-model="newRunName" :placeholder="t('strategy.runName')" />
+              </div>
+              <div>
+                <label class="block text-sm font-medium mb-1">{{ t('strategy.offsetSeconds') }}</label>
+                <UInput v-model="newRunOffsetSeconds" type="number" />
+              </div>
             </div>
-            <div class="mt-2 flex flex-wrap items-center gap-3">
+            <div class="mt-4 flex flex-wrap items-center gap-4">
               <UCheckbox v-model="newRunAutoResume" :label="t('strategy.autoResume')" />
               <UCheckbox v-model="newRunNotifyEnabled" :label="t('strategy.notify')" />
               <UCheckbox v-model="newRunStart" :label="t('strategy.startImmediately')" />
-              <UButton size="xs" color="primary" :loading="runsLoading" @click="createRun">{{ t('strategy.createRun') }}</UButton>
+              <UButton block color="primary" :loading="runsLoading" @click="createRun">{{ t('strategy.createRun') }}</UButton>
             </div>
-            <div class="mt-2 space-y-2">
+            <div class="mt-6 space-y-2">
               <div v-for="r in liveRuns" :key="r.run_id" class="flex items-center justify-between gap-2 text-xs border-b border-gray-100 dark:border-gray-800 pb-2">
                 <div class="min-w-0">
                   <div class="font-mono truncate">{{ r.name || r.run_id }}</div>
@@ -151,10 +155,9 @@
               </div>
               <div v-if="!liveRuns.length" class="text-xs text-gray-400">-</div>
             </div>
-          </UCard>
         </div>
 
-        <div v-if="portfolioSummary" class="mt-3 grid grid-cols-4 gap-3">
+        <div v-if="portfolioSummary" class="mt-6 grid grid-cols-4 gap-4">
           <UCard>
             <div class="text-xs text-gray-500">{{ t('strategy.totalPnlPct') }}</div>
             <div class="mt-1 font-mono text-sm">{{ formatPct(portfolioSummary.total_pnl_pct) }}</div>
@@ -173,7 +176,7 @@
           </UCard>
         </div>
 
-        <div v-if="stepResult" class="mt-3 grid grid-cols-3 gap-3">
+        <div v-if="stepResult" class="mt-6 grid grid-cols-3 gap-4">
           <UCard>
             <div class="text-xs text-gray-500">{{ t('strategy.targets') }}</div>
             <div class="mt-1 text-xs break-all">
@@ -297,187 +300,165 @@
             <div ref="equityChartContainer" class="mt-3 w-full h-72" />
           </div>
         </div>
-      </UCard>
+
     </div>
 
     <!-- Backtest Mode -->
-    <div v-else class="flex-1 flex flex-col gap-4 overflow-y-auto">
+    <div v-else class="flex-1 flex flex-col gap-4 overflow-y-auto p-6">
       <div class="flex items-center gap-2">
-        <UButton
-          size="xs"
-          :variant="backtestKind === 'vector' ? 'solid' : 'ghost'"
-          :color="backtestKind === 'vector' ? 'primary' : 'gray'"
-          @click="backtestKind = 'vector'"
-        >
-          {{ t('portfolio.simpleBacktest') }}
-        </UButton>
-        <UButton
-          size="xs"
-          :variant="backtestKind === 'wolfpack' ? 'solid' : 'ghost'"
-          :color="backtestKind === 'wolfpack' ? 'primary' : 'gray'"
-          @click="backtestKind = 'wolfpack'"
-        >
-          {{ t('portfolio.wolfpackBacktest') }}
-        </UButton>
+        <USelectMenu
+          v-model="backtestKind"
+          :options="backtestKindOptions"
+          value-attribute="value"
+          option-attribute="label"
+          class="w-64"
+        />
       </div>
 
-      <UCard v-if="backtestKind === 'vector'">
-        <template #header>
-          <div class="font-bold">{{ t('portfolio.simpleBacktest') }}</div>
-        </template>
-        <div class="grid grid-cols-2 gap-4">
-          <div>
-            <label class="block text-sm font-medium mb-1">{{ t('portfolio.startDate') }}</label>
-            <UInput type="date" v-model="backtestConfig.start_date" />
-          </div>
-          <div>
-            <label class="block text-sm font-medium mb-1">{{ t('portfolio.endDate') }}</label>
-            <UInput type="date" v-model="backtestConfig.end_date" />
-          </div>
-          <div>
-            <label class="block text-sm font-medium mb-1">{{ t('portfolio.modelKey') }}</label>
-            <UInput v-model="backtestConfig.model_key" :placeholder="t('portfolio.autoPlaceholder')" />
-          </div>
-          <div class="flex items-end">
-            <UButton block color="primary" :loading="backtestLoading" @click="runBacktest">{{ t('portfolio.runBacktest') }}</UButton>
-          </div>
+      <div v-if="backtestKind === 'vector'" class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm font-medium mb-1">{{ t('portfolio.startDate') }}</label>
+          <UInput type="date" v-model="backtestConfig.start_date" />
         </div>
-      </UCard>
-
-      <UCard v-else>
-        <template #header>
-          <div class="font-bold">{{ t('portfolio.wolfpackBacktest') }}</div>
-        </template>
-        <div class="grid grid-cols-2 gap-4">
-          <div>
-            <label class="block text-sm font-medium mb-1">{{ t('portfolio.startDate') }}</label>
-            <UInput type="date" v-model="wolfpackConfig.start_date" />
-          </div>
-          <div>
-            <label class="block text-sm font-medium mb-1">{{ t('portfolio.endDate') }}</label>
-            <UInput type="date" v-model="wolfpackConfig.end_date" />
-          </div>
-          <div>
-            <label class="block text-sm font-medium mb-1">{{ t('strategy.poolId') }}</label>
-            <UInput v-model="wolfpackConfig.pool_id" />
-          </div>
-          <div>
-            <label class="block text-sm font-medium mb-1">{{ t('app.periodSelect') }}</label>
-            <USelectMenu v-model="wolfpackConfig.frequency" :options="wolfpackFrequencyOptions" value-attribute="value" option-attribute="label" class="w-full" />
-          </div>
-          <div>
-            <label class="block text-sm font-medium mb-1">{{ t('app.dataSrc') }}</label>
-            <USelectMenu v-model="wolfpackConfig.data_src" :options="wolfpackDataSrcOptions" value-attribute="value" option-attribute="label" class="w-full" />
-          </div>
-          <div>
-            <label class="block text-sm font-medium mb-1">{{ t('sidebar.autype') }}</label>
-            <USelectMenu v-model="wolfpackConfig.autype" :options="wolfpackAutypeOptions" value-attribute="value" option-attribute="label" class="w-full" />
-          </div>
-
-          <div>
-            <label class="block text-sm font-medium mb-1">{{ t('strategy.topN') }}</label>
-            <UInput type="number" v-model="wolfpackConfig.portfolio_top_n" min="0" step="1" />
-          </div>
-          <div>
-            <label class="block text-sm font-medium mb-1">{{ t('strategy.holdingBars') }}</label>
-            <UInput type="number" v-model="wolfpackConfig.holding_period" min="1" step="1" />
-          </div>
-          <div>
-            <label class="block text-sm font-medium mb-1">{{ t('strategy.minProb') }}</label>
-            <UInput type="number" v-model="wolfpackConfig.min_prob" min="0" max="1" step="0.01" />
-          </div>
-          <div>
-            <label class="block text-sm font-medium mb-1">{{ t('strategy.tradeCost') }}</label>
-            <UInput type="number" v-model="wolfpackConfig.trade_cost" step="0.0001" />
-          </div>
-
-          <div class="flex items-center gap-4">
-            <UCheckbox v-model="wolfpackConfig.enforce_t1" :label="t('strategy.enforceT1')" />
-            <UCheckbox v-model="wolfpackConfig.index_filter_enabled" :label="t('strategy.indexFilterEnabled')" />
-          </div>
-          <div>
-            <label class="block text-sm font-medium mb-1">{{ t('strategy.stopLoss') }}</label>
-            <UInput type="number" v-model="wolfpackConfig.stop_loss" step="0.005" />
-          </div>
-
-          <div>
-            <label class="block text-sm font-medium mb-1">{{ t('strategy.indexCode') }}</label>
-            <UInput v-model="wolfpackConfig.index_code" />
-          </div>
-          <div>
-            <label class="block text-sm font-medium mb-1">{{ t('strategy.indexMaWindow') }}</label>
-            <UInput type="number" v-model="wolfpackConfig.index_ma_window" min="2" step="1" />
-          </div>
-
-          <div class="col-span-2 pt-2 border-t border-gray-100 dark:border-gray-800">
-            <div class="flex items-center justify-between">
-              <div class="text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.risk') }}</div>
-              <UCheckbox v-model="wolfpackConfig.risk_filter_enabled" :label="t('strategy.riskEnabled')" />
-            </div>
-            <div class="grid grid-cols-2 gap-2 mt-2">
-              <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.riskMode') }}</label>
-                <USelectMenu v-model="wolfpackConfig.risk_mode" :options="riskModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
-              </div>
-              <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.riskGapDownThreshold') }}</label>
-                <UInput v-model="wolfpackConfig.risk_gap_down_threshold" type="number" />
-              </div>
-              <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.riskDropThreshold') }}</label>
-                <UInput v-model="wolfpackConfig.risk_drop_threshold" type="number" />
-              </div>
-              <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.riskFlatDropThreshold') }}</label>
-                <UInput v-model="wolfpackConfig.risk_flat_drop_threshold" type="number" />
-              </div>
-              <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.riskAtrWindow') }}</label>
-                <UInput v-model="wolfpackConfig.risk_atr_window" type="number" />
-              </div>
-              <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.riskAtrPctThreshold') }}</label>
-                <UInput v-model="wolfpackConfig.risk_atr_pct_threshold" type="number" />
-              </div>
-              <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.riskFlatAtrPctThreshold') }}</label>
-                <UInput v-model="wolfpackConfig.risk_flat_atr_pct_threshold" type="number" />
-              </div>
-            </div>
-          </div>
-
-          <div class="col-span-2 flex items-end">
-            <UButton block color="primary" :loading="wolfpackLoading" @click="runWolfpackBacktest">{{ t('portfolio.runBacktest') }}</UButton>
-          </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">{{ t('portfolio.endDate') }}</label>
+          <UInput type="date" v-model="backtestConfig.end_date" />
         </div>
-      </UCard>
+        <div>
+          <label class="block text-sm font-medium mb-1">{{ t('portfolio.modelKey') }}</label>
+          <UInput v-model="backtestConfig.model_key" :placeholder="t('portfolio.autoPlaceholder')" />
+        </div>
+        <div class="col-span-2 flex items-end">
+          <UButton block color="primary" :loading="backtestLoading" @click="runBacktest">{{ t('portfolio.runBacktest') }}</UButton>
+        </div>
+      </div>
 
-      <div v-if="backtestResult" class="flex flex-col gap-4">
+      <div v-else class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm font-medium mb-1">{{ t('portfolio.startDate') }}</label>
+          <UInput type="date" v-model="wolfpackConfig.start_date" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">{{ t('portfolio.endDate') }}</label>
+          <UInput type="date" v-model="wolfpackConfig.end_date" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">{{ t('strategy.poolId') }}</label>
+          <USelectMenu v-model="wolfpackConfig.pool_id" :options="poolOptions" value-attribute="value" option-attribute="label" class="w-full" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">{{ t('app.periodSelect') }}</label>
+          <USelectMenu v-model="wolfpackConfig.frequency" :options="wolfpackFrequencyOptions" value-attribute="value" option-attribute="label" class="w-full" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">{{ t('app.dataSrc') }}</label>
+          <USelectMenu v-model="wolfpackConfig.data_src" :options="wolfpackDataSrcOptions" value-attribute="value" option-attribute="label" class="w-full" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">{{ t('sidebar.autype') }}</label>
+          <USelectMenu v-model="wolfpackConfig.autype" :options="wolfpackAutypeOptions" value-attribute="value" option-attribute="label" class="w-full" />
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium mb-1">{{ t('strategy.topN') }}</label>
+          <UInput type="number" v-model="wolfpackConfig.portfolio_top_n" min="0" step="1" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">{{ t('strategy.holdingBars') }}</label>
+          <UInput type="number" v-model="wolfpackConfig.holding_period" min="1" step="1" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">{{ t('strategy.minProb') }}</label>
+          <UInput type="number" v-model="wolfpackConfig.min_prob" min="0" max="1" step="0.01" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">{{ t('strategy.tradeCost') }}</label>
+          <UInput type="number" v-model="wolfpackConfig.trade_cost" step="0.0001" />
+        </div>
+
+        <div class="flex items-center gap-4">
+          <UCheckbox v-model="wolfpackConfig.enforce_t1" :label="t('strategy.enforceT1')" />
+          <UCheckbox v-model="wolfpackConfig.index_filter_enabled" :label="t('strategy.indexFilterEnabled')" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">{{ t('strategy.stopLoss') }}</label>
+          <UInput type="number" v-model="wolfpackConfig.stop_loss" step="0.005" />
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium mb-1">{{ t('strategy.indexCode') }}</label>
+          <USelectMenu v-model="wolfpackConfig.index_code" :options="indexOptions" value-attribute="value" option-attribute="label" class="w-full" :searchable="true" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">{{ t('strategy.indexMaWindow') }}</label>
+          <UInput type="number" v-model="wolfpackConfig.index_ma_window" min="2" step="1" />
+        </div>
+
+        <div class="col-span-2 pt-2 border-t border-gray-100 dark:border-gray-800 flex items-center justify-between">
+          <div class="text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.risk') }}</div>
+          <UCheckbox v-model="wolfpackConfig.risk_filter_enabled" :label="t('strategy.riskEnabled')" />
+        </div>
+
+        <div>
+           <label class="text-xs text-gray-500">{{ t('strategy.riskMode') }}</label>
+           <USelectMenu v-model="wolfpackConfig.risk_mode" :options="riskModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
+        </div>
+        <div>
+           <label class="text-xs text-gray-500">{{ t('strategy.riskGapDownThreshold') }}</label>
+           <UInput v-model="wolfpackConfig.risk_gap_down_threshold" type="number" />
+        </div>
+        <div>
+           <label class="text-xs text-gray-500">{{ t('strategy.riskDropThreshold') }}</label>
+           <UInput v-model="wolfpackConfig.risk_drop_threshold" type="number" />
+        </div>
+        <div>
+           <label class="text-xs text-gray-500">{{ t('strategy.riskFlatDropThreshold') }}</label>
+           <UInput v-model="wolfpackConfig.risk_flat_drop_threshold" type="number" />
+        </div>
+        <div>
+           <label class="text-xs text-gray-500">{{ t('strategy.riskAtrWindow') }}</label>
+           <UInput v-model="wolfpackConfig.risk_atr_window" type="number" />
+        </div>
+        <div>
+           <label class="text-xs text-gray-500">{{ t('strategy.riskAtrPctThreshold') }}</label>
+           <UInput v-model="wolfpackConfig.risk_atr_pct_threshold" type="number" />
+        </div>
+        <div>
+           <label class="text-xs text-gray-500">{{ t('strategy.riskFlatAtrPctThreshold') }}</label>
+           <UInput v-model="wolfpackConfig.risk_flat_atr_pct_threshold" type="number" />
+        </div>
+
+        <div class="col-span-2 flex items-end">
+          <UButton block color="primary" :loading="wolfpackLoading" @click="runWolfpackBacktest">{{ t('portfolio.runBacktest') }}</UButton>
+        </div>
+      </div>
+
+      <div v-if="currentBacktestResult" class="flex flex-col gap-6 mt-6">
         <div class="grid grid-cols-4 gap-4">
           <UCard>
             <div class="text-xs text-gray-500">{{ t('portfolio.totalReturn') }}</div>
-            <div class="text-xl font-bold" :class="getColor(backtestResult.metrics.total_return)">
-              {{ (backtestResult.metrics.total_return * 100).toFixed(2) }}%
+            <div class="text-xl font-bold" :class="getColor(currentBacktestResult.metrics.total_return)">
+              {{ (currentBacktestResult.metrics.total_return * 100).toFixed(2) }}%
             </div>
           </UCard>
           <UCard>
             <div class="text-xs text-gray-500">{{ t('portfolio.sharpe') }}</div>
-            <div class="text-xl font-bold">{{ backtestResult.metrics.sharpe_ratio.toFixed(2) }}</div>
+            <div class="text-xl font-bold">{{ currentBacktestResult.metrics.sharpe_ratio.toFixed(2) }}</div>
           </UCard>
           <UCard>
             <div class="text-xs text-gray-500">{{ t('portfolio.maxDD') }}</div>
-            <div class="text-xl font-bold text-red-500">{{ (backtestResult.metrics.max_drawdown * 100).toFixed(2) }}%</div>
+            <div class="text-xl font-bold text-red-500">{{ (currentBacktestResult.metrics.max_drawdown * 100).toFixed(2) }}%</div>
           </UCard>
           <UCard>
             <div class="text-xs text-gray-500">{{ t('portfolio.finalEquity') }}</div>
-            <div class="text-xl font-bold">{{ backtestResult.metrics.final_equity.toFixed(2) }}</div>
+            <div class="text-xl font-bold">{{ currentBacktestResult.metrics.final_equity.toFixed(2) }}</div>
           </UCard>
         </div>
 
         <!-- Simple Chart Placeholder -->
         <UCard>
            <template #header>{{ t('portfolio.equityCurve') }}</template>
-           <div class="h-[300px] w-full" ref="chartContainer"></div>
+           <div class="h-[300px]" style="width: 100%; min-width: 0;" ref="chartContainer"></div>
         </UCard>
       </div>
     </div>
@@ -593,14 +574,20 @@ const showAddPosModal = ref(false)
 const newPosition = ref({ code: '', name: '', volume: 0, price: 0 })
 
 // Backtest
-const backtestKind = ref('vector')
+const backtestKind = ref('wolfpack')
 const backtestConfig = ref({
   start_date: defaultStartDate,
   end_date: defaultEndDate,
   model_key: ''
 })
 const backtestLoading = ref(false)
-const backtestResult = ref(null)
+const vectorBacktestResult = ref(null)
+const wolfpackBacktestResult = ref(null)
+
+const currentBacktestResult = computed(() => {
+  return backtestKind.value === 'vector' ? vectorBacktestResult.value : wolfpackBacktestResult.value
+})
+
 const chartContainer = ref(null)
 const equityChartContainer = ref(null)
 let chartInstance = null
@@ -612,7 +599,7 @@ const wolfpackConfig = ref({
   start_date: defaultStartDate,
   end_date: defaultEndDate,
   frequency: '30m',
-  data_src: 'akshare',
+  data_src: 'clickhouse',
   autype: 'qfq',
   enable_rolling_lookback: true,
   holding_period: 3,
@@ -620,7 +607,7 @@ const wolfpackConfig = ref({
   trade_cost: 0.0002,
   portfolio_top_n: 2,
   index_filter_enabled: true,
-  index_code: '399006',
+  index_code: 'sh000001',
   index_ma_window: 20,
   stop_loss: -0.03,
   enforce_t1: true,
@@ -664,6 +651,40 @@ const riskModeOptions = computed(() => ([
   { label: t('strategy.riskModeDrop'), value: 'drop' },
   { label: t('strategy.riskModeAtr'), value: 'atr' },
   { label: t('strategy.riskModeBoth'), value: 'both' }
+]))
+
+const poolOptions = ref([{ label: '创业板50 (50)', value: 'index:IDX399673' }])
+const indexOptions = ref([])
+
+onMounted(async () => {
+    fetchPortfolios()
+    
+    // Fetch Indices
+    try {
+        const res = await axios.get('/api/indices?limit=5000')
+        if (res.data && res.data.items) {
+            indexOptions.value = res.data.items.map(c => {
+                const code = typeof c === 'string' ? c : (c.code || '')
+                const name = typeof c === 'string' ? c : (c.name || code)
+                return { label: `${name} (${code})`, value: code, name: name }
+            })
+            // Default check
+            if (wolfpackConfig.value.index_code && !indexOptions.value.find(x => x.value === wolfpackConfig.value.index_code)) {
+               // keep existing or set default? Keep existing for now.
+            } else if (!wolfpackConfig.value.index_code && indexOptions.value.length > 0) {
+               if (indexOptions.value.find(x => x.value === 'sh000001')) {
+                   wolfpackConfig.value.index_code = 'sh000001'
+               }
+            }
+        }
+    } catch (e) {
+        // ignore
+    }
+})
+
+const backtestKindOptions = computed(() => ([
+  { label: t('portfolio.wolfpackBacktest'), value: 'wolfpack' },
+  { label: t('portfolio.simpleBacktest'), value: 'vector' }
 ]))
 
 const paperInitialized = ref(false)
@@ -778,6 +799,7 @@ const tradeTotalPages = computed(() => {
 
 const positionColumns = computed(() => ([
   { key: 'stock_code', label: t('sidebar.stockCode') },
+  { key: 'stock_name', label: t('portfolio.stockName') },
   { key: 'bars_held', label: t('strategy.barsHeld') },
   { key: 'entry_time_text', label: t('strategy.entryTime') },
   { key: 'entry_price_text', label: t('strategy.entryPrice') },
@@ -816,14 +838,16 @@ const formatTs = (ts) => {
   if (!Number.isFinite(n) || n <= 0) return '-'
   try {
     const dt = new Date(n * 1000)
-    return new Intl.DateTimeFormat(undefined, {
+    return new Intl.DateTimeFormat('zh-CN', {
       year: 'numeric',
       month: '2-digit',
       day: '2-digit',
       hour: '2-digit',
       minute: '2-digit',
-      second: '2-digit'
-    }).format(dt)
+      second: '2-digit',
+      hour12: false,
+      timeZone: 'Asia/Shanghai'
+    }).format(dt).replace(/\//g, '-')
   } catch (e) {
     return String(ts)
   }
@@ -967,7 +991,7 @@ const runBacktest = async () => {
         alert(res.data.error)
         return
     }
-    backtestResult.value = res.data
+    vectorBacktestResult.value = res.data
     nextTick(() => {
         renderChart()
     })
@@ -995,7 +1019,7 @@ const runWolfpackBacktest = async () => {
       equity: Number(x?.equity ?? 0)
     }))
     const lastEquity = curve.length ? Number(curve[curve.length - 1]?.equity) : 1
-    backtestResult.value = {
+    wolfpackBacktestResult.value = {
       metrics: {
         total_return: Number(pf.total_return ?? (lastEquity - 1)),
         sharpe_ratio: Number(pf.sharpe ?? 0),
@@ -1329,10 +1353,18 @@ const loadEquity = async () => {
   }
 }
 
-const renderEquityChart = () => {
+const renderEquityChart = (retry = 0) => {
   if (mode.value !== 'paper') return
   const el = equityChartContainer.value
   if (!el) return
+
+  // Check dimensions to prevent ECharts init error
+  if (el.clientWidth === 0 || el.clientHeight === 0) {
+     if (retry < 3) {
+        setTimeout(() => renderEquityChart(retry + 1), 100)
+     }
+     return
+  }
 
   const points = Array.isArray(equityPoints.value) ? equityPoints.value : []
   const xs = []
@@ -1405,12 +1437,19 @@ const renderEquityChart = () => {
   equityChartInstance.setOption(option, { notMerge: true })
 }
 
-const renderChart = () => {
-    if (!chartContainer.value || !backtestResult.value) return
+const renderChart = (retry = 0) => {
+    if (!chartContainer.value || !currentBacktestResult.value) return
+    if (chartContainer.value.clientWidth === 0 || chartContainer.value.clientHeight === 0) {
+      if (retry < 3) {
+         setTimeout(() => renderChart(retry + 1), 100)
+      }
+      return
+    }
+
     if (chartInstance) chartInstance.dispose()
     
     chartInstance = echarts.init(chartContainer.value)
-    const curve = backtestResult.value.equity_curve
+    const curve = currentBacktestResult.value.equity_curve
     
     const option = {
         tooltip: { trigger: 'axis' },
@@ -1458,6 +1497,18 @@ defineExpose({
 
 onMounted(() => {
   fetchPortfolios()
+  // Fetch stock pool options
+  axios.get('/api/stock_pools').then(res => {
+    if (res.data && res.data.items) {
+      poolOptions.value = res.data.items.map(p => ({
+        label: `${p.pool_name} (${p.stock_count})`,
+        value: p.pool_id
+      }))
+      if (!poolOptions.value.find(x => x.value === 'index:IDX399673')) {
+        poolOptions.value.unshift({ label: '创业板50 (50)', value: 'index:IDX399673' })
+      }
+    }
+  }).catch(() => {})
   if (typeof window !== 'undefined') {
     window.addEventListener('resize', handleResize, { passive: true })
   }

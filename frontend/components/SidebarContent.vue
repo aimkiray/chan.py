@@ -495,6 +495,13 @@
           <USelectMenu v-model="proxyPaperConfig.frequency" :options="paperFrequencyOptions" value-attribute="value" option-attribute="label" class="w-full" />
         </div>
 
+        <div>
+          <div class="flex items-center gap-1 mb-2">
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.initialCapital') }}</label>
+          </div>
+          <UInput type="number" v-model="proxyPaperConfig.initial_capital" class="w-full" />
+        </div>
+
         <div class="pt-2">
           <UButton
             size="xs"
@@ -549,6 +556,10 @@
               <div>
                 <label class="text-xs text-gray-500">{{ t('strategy.riskMode') }}</label>
                 <USelectMenu v-model="proxyPaperParams.risk_mode" :options="riskModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
+              </div>
+              <div>
+                 <label class="text-xs text-gray-500">{{ t('strategy.riskIndexCode') }}</label>
+                 <USelectMenu v-model="proxyPaperParams.risk_index_code" :options="indexOptions" value-attribute="value" option-attribute="label" class="w-full" :searchable="true" />
               </div>
               <div>
                 <label class="text-xs text-gray-500">{{ t('strategy.riskGapDownThreshold') }}</label>
@@ -606,6 +617,14 @@
               <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.scope') }}</label>
             </div>
             <USelectMenu v-model="proxyStrategyForm.pool_id" :options="poolOptions" value-attribute="value" option-attribute="label" class="w-full" />
+          </div>
+
+          <!-- Index Code -->
+          <div>
+             <div class="flex items-center gap-1 mb-2">
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.indexCode') }}</label>
+             </div>
+             <USelectMenu v-model="proxyStrategyForm.index_code" :options="indexOptions" value-attribute="value" option-attribute="label" class="w-full" :searchable="true" />
           </div>
 
           <!-- Model -->
@@ -1100,6 +1119,8 @@ const poolOptions = ref([{label: 'HS300', value: 'hs300'}])
 const poolMembersLoading = ref(false)
 const poolMetaLabel = ref('')
 
+const indexOptions = ref([])
+
 const frequencyOptions = computed(() => [
   { label: t('periods.1d'), value: '1d' },
   { label: t('periods.1w'), value: '1w' },
@@ -1164,11 +1185,11 @@ const fillCodesFromPool = async () => {
 }
 
 onMounted(async () => {
+    // We can fetch pools here too if we want dynamic list
+    // But for now let's keep it simple.
+    // If StrategyPanel fetches it, maybe app.vue should fetch and pass down?
+    // Let's self-fetch for independence
     try {
-        // We can fetch pools here too if we want dynamic list
-        // But for now let's keep it simple.
-        // If StrategyPanel fetches it, maybe app.vue should fetch and pass down?
-        // Let's self-fetch for independence
         const res = await axios.get('/api/stock_pools')
         if (res.data && res.data.items) {
             poolOptions.value = res.data.items.map(p => ({
@@ -1185,6 +1206,29 @@ onMounted(async () => {
             }
             if (!proxyPaperConfig.value?.pool_id) {
               proxyPaperConfig.value.pool_id = poolOptions.value.find(x => x.value === 'index:IDX399673')?.value || poolOptions.value[0].value
+            }
+        }
+    } catch (e) {
+        // ignore
+    }
+
+    try {
+        const res = await axios.get('/api/indices?limit=5000')
+        if (res.data && res.data.items) {
+            indexOptions.value = res.data.items.map(c => {
+                const code = typeof c === 'string' ? c : (c.code || '')
+                const name = typeof c === 'string' ? c : (c.name || code)
+                return { label: `${name} (${code})`, value: code, name: name }
+            })
+            // Set default if not set
+            if (!proxyStrategyForm.value.index_code && indexOptions.value.length > 0) {
+               // Default to 000001 (Shanghai Composite) if exists
+                const def = indexOptions.value.find(x => x.value === '000001' || x.value === 'sh000001')
+                if (def) {
+                    proxyStrategyForm.value.index_code = def.value
+                } else {
+                    proxyStrategyForm.value.index_code = 'sh000001'
+                }
             }
         }
     } catch (e) {

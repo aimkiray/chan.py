@@ -166,7 +166,7 @@ def _load_index_filter_day_set(
     code = normalize_code(str(index_code or "399006"))
     if str(code).endswith("399006") and (not (code.startswith("sz.") or code.startswith("sh."))):
         code = "sz.399006"
-    kl_list = fetch_stock_data(code, KL_TYPE.K_DAY, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
+    kl_list = fetch_stock_data(code, KL_TYPE.K_DAY, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE), asset_type="INDEX")
     if (not kl_list) or len(kl_list) < mw + 5:
         alt_src = None
         if data_src in (DATA_SRC.AK_SHARE, DATA_SRC.BAO_STOCK):
@@ -176,7 +176,7 @@ def _load_index_filter_day_set(
                 alt_src = DATA_SRC.AK_SHARE
         if alt_src is not None:
             try:
-                kl_list = fetch_stock_data(code, KL_TYPE.K_DAY, start_date, end_date, alt_src, autype=autype, use_online_latest=True)
+                kl_list = fetch_stock_data(code, KL_TYPE.K_DAY, start_date, end_date, alt_src, autype=autype, use_online_latest=True, asset_type="INDEX")
             except Exception:
                 kl_list = None
     if not kl_list or len(kl_list) < mw + 5:
@@ -244,9 +244,9 @@ def _load_index_risk_day_map(
     code = normalize_code(str(index_code or "399006"))
     if str(code).endswith("399006") and (not (code.startswith("sz.") or code.startswith("sh."))):
         code = "sz.399006"
-    kl_list = fetch_stock_data(code, KL_TYPE.K_DAY, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
+    kl_list = fetch_stock_data(code, KL_TYPE.K_DAY, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE), asset_type="INDEX")
     if not kl_list:
-        kl_list = fetch_stock_data(code, KL_TYPE.K_30M, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
+        kl_list = fetch_stock_data(code, KL_TYPE.K_30M, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE), asset_type="INDEX")
     if not kl_list:
         return None
 
@@ -369,9 +369,9 @@ def _load_index_daily_ohlc(
     code = normalize_code(str(index_code or "399006"))
     if str(code).endswith("399006") and (not (code.startswith("sz.") or code.startswith("sh."))):
         code = "sz.399006"
-    kl_list = fetch_stock_data(code, KL_TYPE.K_DAY, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
+    kl_list = fetch_stock_data(code, KL_TYPE.K_DAY, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE), asset_type="INDEX")
     if not kl_list:
-        kl_list = fetch_stock_data(code, KL_TYPE.K_30M, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
+        kl_list = fetch_stock_data(code, KL_TYPE.K_30M, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE), asset_type="INDEX")
     if not kl_list:
         return []
 
@@ -434,7 +434,7 @@ def _load_index_intraday_close_series(
     code = normalize_code(str(index_code or "399006"))
     if str(code).endswith("399006") and (not (code.startswith("sz.") or code.startswith("sh."))):
         code = "sz.399006"
-    kl_list = fetch_stock_data(code, KL_TYPE.K_30M, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
+    kl_list = fetch_stock_data(code, KL_TYPE.K_30M, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE), asset_type="INDEX")
     out = []
     for k in (kl_list or []):
         try:
@@ -702,6 +702,13 @@ def _calc_code_candidates(
     if isinstance(acc, dict):
         preds = list(acc.get("predictions") or [])
 
+    kl_idx_map = {}
+    for i, k in enumerate(kl_list or []):
+        try:
+             kl_idx_map[int(getattr(getattr(k, "time", None), "ts", 0) or 0)] = i
+        except:
+             pass
+
     best = {}
     for r in preds:
         if not isinstance(r, dict):
@@ -720,6 +727,30 @@ def _calc_code_candidates(
             ts = 0
         if ts <= 0:
             continue
+
+        # Check Limit Up
+        idx = kl_idx_map.get(ts)
+        if idx is not None and idx > 0:
+             k = kl_list[idx]
+             try:
+                 c_px = float(getattr(k, "close", 0.0) or 0.0)
+                 h_px = float(getattr(k, "high", 0.0) or 0.0)
+                 prev = kl_list[idx-1]
+                 p_px = float(getattr(prev, "close", 0.0) or c_px)
+                 limit_rate = 0.095
+                 s_code = code.split(".")[-1] if "." in code else code
+                 if s_code.startswith("300") or s_code.startswith("688"):
+                     limit_rate = 0.195
+                 elif s_code.startswith("8") or s_code.startswith("4") or s_code.startswith("92"):
+                     limit_rate = 0.295
+                     
+                 if p_px > 0 and c_px >= p_px * (1.0 + limit_rate) and abs(c_px - h_px) < 0.01:
+                     # Block Limit Up Buy
+                     continue
+             except:
+                 pass
+
+
         dk = _day_key_from_ts(ts)
         if dk is None:
             continue
@@ -913,7 +944,7 @@ class WolfpackBacktester:
                     "daily_low_by_day": {},
                     "get_index_close_at_ts": None,
                 }
-        with concurrent.futures.ThreadPoolExecutor(max_workers=mw) as executor:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=mw) as executor:
             futures = {
                 executor.submit(
                     _calc_code_candidates,

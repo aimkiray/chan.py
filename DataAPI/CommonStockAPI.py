@@ -5,7 +5,7 @@ from KLine.KLine_Unit import CKLine_Unit
 
 
 class CCommonStockApi:
-    def __init__(self, code, k_type, begin_date, end_date, autype):
+    def __init__(self, code, k_type, begin_date, end_date, autype, asset_type="STOCK"):
         self.code = code
         self.name = None
         self.is_stock = None
@@ -13,6 +13,7 @@ class CCommonStockApi:
         self.begin_date = begin_date
         self.end_date = end_date
         self.autype = autype
+        self.asset_type = asset_type
         self.warnings = []  # List to store warnings during data fetching
         self.SetBasciInfo()
 

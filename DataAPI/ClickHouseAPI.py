@@ -36,8 +36,8 @@ class CClickHouseAPI(CCommonStockApi):
     _table_exists_cache = {}
     _min_daily_date_cache = {}
 
-    def __init__(self, code, k_type, begin_date, end_date, autype):
-        super(CClickHouseAPI, self).__init__(code, k_type, begin_date, end_date, autype)
+    def __init__(self, code, k_type, begin_date, end_date, autype, asset_type="STOCK"):
+        super(CClickHouseAPI, self).__init__(code, k_type, begin_date, end_date, autype, asset_type)
 
     @classmethod
     def do_init(cls):
@@ -947,15 +947,17 @@ class CClickHouseAPI(CCommonStockApi):
             print("ClickHouse client not initialized")
             return []
 
+        prefix = "index_" if self.asset_type == "INDEX" else "stock_"
+
         table_map = {
-            KL_TYPE.K_1M: "stock_1min",
-            KL_TYPE.K_5M: "stock_5min",
-            KL_TYPE.K_15M: "stock_15min",
-            KL_TYPE.K_30M: "stock_30min",
-            KL_TYPE.K_60M: "stock_60min",
-            KL_TYPE.K_DAY: "stock_daily",
-            KL_TYPE.K_WEEK: "stock_weekly",
-            KL_TYPE.K_MON: "stock_monthly",
+            KL_TYPE.K_1M: f"{prefix}1min",
+            KL_TYPE.K_5M: f"{prefix}5min",
+            KL_TYPE.K_15M: f"{prefix}15min",
+            KL_TYPE.K_30M: f"{prefix}30min",
+            KL_TYPE.K_60M: f"{prefix}60min",
+            KL_TYPE.K_DAY: f"{prefix}daily",
+            KL_TYPE.K_WEEK: f"{prefix}weekly",
+            KL_TYPE.K_MON: f"{prefix}monthly",
         }
 
         need_aggregate = False
@@ -1002,6 +1004,8 @@ class CClickHouseAPI(CCommonStockApi):
         )
         
         # Normalize code: remove dot for ClickHouse query
+        # For indices, we might need to be careful. 
+        # But previous code used normalized_code for index too (sz.399006 -> sz399006)
         normalized_code = self.code.lower().replace(".", "")
         
         begin_date = self.begin_date if self.begin_date else "1990-01-01"
@@ -1035,6 +1039,7 @@ class CClickHouseAPI(CCommonStockApi):
                 return None
 
         rows = run_query(table)
+        
         if rows is None:
             return []
 
@@ -1193,3 +1198,55 @@ class CClickHouseAPI(CCommonStockApi):
         except Exception as e:
             print(f"SetBasciInfo failed: {e}")
             self.name = self.code
+
+    @classmethod
+    def list_indices(cls, limit: int = 2000):
+        client = cls.get_client()
+        if not client:
+            return []
+        
+        if not cls._table_exists("index_daily"):
+            return []
+            
+        cols = cls._get_table_columns("index_daily")
+        col_set = set([c.lower() for c in cols])
+        
+        code_col_name = "code"
+        if "ts_code" in col_set: code_col_name = "ts_code"
+        elif "symbol" in col_set: code_col_name = "symbol"
+        elif "code" in col_set: code_col_name = "code"
+        
+        # We need to get distinct codes from index_daily, then try to get names from index_info
+        # If index_info exists, join or separate query. 
+        # For simplicity and ClickHouse optimization:
+        # Get codes first, then names? Or LEFT JOIN. 
+        # Let's try LEFT JOIN if index_info exists.
+        
+        has_info = cls._table_exists("index_info")
+        
+        try:
+            if has_info:
+                query = f"""
+                    SELECT DISTINCT a.{code_col_name} as code, b.name 
+                    FROM index_daily a
+                    LEFT JOIN index_info b ON a.{code_col_name} = b.code
+                    LIMIT %(limit)s
+                """
+                rows = client.execute(query, {"limit": limit})
+                result = []
+                for r in rows:
+                    c = str(r[0])
+                    n = str(r[1]) if r[1] else c
+                    result.append({"code": c, "name": n})
+                return result
+            else:
+                query = f"""
+                    SELECT DISTINCT {code_col_name} as code 
+                    FROM index_daily 
+                    LIMIT %(limit)s
+                """
+                rows = client.execute(query, {"limit": limit})
+                return [{"code": str(r[0]), "name": str(r[0])} for r in rows]
+        except Exception as e:
+            print(f"List indices failed: {e}")
+            return []

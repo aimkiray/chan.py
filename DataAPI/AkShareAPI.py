@@ -31,8 +31,8 @@ def parse_time_column(inp):
         raise Exception(f"unknown time column from akshare:{inp}")
 
 class CAkShare(CCommonStockApi):
-    def __init__(self, code, k_type=KL_TYPE.K_DAY, begin_date=None, end_date=None, autype=AUTYPE.QFQ):
-        super(CAkShare, self).__init__(code, k_type, begin_date, end_date, autype)
+    def __init__(self, code, k_type=KL_TYPE.K_DAY, begin_date=None, end_date=None, autype=AUTYPE.QFQ, asset_type="STOCK"):
+        super(CAkShare, self).__init__(code, k_type, begin_date, end_date, autype, asset_type)
 
     def get_kl_data(self):
         # AkShare uses 6-digit code. Need to strip sh/sz prefix if present

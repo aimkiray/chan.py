@@ -327,21 +327,21 @@
 
           <!-- My Portfolios Tab -->
           <div v-show="activeTab === 'portfolios'" class="h-full w-full flex flex-col lg:overflow-hidden">
-             <div class="lg:h-full lg:overflow-hidden p-2 box-border bg-white dark:bg-gray-900 flex-1">
+             <div class="lg:h-full lg:overflow-hidden flex-1 box-border bg-white dark:bg-gray-900">
                <PortfolioPanel ref="portfoliosPanelRef" fixed-mode="portfolio" />
              </div>
           </div>
 
           <!-- Backtest Tab -->
           <div v-show="activeTab === 'backtest'" class="h-full w-full flex flex-col lg:overflow-hidden">
-             <div class="lg:h-full lg:overflow-hidden p-2 box-border bg-white dark:bg-gray-900 flex-1">
+             <div class="lg:h-full lg:overflow-hidden flex-1 box-border bg-white dark:bg-gray-900">
                <PortfolioPanel ref="backtestPanelRef" fixed-mode="backtest" />
              </div>
           </div>
 
           <!-- Paper Trade Tab -->
           <div v-show="activeTab === 'paper'" class="h-full w-full flex flex-col lg:overflow-hidden">
-             <div class="lg:h-full lg:overflow-hidden p-2 box-border bg-white dark:bg-gray-900 flex-1">
+             <div class="lg:h-full lg:overflow-hidden flex-1 box-border bg-white dark:bg-gray-900">
                <PortfolioPanel
                  ref="paperPanelRef"
                  fixed-mode="paper"
@@ -483,7 +483,8 @@ const paperConfig = ref({
   pool_id: 'index:IDX399673',
   data_src: 'akshare',
   autype: 'qfq',
-  frequency: '30m'
+  frequency: '30m',
+  initial_capital: 100000
 })
 const paperParams = ref({
   lookback_days: 365 * 5,
