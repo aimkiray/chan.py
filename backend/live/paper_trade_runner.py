@@ -124,6 +124,11 @@ def main():
     ap.add_argument("--risk_trend_ma_window", type=int, default=20)
     ap.add_argument("--risk_data_fail_mode", type=str, default="reduce")
     ap.add_argument("--risk_intraday_data_fail_mode", type=str, default="reduce")
+    ap.add_argument("--sell_mode", type=str, default="baseline")
+    ap.add_argument("--t1_decision_time", type=str, default="10:00")
+    ap.add_argument("--t1_gap_strong_threshold", type=float, default=0.03)
+    ap.add_argument("--t1_gap_weak_threshold", type=float, default=-0.02)
+    ap.add_argument("--t1_gap_very_strong_threshold", type=float, default=0.05)
 
     args = ap.parse_args()
 
@@ -168,6 +173,11 @@ def main():
                 "risk_trend_ma_window": int(args.risk_trend_ma_window),
                 "risk_data_fail_mode": str(args.risk_data_fail_mode),
                 "risk_intraday_data_fail_mode": str(args.risk_intraday_data_fail_mode),
+                "sell_mode": str(args.sell_mode),
+                "t1_decision_time": str(args.t1_decision_time),
+                "t1_gap_strong_threshold": float(args.t1_gap_strong_threshold),
+                "t1_gap_weak_threshold": float(args.t1_gap_weak_threshold),
+                "t1_gap_very_strong_threshold": float(args.t1_gap_very_strong_threshold),
             }
 
             url = str(args.api_base).rstrip("/") + str(args.endpoint)

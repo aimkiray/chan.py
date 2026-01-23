@@ -87,6 +87,7 @@
           v-model:pretrainConfig="pretrainConfig"
           :activeTab="activeTab"
           :loading="loading"
+          :backtestLoading="backtestPanelRef?.wolfpackLoading?.value || false"
           :dataLengthMin="dataLengthMin"
           :dataLengthMax="dataLengthMax"
           :dataLengthStep="dataLengthStep"
@@ -97,8 +98,7 @@
           @runStrategy="strategyPanelRef.runStrategy()"
           @runPretrain="pretrainPanelRef.runPretrain()"
           @runPaperStep="paperPanelRef.runPaperStep()"
-          @refreshPaperPositions="paperPanelRef.loadPositions()"
-          @resetPaperPositions="paperPanelRef.resetPositions()"
+          @runBacktest="backtestPanelRef.runBacktest()"
           @refresh="analyze(false, false, true)"
             @toggle="handleManualClose"
             @refreshPretrained="fetchIntradayPretrainedModels"
@@ -175,6 +175,7 @@
             v-model:pretrainConfig="pretrainConfig"
             :activeTab="activeTab"
             :loading="loading"
+            :backtestLoading="backtestPanelRef?.wolfpackLoading?.value || false"
             :dataLengthMin="dataLengthMin"
             :dataLengthMax="dataLengthMax"
             :dataLengthStep="dataLengthStep"
@@ -186,8 +187,7 @@
             @runStrategy="strategyPanelRef.runStrategy()"
             @runPretrain="pretrainPanelRef.runPretrain()"
             @runPaperStep="paperPanelRef.runPaperStep(); mobileSidebarCollapsed = true"
-            @refreshPaperPositions="paperPanelRef.loadPositions(); mobileSidebarCollapsed = true"
-            @resetPaperPositions="paperPanelRef.resetPositions(); mobileSidebarCollapsed = true"
+            @runBacktest="backtestPanelRef.runBacktest(); mobileSidebarCollapsed = true"
             @refresh="analyze(false, false, true); mobileSidebarCollapsed = true"
             @toggle="mobileSidebarCollapsed = !mobileSidebarCollapsed"
             @refreshPretrained="fetchIntradayPretrainedModels"
@@ -351,7 +351,15 @@
           <!-- Backtest Tab -->
           <div v-show="activeTab === 'backtest'" class="h-full w-full flex flex-col lg:overflow-hidden">
              <div class="lg:h-full lg:overflow-hidden flex-1 box-border bg-white dark:bg-gray-900">
-               <PortfolioPanel ref="backtestPanelRef" fixed-mode="backtest" />
+               <PortfolioPanel
+                 ref="backtestPanelRef"
+                 fixed-mode="backtest"
+                 :paperConfig="paperConfig"
+                 :paperParams="paperParams"
+                 @selectSimId="handleSelectSimId"
+                 @applyRunParams="handleApplyRunParams"
+                 @openPaper="handleOpenPaper"
+               />
              </div>
           </div>
 
@@ -400,8 +408,8 @@ const toast = useToast()
 const tabs = computed(() => [
   { name: 'analysis', label: t('app.stockAnalysis'), icon: MemoryChartBar },
   { name: 'intraday', label: t('app.intradayAnalysis'), icon: MemoryClock },
-  { name: 'paper', label: t('strategy.paperTrade'), icon: MemoryBriefcase },
   { name: 'backtest', label: t('portfolio.backtest'), icon: MemoryBriefcase },
+  { name: 'paper', label: t('strategy.paperTrade'), icon: MemoryBriefcase },
   { name: 'portfolios', label: t('portfolio.myPortfolios'), icon: MemoryBriefcase },
   { name: 'pretrain', label: t('app.pretrain'), icon: MemoryChartBar },
   { name: 'strategy', label: t('app.strategy'), icon: MemoryFilter },
@@ -523,10 +531,21 @@ const paperParams = ref({
   min_prob: 0.25,
   holding_period: 3,
   trade_cost: 0.0002,
+  walk_forward_max_folds: 25,
+  sell_mode: 'baseline',
+  t1_decision_time: '10:00',
+  t1_gap_strong_threshold: 0.03,
+  t1_gap_weak_threshold: -0.02,
+  t1_gap_very_strong_threshold: 0.05,
   limit: 0,
+  use_latest_available_day: true,
   pretrained_model_key: '',
+  rank_mode: 'cross_section',
+  rolling_sample_mode: 'every_bar',
+  rolling_stride: 1,
   risk_filter_enabled: true,
   risk_mode: 'both',
+  risk_index_code: '399006',
   risk_drop_threshold: -0.03,
   risk_flat_drop_threshold: -0.05,
   risk_gap_down_threshold: -0.015,
@@ -536,9 +555,10 @@ const paperParams = ref({
   risk_intraday_enabled: true,
   risk_intraday_bear_threshold: -0.015,
   risk_intraday_bull_threshold: -0.03,
-  risk_trend_ma_window: 20
+  risk_trend_ma_window: 20,
+  risk_data_fail_mode: 'reduce',
+  risk_intraday_data_fail_mode: 'reduce'
 })
-
 const handleSelectSimId = (simId) => {
   const sid = String(simId || '').trim() || 'default'
   paperConfig.value = { ...(paperConfig.value || {}), sim_id: sid }
@@ -563,6 +583,18 @@ const handleApplyRunParams = (params) => {
   })
   paperConfig.value = nextCfg
   paperParams.value = nextPrm
+}
+
+const handleOpenPaper = async (payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const sid = String(p.sim_id || '').trim()
+  if (sid) handleSelectSimId(sid)
+  activeTab.value = 'paper'
+  toast.add({ title: t('portfolio.runPaperFromBacktest'), description: t('portfolio.goPaperToView'), color: 'green' })
+  nextTick(() => {
+    if (paperPanelRef.value?.loadRuns) paperPanelRef.value.loadRuns()
+    if (paperPanelRef.value?.loadPositions) paperPanelRef.value.loadPositions()
+  })
 }
 const strategyForm = ref({
   strategy_name: `Strategy-${new Date().getTime()}`,

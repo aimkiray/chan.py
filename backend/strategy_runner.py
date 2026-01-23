@@ -23,6 +23,7 @@ from backend.chan_service import (
 )
 from backend.storage import StorageManager, StrategyRun
 from backend.vector_backtest import VectorBacktester
+from backend.wolfpack_backtest import _day_key_from_ts, _daily_oc_from_kl_list, _simulate_universe_daily_topn
 from Common.CEnum import KL_TYPE, DATA_SRC, AUTYPE
 from ChanConfig import CChanConfig
 from DataAPI.ClickHouseAPI import CClickHouseAPI
@@ -78,6 +79,7 @@ def _process_single_stock_strategy(
     auto_profit_quantile: float,
     profit_lookahead: int,
     autype,
+    need_predictions: bool = False,
 ):
     try:
         # Set thread limits for worker process
@@ -148,6 +150,7 @@ def _process_single_stock_strategy(
             deduped.append(klu)
             last_ts = ts
         kl_list = deduped
+        daily_oc = _daily_oc_from_kl_list(kl_list)
 
         # --- Cache Logic Start ---
         data_start_time = None
@@ -195,8 +198,8 @@ def _process_single_stock_strategy(
                 
                 storage = get_worker_storage()
                 cached = storage.get_strategy_cache(key_hash)
-                if cached:
-                    return code, cached['result'], cached['bsp_count'], cached['accuracy'], cached['method'] + " (cached)"
+                if cached and (not bool(need_predictions)):
+                    return code, cached["result"], cached["bsp_count"], cached["accuracy"], cached["method"] + " (cached)", {"daily_oc": daily_oc}
         except Exception:
             pass
         # --- Cache Logic End ---
@@ -273,7 +276,7 @@ def _process_single_stock_strategy(
                     pass
         
         if not last_snapshot:
-            return code, None, len(bsp_dict), 0.0, "", None
+            return code, None, len(bsp_dict), 0.0, "", {"daily_oc": daily_oc}
 
         last_klu = last_snapshot[0][-1][-1]
         latest_bsp_list = last_snapshot.get_latest_bsp(number=0)
@@ -295,7 +298,7 @@ def _process_single_stock_strategy(
                     )
             except Exception:
                 pass
-            return code, None, len(bsp_dict), 0.0, method
+            return code, None, len(bsp_dict), 0.0, method, {"daily_oc": daily_oc}
         
         # Train with n_jobs=1 to avoid thread explosion
         backtest_kwargs = {
@@ -461,7 +464,9 @@ def _process_single_stock_strategy(
         except Exception:
             pass
 
-        return code, result, len(bsp_dict), current_accuracy, method, accuracy_info
+        info = accuracy_info if isinstance(accuracy_info, dict) else {}
+        info["daily_oc"] = daily_oc
+        return code, result, len(bsp_dict), current_accuracy, method, info
 
     except Exception as e:
         print(f"Error processing {code}: {e}")
@@ -740,6 +745,8 @@ class StrategyRunner:
             
             results = []
             processed = 0
+            all_predictions = {}
+            daily_oc_by_code = {}
             
             freq = str(frequency or "").strip().lower() or "1d"
             kl_type = KL_TYPE.K_DAY
@@ -816,6 +823,7 @@ class StrategyRunner:
                             auto_profit_quantile,
                             profit_lookahead,
                             raw_autype,
+                            bool(portfolio_top_n),
                         )
                         active_futures.add(fut)
                         future_to_code[fut] = code
@@ -844,6 +852,8 @@ class StrategyRunner:
 
                             if r_info and isinstance(r_info, dict) and "predictions" in r_info:
                                 all_predictions[r_code] = r_info["predictions"]
+                            if r_info and isinstance(r_info, dict) and isinstance(r_info.get("daily_oc"), dict):
+                                daily_oc_by_code[r_code] = r_info["daily_oc"]
 
                             if processed % 10 == 0:
                                 print(f"[Strategy] {r_code} samples={r_samples} accuracy={r_acc:.3f} {r_method}")
@@ -893,102 +903,53 @@ class StrategyRunner:
                 return
             if portfolio_top_n and all_predictions:
                 try:
-                    # 1. Prepare Data
-                    events_by_ts = {}
-                    for code, preds in all_predictions.items():
-                        for p in preds:
-                            ts = int(p.get('ts', 0))
-                            if ts > 0:
-                                events_by_ts.setdefault(ts, []).append({
-                                    'code': code,
-                                    'prob': float(p.get('prob', 0)),
-                                    'profit': float(p.get('profit', 0))
-                                })
-                    
-                    sorted_ts = sorted(events_by_ts.keys())
                     min_score = float(min_signal_score) if min_signal_score is not None else 0.6
-                    holding_period = int(params.get('holding_period', 3))
-                    if holding_period < 1: holding_period = 1
-                    
-                    # 2. Simulate Trades
-                    trades = [] # {entry_idx, exit_idx, return, code}
-                    
-                    for i, ts in enumerate(sorted_ts):
-                        # Identify candidates
-                        candidates = events_by_ts[ts]
-                        candidates = [c for c in candidates if c['prob'] >= min_score]
-                        candidates.sort(key=lambda x: x['prob'], reverse=True)
-                        
-                        # Check available slots
-                        # Active trade: entry_idx <= i < exit_idx
-                        active_trades = [t for t in trades if t['entry_idx'] <= i < t['exit_idx']]
-                        slots_available = portfolio_top_n - len(active_trades)
-                        
-                        if slots_available > 0:
-                            held_codes = {t['code'] for t in active_trades}
-                            to_buy = []
-                            for c in candidates:
-                                if len(to_buy) >= slots_available:
-                                    break
-                                if c['code'] not in held_codes:
-                                    to_buy.append(c)
-                            
-                            for c in to_buy:
-                                trades.append({
-                                    'code': c['code'],
-                                    'entry_idx': i,
-                                    'exit_idx': i + holding_period,
-                                    'return': c['profit']
-                                })
-                    
-                    # 3. Calculate Curve
-                    step_returns = []
-                    for i in range(len(sorted_ts)):
-                        step_ret = 0.0
-                        # Active trades at this step
-                        active_trades = [t for t in trades if t['entry_idx'] <= i < t['exit_idx']]
-                        
-                        for t in active_trades:
-                            # Simple linear attribution of return
-                            step_ret += t['return'] / holding_period
-                        
-                        # Portfolio return = Sum(Position Returns) / TopN
-                        # (Assuming equal capital allocation to N slots)
-                        avg_step_ret = step_ret / portfolio_top_n
-                        step_returns.append(avg_step_ret)
-                    
-                    # 4. Metrics
-                    eq = 1.0
-                    equity_curve = [1.0]
-                    for r in step_returns:
-                        eq *= (1.0 + r)
-                        equity_curve.append(eq)
-                        
-                    total_return = eq - 1.0
-                    sharpe = 0.0
-                    max_dd = 0.0
-                    
-                    if step_returns:
-                        arr = np.array(step_returns)
-                        if np.std(arr) > 0:
-                            # Simple Sharpe (not annualized)
-                            sharpe = np.mean(arr) / np.std(arr)
-                            # To annualize, we'd need frequency. 
-                            # Assuming 30m (8 bars/day * 250 days = 2000)
-                            if frequency == '30m':
-                                sharpe *= np.sqrt(2000)
-                            elif frequency == '1d':
-                                sharpe *= np.sqrt(250)
-                            elif frequency == '60m':
-                                sharpe *= np.sqrt(1000)
-                        
-                        peak = -99999.0
-                        for v in equity_curve:
-                            if v > peak:
-                                peak = v
-                            dd = (peak - v) / peak if peak > 0 else 0
-                            max_dd = max(max_dd, dd)
-                            
+                    best = {}
+                    for code, preds in all_predictions.items():
+                        for p in (preds or []):
+                            if not isinstance(p, dict):
+                                continue
+                            if not bool(p.get("is_buy")):
+                                continue
+                            try:
+                                prob = float(p.get("prob"))
+                            except Exception:
+                                continue
+                            if (not np.isfinite(prob)) or float(prob) < float(min_score):
+                                continue
+                            try:
+                                ts = int(p.get("ts") or 0)
+                            except Exception:
+                                ts = 0
+                            if ts <= 0:
+                                continue
+                            dk = _day_key_from_ts(ts)
+                            if dk is None:
+                                continue
+                            k = (str(code), int(dk))
+                            cur = best.get(k)
+                            if cur is None or float(prob) > float(cur.get("prob") or float("-inf")):
+                                best[k] = {"code": str(code), "day": int(dk), "ts": int(ts), "prob": float(prob)}
+
+                    candidates = list(best.values())
+                    end_date = datetime.datetime.now().strftime("%Y-%m-%d")
+                    sim = _simulate_universe_daily_topn(
+                        candidates,
+                        begin_time,
+                        end_date,
+                        trade_cost=0.0,
+                        top_n=int(portfolio_top_n),
+                        daily_oc_by_code=daily_oc_by_code,
+                        sell_mode="baseline",
+                        enforce_t1=True,
+                        stop_loss=-1.0,
+                    )
+
+                    sharpe = float(sim.get("sharpe") or 0.0) if isinstance(sim, dict) else 0.0
+                    max_dd = float(sim.get("max_drawdown") or 0.0) if isinstance(sim, dict) else 0.0
+                    total_return = float(sim.get("total_return") or 0.0) if isinstance(sim, dict) else 0.0
+                    trade_count = int(sim.get("trade_count") or 0) if isinstance(sim, dict) else 0
+
                     portfolio_res = {
                         "code": "PORTFOLIO",
                         "name": f"Portfolio (Top {portfolio_top_n})",
@@ -1001,7 +962,7 @@ class StrategyRunner:
                             "sharpe": sharpe,
                             "max_dd": max_dd,
                             "total_return": total_return,
-                            "trade_count": len(trades)
+                            "trade_count": trade_count
                         }
                     }
                     results.insert(0, portfolio_res)

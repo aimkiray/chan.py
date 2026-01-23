@@ -120,22 +120,6 @@
               <UButton size="xs" color="gray" variant="soft" :loading="runsLoading" @click="loadRuns">{{ t('strategy.refresh') }}</UButton>
             </div>
             <div v-if="runsError" class="mb-2 text-xs text-red-500 break-all">{{ runsError }}</div>
-            <div class="grid grid-cols-2 gap-4">
-              <div>
-                <label class="block text-sm font-medium mb-1">{{ t('strategy.runName') }}</label>
-                <UInput v-model="newRunName" :placeholder="t('strategy.runName')" />
-              </div>
-              <div>
-                <label class="block text-sm font-medium mb-1">{{ t('strategy.offsetSeconds') }}</label>
-                <UInput v-model="newRunOffsetSeconds" type="number" />
-              </div>
-            </div>
-            <div class="mt-4 flex flex-wrap items-center gap-4">
-              <UCheckbox v-model="newRunAutoResume" :label="t('strategy.autoResume')" />
-              <UCheckbox v-model="newRunNotifyEnabled" :label="t('strategy.notify')" />
-              <UCheckbox v-model="newRunStart" :label="t('strategy.startImmediately')" />
-              <UButton block color="primary" :loading="runsLoading" @click="createRun">{{ t('strategy.createRun') }}</UButton>
-            </div>
             <div class="mt-6 space-y-2">
               <div v-for="r in liveRuns" :key="r.run_id" class="flex items-center justify-between gap-2 text-xs border-b border-gray-100 dark:border-gray-800 pb-2">
                 <div class="min-w-0">
@@ -153,7 +137,7 @@
                   <UButton size="xs" color="red" variant="soft" @click="deleteRun(r.run_id)">{{ t('strategy.delete') }}</UButton>
                 </div>
               </div>
-              <div v-if="!liveRuns.length" class="text-xs text-gray-400">-</div>
+              <div v-if="!liveRuns.length" class="text-xs text-gray-400">{{ t('portfolio.noPaperRunsHint') }}</div>
             </div>
         </div>
 
@@ -304,136 +288,8 @@
     </div>
 
     <!-- Backtest Mode -->
-    <div v-else class="flex-1 flex flex-col gap-4 overflow-y-auto p-6">
-      <div class="flex items-center gap-2">
-        <USelectMenu
-          v-model="backtestKind"
-          :options="backtestKindOptions"
-          value-attribute="value"
-          option-attribute="label"
-          class="w-64"
-        />
-      </div>
-
-      <div v-if="backtestKind === 'vector'" class="grid grid-cols-2 gap-4">
-        <div>
-          <label class="block text-sm font-medium mb-1">{{ t('portfolio.startDate') }}</label>
-          <UInput type="date" v-model="backtestConfig.start_date" />
-        </div>
-        <div>
-          <label class="block text-sm font-medium mb-1">{{ t('portfolio.endDate') }}</label>
-          <UInput type="date" v-model="backtestConfig.end_date" />
-        </div>
-        <div>
-          <label class="block text-sm font-medium mb-1">{{ t('portfolio.modelKey') }}</label>
-          <UInput v-model="backtestConfig.model_key" :placeholder="t('portfolio.autoPlaceholder')" />
-        </div>
-        <div class="col-span-2 flex items-end">
-          <UButton block color="primary" :loading="backtestLoading" @click="runBacktest">{{ t('portfolio.runBacktest') }}</UButton>
-        </div>
-      </div>
-
-      <div v-else class="grid grid-cols-2 gap-4">
-        <div>
-          <label class="block text-sm font-medium mb-1">{{ t('portfolio.startDate') }}</label>
-          <UInput type="date" v-model="wolfpackConfig.start_date" />
-        </div>
-        <div>
-          <label class="block text-sm font-medium mb-1">{{ t('portfolio.endDate') }}</label>
-          <UInput type="date" v-model="wolfpackConfig.end_date" />
-        </div>
-        <div>
-          <label class="block text-sm font-medium mb-1">{{ t('strategy.poolId') }}</label>
-          <USelectMenu v-model="wolfpackConfig.pool_id" :options="poolOptions" value-attribute="value" option-attribute="label" class="w-full" />
-        </div>
-        <div>
-          <label class="block text-sm font-medium mb-1">{{ t('app.periodSelect') }}</label>
-          <USelectMenu v-model="wolfpackConfig.frequency" :options="wolfpackFrequencyOptions" value-attribute="value" option-attribute="label" class="w-full" />
-        </div>
-        <div>
-          <label class="block text-sm font-medium mb-1">{{ t('app.dataSrc') }}</label>
-          <USelectMenu v-model="wolfpackConfig.data_src" :options="wolfpackDataSrcOptions" value-attribute="value" option-attribute="label" class="w-full" />
-        </div>
-        <div>
-          <label class="block text-sm font-medium mb-1">{{ t('sidebar.autype') }}</label>
-          <USelectMenu v-model="wolfpackConfig.autype" :options="wolfpackAutypeOptions" value-attribute="value" option-attribute="label" class="w-full" />
-        </div>
-
-        <div>
-          <label class="block text-sm font-medium mb-1">{{ t('strategy.topN') }}</label>
-          <UInput type="number" v-model="wolfpackConfig.portfolio_top_n" min="0" step="1" />
-        </div>
-        <div>
-          <label class="block text-sm font-medium mb-1">{{ t('strategy.holdingBars') }}</label>
-          <UInput type="number" v-model="wolfpackConfig.holding_period" min="1" step="1" />
-        </div>
-        <div>
-          <label class="block text-sm font-medium mb-1">{{ t('strategy.minProb') }}</label>
-          <UInput type="number" v-model="wolfpackConfig.min_prob" min="0" max="1" step="0.01" />
-        </div>
-        <div>
-          <label class="block text-sm font-medium mb-1">{{ t('strategy.tradeCost') }}</label>
-          <UInput type="number" v-model="wolfpackConfig.trade_cost" step="0.0001" />
-        </div>
-
-        <div class="flex items-center gap-4">
-          <UCheckbox v-model="wolfpackConfig.enforce_t1" :label="t('strategy.enforceT1')" />
-          <UCheckbox v-model="wolfpackConfig.index_filter_enabled" :label="t('strategy.indexFilterEnabled')" />
-        </div>
-        <div>
-          <label class="block text-sm font-medium mb-1">{{ t('strategy.stopLoss') }}</label>
-          <UInput type="number" v-model="wolfpackConfig.stop_loss" step="0.005" />
-        </div>
-
-        <div>
-          <label class="block text-sm font-medium mb-1">{{ t('strategy.indexCode') }}</label>
-          <USelectMenu v-model="wolfpackConfig.index_code" :searchable="searchIndices" :searchable-placeholder="t('common.typeToSearch')" :loading="searchingIndices" :options="indexOptions" value-attribute="value" option-attribute="label" class="w-full" />
-        </div>
-        <div>
-          <label class="block text-sm font-medium mb-1">{{ t('strategy.indexMaWindow') }}</label>
-          <UInput type="number" v-model="wolfpackConfig.index_ma_window" min="2" step="1" />
-        </div>
-
-        <div class="col-span-2 pt-2 border-t border-gray-100 dark:border-gray-800 flex items-center justify-between">
-          <div class="text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.risk') }}</div>
-          <UCheckbox v-model="wolfpackConfig.risk_filter_enabled" :label="t('strategy.riskEnabled')" />
-        </div>
-
-        <div>
-           <label class="text-xs text-gray-500">{{ t('strategy.riskMode') }}</label>
-           <USelectMenu v-model="wolfpackConfig.risk_mode" :options="riskModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
-        </div>
-        <div>
-           <label class="text-xs text-gray-500">{{ t('strategy.riskGapDownThreshold') }}</label>
-           <UInput v-model="wolfpackConfig.risk_gap_down_threshold" type="number" />
-        </div>
-        <div>
-           <label class="text-xs text-gray-500">{{ t('strategy.riskDropThreshold') }}</label>
-           <UInput v-model="wolfpackConfig.risk_drop_threshold" type="number" />
-        </div>
-        <div>
-           <label class="text-xs text-gray-500">{{ t('strategy.riskFlatDropThreshold') }}</label>
-           <UInput v-model="wolfpackConfig.risk_flat_drop_threshold" type="number" />
-        </div>
-        <div>
-           <label class="text-xs text-gray-500">{{ t('strategy.riskAtrWindow') }}</label>
-           <UInput v-model="wolfpackConfig.risk_atr_window" type="number" />
-        </div>
-        <div>
-           <label class="text-xs text-gray-500">{{ t('strategy.riskAtrPctThreshold') }}</label>
-           <UInput v-model="wolfpackConfig.risk_atr_pct_threshold" type="number" />
-        </div>
-        <div>
-           <label class="text-xs text-gray-500">{{ t('strategy.riskFlatAtrPctThreshold') }}</label>
-           <UInput v-model="wolfpackConfig.risk_flat_atr_pct_threshold" type="number" />
-        </div>
-
-        <div class="col-span-2 flex items-end">
-          <UButton block color="primary" :loading="wolfpackLoading" @click="runWolfpackBacktest">{{ t('portfolio.runBacktest') }}</UButton>
-        </div>
-      </div>
-
-      <div v-if="currentBacktestResult" class="flex flex-col gap-6 mt-6">
+    <div v-else class="flex-1 min-h-0 flex flex-col overflow-y-auto p-6">
+      <div v-if="currentBacktestResult" class="flex flex-col gap-6">
         <div class="grid grid-cols-4 gap-4">
           <UCard>
             <div class="text-xs text-gray-500">{{ t('portfolio.totalReturn') }}</div>
@@ -460,6 +316,23 @@
            <template #header>{{ t('portfolio.equityCurve') }}</template>
            <div class="h-[300px]" style="width: 100%; min-width: 0;" ref="chartContainer"></div>
         </UCard>
+
+        <div class="flex flex-col gap-2">
+          <UCheckbox v-model="backtestConfirmed" :label="t('portfolio.confirmBacktest')" />
+          <UButton
+            block
+            color="primary"
+            :disabled="!backtestConfirmed"
+            :loading="paperRunFromBacktestLoading"
+            @click="runPaperFromBacktest"
+          >
+            {{ t('portfolio.runPaperFromBacktest') }}
+          </UButton>
+          <div class="text-xs text-gray-500">{{ t('portfolio.goPaperToView') }}</div>
+        </div>
+      </div>
+      <div v-else class="flex-1 flex items-center justify-center text-gray-400">
+        {{ t('portfolio.runBacktest') }}
       </div>
     </div>
 
@@ -532,9 +405,10 @@ const props = defineProps({
   initialMode: { type: String, default: 'portfolio' },
   fixedMode: { type: String, default: '' },
   paperConfig: { type: Object, default: () => ({}) },
-  paperParams: { type: Object, default: () => ({}) }
+  paperParams: { type: Object, default: () => ({}) },
+  paperRunForm: { type: Object, default: () => ({}) }
 })
-const emit = defineEmits(['selectSimId', 'applyRunParams'])
+const emit = defineEmits(['selectSimId', 'applyRunParams', 'openPaper'])
 
 const fixedMode = computed(() => String(props.fixedMode || '').trim())
 const mode = ref(String((fixedMode.value || props.initialMode || 'portfolio')).trim() || 'portfolio')
@@ -583,6 +457,10 @@ const backtestConfig = ref({
 const backtestLoading = ref(false)
 const vectorBacktestResult = ref(null)
 const wolfpackBacktestResult = ref(null)
+const backtestConfirmed = ref(false)
+const lastBacktestPaperConfig = ref(null)
+const lastBacktestPaperParams = ref(null)
+const paperRunFromBacktestLoading = ref(false)
 
 const currentBacktestResult = computed(() => {
   return backtestKind.value === 'vector' ? vectorBacktestResult.value : wolfpackBacktestResult.value
@@ -605,12 +483,20 @@ const wolfpackConfig = ref({
   holding_period: 3,
   min_prob: 0.25,
   trade_cost: 0.0002,
+  walk_forward_max_folds: 25,
+  rolling_sample_mode: 'every_bar',
+  rolling_stride: 1,
   portfolio_top_n: 2,
   index_filter_enabled: true,
   index_code: '399006',
   index_ma_window: 20,
   stop_loss: -0.03,
   enforce_t1: true,
+  sell_mode: 'baseline',
+  t1_decision_time: '10:00',
+  t1_gap_strong_threshold: 0.03,
+  t1_gap_weak_threshold: -0.02,
+  t1_gap_very_strong_threshold: 0.05,
   risk_filter_enabled: true,
   risk_mode: 'both',
   risk_drop_threshold: -0.03,
@@ -624,8 +510,7 @@ const wolfpackConfig = ref({
   risk_intraday_bull_threshold: -0.03,
   risk_trend_ma_window: 20,
   risk_data_fail_mode: 'reduce',
-  risk_intraday_data_fail_mode: 'reduce',
-  max_workers: 8
+  risk_intraday_data_fail_mode: 'reduce'
 })
 const wolfpackLoading = ref(false)
 
@@ -651,6 +536,20 @@ const riskModeOptions = computed(() => ([
   { label: t('strategy.riskModeDrop'), value: 'drop' },
   { label: t('strategy.riskModeAtr'), value: 'atr' },
   { label: t('strategy.riskModeBoth'), value: 'both' }
+]))
+const riskFailModeOptions = computed(() => ([
+  { label: t('strategy.failModePass'), value: 'pass' },
+  { label: t('strategy.failModeReduce'), value: 'reduce' },
+  { label: t('strategy.failModeFlat'), value: 'flat' }
+]))
+const rollingSampleModeOptions = computed(() => ([
+  { label: t('strategy.rollingModeEveryBar'), value: 'every_bar' },
+  { label: t('strategy.rollingModeBsp'), value: 'bsp' }
+]))
+const sellModeOptions = computed(() => ([
+  { label: t('strategy.sellModeBaseline'), value: 'baseline' },
+  { label: t('strategy.sellModeDelayed'), value: 'delayed' },
+  { label: t('strategy.sellModeGapRoll'), value: 't1_gap_roll' }
 ]))
 
 const poolOptions = ref([{ label: '创业板50 (50)', value: 'index:IDX399673' }])
@@ -811,11 +710,6 @@ const stepResult = ref(null)
 const runsLoading = ref(false)
 const runsError = ref('')
 const liveRuns = ref([])
-const newRunName = ref('')
-const newRunOffsetSeconds = ref(5)
-const newRunAutoResume = ref(true)
-const newRunNotifyEnabled = ref(false)
-const newRunStart = ref(true)
 const selectedRunId = ref('')
 
 const stepsLoading = ref(false)
@@ -1099,30 +993,57 @@ const getColor = (val) => {
   return val > 0 ? 'text-red-500' : (val < 0 ? 'text-green-500' : '')
 }
 
-const runBacktest = async () => {
-  backtestLoading.value = true
-  try {
-    const res = await axios.post('/api/backtest/vector', backtestConfig.value)
-    if (res.data.error) {
-        alert(res.data.error)
-        return
-    }
-    vectorBacktestResult.value = res.data
-    nextTick(() => {
-        renderChart()
-    })
-  } catch (e) {
-    alert(t('portfolio.backtestFailed'))
-    console.error(e)
-  } finally {
-    backtestLoading.value = false
+const buildWolfpackBacktestPayload = (paperCfg, paperPrm) => {
+  const cfg = paperCfg && typeof paperCfg === 'object' ? paperCfg : {}
+  const prm = paperPrm && typeof paperPrm === 'object' ? paperPrm : {}
+
+  const idxCode = String(prm.risk_index_code || '').trim()
+  const idxMa = Number(prm.risk_trend_ma_window)
+  const payload = {
+    pool_id: cfg.pool_id,
+    frequency: cfg.frequency,
+    data_src: cfg.data_src,
+    autype: cfg.autype,
+    enable_rolling_lookback: true,
+    holding_period: prm.holding_period,
+    min_prob: prm.min_prob,
+    trade_cost: prm.trade_cost,
+    walk_forward_max_folds: prm.walk_forward_max_folds,
+    rolling_sample_mode: prm.rolling_sample_mode,
+    rolling_stride: prm.rolling_stride,
+    portfolio_top_n: prm.top_n,
+    sell_mode: prm.sell_mode,
+    t1_decision_time: prm.t1_decision_time,
+    t1_gap_strong_threshold: prm.t1_gap_strong_threshold,
+    t1_gap_weak_threshold: prm.t1_gap_weak_threshold,
+    t1_gap_very_strong_threshold: prm.t1_gap_very_strong_threshold,
+    risk_filter_enabled: prm.risk_filter_enabled,
+    risk_mode: prm.risk_mode,
+    risk_drop_threshold: prm.risk_drop_threshold,
+    risk_flat_drop_threshold: prm.risk_flat_drop_threshold,
+    risk_gap_down_threshold: prm.risk_gap_down_threshold,
+    risk_atr_window: prm.risk_atr_window,
+    risk_atr_pct_threshold: prm.risk_atr_pct_threshold,
+    risk_flat_atr_pct_threshold: prm.risk_flat_atr_pct_threshold,
+    risk_intraday_enabled: prm.risk_intraday_enabled,
+    risk_intraday_bear_threshold: prm.risk_intraday_bear_threshold,
+    risk_intraday_bull_threshold: prm.risk_intraday_bull_threshold,
+    risk_trend_ma_window: prm.risk_trend_ma_window,
+    risk_data_fail_mode: prm.risk_data_fail_mode,
+    risk_intraday_data_fail_mode: prm.risk_intraday_data_fail_mode,
   }
+
+  if (idxCode) payload.index_code = idxCode
+  if (Number.isFinite(idxMa) && idxMa > 0) payload.index_ma_window = Math.trunc(idxMa)
+
+  return payload
 }
 
 const runWolfpackBacktest = async () => {
   wolfpackLoading.value = true
   try {
-    const res = await axios.post('/api/backtest/wolfpack', wolfpackConfig.value)
+    const cfg = buildWolfpackBacktestPayload(props.paperConfig, props.paperParams)
+    const res = await axios.post('/api/backtest/wolfpack', cfg)
     const data = res.data || {}
     if (String(data.status || '') !== 'success') {
       alert(String(data.detail || data.error || t('portfolio.backtestFailed')))
@@ -1144,6 +1065,9 @@ const runWolfpackBacktest = async () => {
       },
       equity_curve: curve
     }
+    lastBacktestPaperConfig.value = { ...(props.paperConfig || {}) }
+    lastBacktestPaperParams.value = { ...(props.paperParams || {}) }
+    backtestConfirmed.value = false
     nextTick(() => {
       renderChart()
     })
@@ -1152,6 +1076,57 @@ const runWolfpackBacktest = async () => {
     console.error(e)
   } finally {
     wolfpackLoading.value = false
+  }
+}
+
+const resolveRunSimId = (baseSimId) => {
+  const baseSid = String(baseSimId || '').trim() || 'default'
+  if (baseSid !== 'default') return baseSid
+  return `sim_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+}
+
+const buildLiveParams = (paperCfg, paperPrm, sid) => {
+  const cfg = paperCfg && typeof paperCfg === 'object' ? paperCfg : {}
+  const prm = paperPrm && typeof paperPrm === 'object' ? paperPrm : {}
+  const nextPrm = { ...prm }
+  delete nextPrm.max_workers
+  return {
+    ...cfg,
+    ...nextPrm,
+    sim_id: sid,
+    portfolio_id: activePortfolioId.value,
+    enable_rolling_lookback: true
+  }
+}
+
+const runPaperFromBacktest = async () => {
+  if (!currentBacktestResult.value) return
+  if (!backtestConfirmed.value) return
+  paperRunFromBacktestLoading.value = true
+  try {
+    const snapCfg = lastBacktestPaperConfig.value || props.paperConfig || {}
+    const snapPrm = lastBacktestPaperParams.value || props.paperParams || {}
+
+    const sid = resolveRunSimId(snapCfg?.sim_id)
+    const params = buildLiveParams(snapCfg, snapPrm, sid)
+    const payload = {
+      name: '',
+      sim_id: sid,
+      portfolio_id: activePortfolioId.value,
+      params,
+      offset_seconds: 5,
+      auto_resume: true,
+      notify_enabled: false,
+      start: true
+    }
+    const res = await axios.post('/api/live/runs', payload)
+    emit('selectSimId', sid)
+    emit('applyRunParams', params)
+    emit('openPaper', { sim_id: sid, run_id: String(res.data?.item?.run_id || '').trim() })
+  } catch (e) {
+    alert(String(e?.response?.data?.detail || e?.message || e))
+  } finally {
+    paperRunFromBacktestLoading.value = false
   }
 }
 
@@ -1251,9 +1226,11 @@ const runPaperStep = async () => {
   stepResult.value = null
   stepLoading.value = true
   try {
+    const paperParams = { ...(props.paperParams || {}) }
+    delete paperParams.max_workers
     const payload = {
       ...(props.paperConfig || {}),
-      ...(props.paperParams || {}),
+      ...paperParams,
       sim_id: activeSimId.value,
       portfolio_id: activePortfolioId.value,
       enable_rolling_lookback: true
@@ -1297,6 +1274,36 @@ const loadRuns = async () => {
   try {
     const res = await axios.get('/api/live/runs', { params: { limit: 200, portfolio_id: activePortfolioId.value } })
     liveRuns.value = Array.isArray(res.data?.items) ? res.data.items : []
+    if (mode.value === 'paper' && !String(selectedRunId.value || '').trim() && liveRuns.value.length) {
+      const getRunTs = (r) => {
+        const candidates = [
+          Number(r?.last_step_ts),
+          Number(r?.updated_ts),
+          Number(r?.created_ts),
+          Number(r?.next_exec_ts)
+        ].filter(n => Number.isFinite(n))
+        return candidates.length ? Math.max(...candidates) : 0
+      }
+      const sorted = [...liveRuns.value].sort((a, b) => {
+        const dt = getRunTs(b) - getRunTs(a)
+        if (dt) return dt
+        return String(b?.run_id || '').localeCompare(String(a?.run_id || ''))
+      })
+      const pick = sorted[0] || null
+      const rid = String(pick?.run_id || '').trim()
+      const sid = String(pick?.sim_id || '').trim()
+      if (rid && sid) {
+        preserveSelectedRunIdOnce = true
+        localSimId.value = sid
+        emit('selectSimId', sid)
+        selectedRunId.value = rid
+        stepLogPage.value = 1
+        tradePage.value = 1
+        await loadPositions()
+        await loadStepLogs()
+        await loadEquity()
+      }
+    }
   } catch (e) {
     runsError.value = String(e?.response?.data?.detail || e?.message || e)
   } finally {
@@ -1313,22 +1320,24 @@ const createRun = async () => {
     const sid = baseSid === 'default'
       ? `sim_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
       : baseSid
+    const paperParams = { ...(props.paperParams || {}) }
+    delete paperParams.max_workers
     const params = {
       ...(props.paperConfig || {}),
-      ...(props.paperParams || {}),
+      ...paperParams,
       sim_id: sid,
       portfolio_id: activePortfolioId.value,
       enable_rolling_lookback: true
     }
     const payload = {
-      name: String(newRunName.value || '').trim(),
+      name: String(props.paperRunForm?.name || '').trim(),
       sim_id: sid,
       portfolio_id: activePortfolioId.value,
       params,
-      offset_seconds: Number(newRunOffsetSeconds.value || 0),
-      auto_resume: !!newRunAutoResume.value,
-      notify_enabled: !!newRunNotifyEnabled.value,
-      start: !!newRunStart.value
+      offset_seconds: Number(props.paperRunForm?.offset_seconds || 0),
+      auto_resume: !!props.paperRunForm?.auto_resume,
+      notify_enabled: !!props.paperRunForm?.notify_enabled,
+      start: !!props.paperRunForm?.start
     }
     const res = await axios.post('/api/live/runs', payload)
     preserveSelectedRunIdOnce = true
@@ -1591,6 +1600,7 @@ const handleResize = () => {
 // Expose methods for parent
 defineExpose({
   refresh: fetchPortfolios,
+  wolfpackLoading,
   openAddPosition: (code, name) => {
     mode.value = 'portfolio'
     newPosition.value.code = code
@@ -1608,6 +1618,18 @@ defineExpose({
   resetPositions: async () => {
     mode.value = 'paper'
     await resetPositions()
+  },
+  loadRuns: async () => {
+    mode.value = 'paper'
+    await loadRuns()
+  },
+  createRun: async () => {
+    mode.value = 'paper'
+    await createRun()
+  },
+  runBacktest: async () => {
+    mode.value = 'backtest'
+    await runWolfpackBacktest()
   }
 })
 

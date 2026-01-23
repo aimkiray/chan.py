@@ -53,6 +53,76 @@ def _date_range_days(start_date: str, end_date: str) -> List[int]:
     return days
 
 
+def _parse_hhmm_to_minutes(v: Optional[str], default_min: int = 10 * 60) -> int:
+    raw = str(v or "").strip()
+    if not raw:
+        return int(default_min)
+    try:
+        parts = raw.split(":")
+        hh = int(parts[0]) if parts and parts[0].strip() else 10
+        mm = int(parts[1]) if len(parts) > 1 and parts[1].strip() else 0
+        hh = max(0, min(23, int(hh)))
+        mm = max(0, min(59, int(mm)))
+        return int(hh * 60 + mm)
+    except Exception:
+        return int(default_min)
+
+
+def _prev_weekday_day_key(dk: int) -> Optional[int]:
+    try:
+        s = str(int(dk))
+        d = datetime.date(int(s[0:4]), int(s[4:6]), int(s[6:8]))
+    except Exception:
+        return None
+    pd = d - datetime.timedelta(days=1)
+    while pd.weekday() >= 5:
+        pd = pd - datetime.timedelta(days=1)
+    return int(pd.year) * 10000 + int(pd.month) * 100 + int(pd.day)
+
+
+def _daily_oc_from_kl_list(kl_list) -> Dict[int, Dict[str, float]]:
+    by_day: Dict[int, Dict[str, float]] = {}
+    for k in (kl_list or []):
+        try:
+            ts = int(getattr(getattr(k, "time", None), "ts", 0) or 0)
+        except Exception:
+            ts = 0
+        if ts <= 0:
+            continue
+        dk = _day_key_from_ts(ts)
+        if dk is None:
+            continue
+        try:
+            o = float(getattr(k, "open", 0.0) or 0.0)
+        except Exception:
+            o = 0.0
+        try:
+            c = float(getattr(k, "close", 0.0) or 0.0)
+        except Exception:
+            c = 0.0
+        if c <= 0.0:
+            continue
+        if o <= 0.0:
+            o = c
+        dd = by_day.get(int(dk))
+        if dd is None:
+            by_day[int(dk)] = {"open": float(o), "close": float(c), "ts_first": int(ts), "ts_last": int(ts)}
+            continue
+        if int(ts) <= int(dd.get("ts_first") or 0):
+            dd["ts_first"] = int(ts)
+            dd["open"] = float(o)
+        if int(ts) >= int(dd.get("ts_last") or 0):
+            dd["ts_last"] = int(ts)
+            dd["close"] = float(c)
+    out = {}
+    for dk, dd in by_day.items():
+        try:
+            out[int(dk)] = {"open": float(dd.get("open") or 0.0), "close": float(dd.get("close") or 0.0)}
+        except Exception:
+            continue
+    return out
+
+
 def _simulate_universe_daily_top1(
     candidates: List[dict],
     start_date: str,
@@ -477,6 +547,14 @@ def _simulate_universe_daily_topn(
     index_allow_by_day: Optional[Dict[int, bool]] = None,
     risk_by_day: Optional[Dict[int, str]] = None,
     intraday_cfg: Optional[dict] = None,
+    daily_oc_by_code: Optional[Dict[str, Dict[int, Dict[str, float]]]] = None,
+    sell_mode: str = "baseline",
+    t1_decision_time: Optional[str] = None,
+    t1_gap_strong_threshold: float = 0.03,
+    t1_gap_weak_threshold: float = -0.02,
+    t1_gap_very_strong_threshold: float = 0.05,
+    enforce_t1: bool = True,
+    stop_loss: float = -0.03,
 ) -> dict:
     try:
         tc = float(trade_cost or 0.0)
@@ -488,6 +566,21 @@ def _simulate_universe_daily_topn(
         tn = 3
     tn = 1 if tn <= 1 else tn
 
+    sell_mode = str(sell_mode or "baseline").strip().lower() or "baseline"
+    decision_min = _parse_hhmm_to_minutes(t1_decision_time, default_min=10 * 60)
+    try:
+        weak_th = float(t1_gap_weak_threshold)
+    except Exception:
+        weak_th = -0.02
+    try:
+        very_strong_th = float(t1_gap_very_strong_threshold)
+    except Exception:
+        very_strong_th = 0.05
+    try:
+        sl = float(stop_loss)
+    except Exception:
+        sl = -0.03
+
     by_day: Dict[int, List[dict]] = {}
     for r in (candidates or []):
         if not isinstance(r, dict):
@@ -498,31 +591,142 @@ def _simulate_universe_daily_topn(
             dk = 0
         if dk <= 0:
             continue
-        by_day.setdefault(dk, []).append(r)
+        by_day.setdefault(int(dk), []).append(r)
+
+    daily_oc_by_code = daily_oc_by_code or {}
+    last_close: Dict[str, float] = {}
+
+    def _get_oc(code: str, dk: int) -> Tuple[Optional[float], Optional[float]]:
+        m = daily_oc_by_code.get(str(code)) or {}
+        dd = m.get(int(dk)) or {}
+        o = dd.get("open")
+        c = dd.get("close")
+        try:
+            o = float(o) if o is not None else None
+        except Exception:
+            o = None
+        try:
+            c = float(c) if c is not None else None
+        except Exception:
+            c = None
+        if c is None or (isinstance(c, float) and (not np.isfinite(c))) or (c is not None and c <= 0.0):
+            c = last_close.get(str(code))
+        if o is None or (isinstance(o, float) and (not np.isfinite(o))) or (o is not None and o <= 0.0):
+            o = c
+        return o, c
+
+    def _trading_day_ok(dk: int) -> bool:
+        if index_allow_by_day is not None:
+            return bool(index_allow_by_day.get(int(dk), False))
+        for code, m in daily_oc_by_code.items():
+            dd = (m or {}).get(int(dk))
+            if dd and float(dd.get("close") or 0.0) > 0.0:
+                return True
+        return False
 
     day_list = _date_range_days(start_date, end_date)
     eq = 1.0
+    prev_eq = 1.0
     rets = []
     curve = []
     trade_days = 0
 
-    for dk in day_list:
-        if index_allow_by_day is not None:
-            if not bool(index_allow_by_day.get(int(dk), False)):
-                rets.append(0.0)
-                eq = float(eq) * 1.0
-                curve.append({"day": int(dk), "equity": float(eq), "r": 0.0, "codes": [], "probs": []})
+    cash = 1.0
+    positions: Dict[str, dict] = {}
+
+    def _equity_at_px(dk: int, use_close: bool) -> float:
+        tot = float(cash)
+        for code, p in (positions or {}).items():
+            px = None
+            o, c = _get_oc(code, dk)
+            px = c if use_close else o
+            if px is None or px <= 0.0:
                 continue
+            try:
+                sh = float(p.get("shares") or 0.0)
+            except Exception:
+                sh = 0.0
+            tot += float(sh) * float(px)
+        return float(tot)
+
+    def _sell_at_px(codes: List[str], dk: int, use_close: bool):
+        nonlocal cash
+        for code in (codes or []):
+            p = positions.get(str(code))
+            if not p:
+                continue
+            o, c = _get_oc(code, dk)
+            px = c if use_close else o
+            if px is None or px <= 0.0:
+                continue
+            try:
+                sh = float(p.get("shares") or 0.0)
+            except Exception:
+                sh = 0.0
+            if sh <= 0.0:
+                positions.pop(str(code), None)
+                continue
+            cash += float(sh) * float(px) * float(max(0.0, 1.0 - float(tc)))
+            positions.pop(str(code), None)
+
+    def _buy_at_px(rows: List[dict], dk: int, use_close: bool, target_slots: int):
+        nonlocal cash
+        if target_slots <= 0:
+            return
+        tot_eq = _equity_at_px(dk, use_close=use_close)
+        target_value = float(tot_eq) / float(max(1, int(target_slots)))
+        remaining = int(target_slots)
+        for r in (rows or []):
+            if remaining <= 0:
+                break
+            code = str(r.get("code") or "").strip()
+            if not code or code in positions:
+                continue
+            o, c = _get_oc(code, dk)
+            px = c if use_close else o
+            if px is None or px <= 0.0:
+                continue
+            budget = float(min(float(target_value), float(cash)))
+            if budget <= 0.0:
+                break
+            cost = float(budget) * float(1.0 + float(tc))
+            if cost > cash and cash > 0:
+                budget = float(cash) / float(1.0 + float(tc))
+                cost = float(budget) * float(1.0 + float(tc))
+            if cost <= 0.0 or budget <= 0.0:
+                continue
+            sh = float(budget) / float(px)
+            if sh <= 0.0:
+                continue
+            cash -= float(sh) * float(px) * float(1.0 + float(tc))
+            positions[code] = {
+                "shares": float(sh),
+                "entry_day": int(dk),
+                "entry_price": float(px),
+                "prob": float(r.get("prob") or 0.0),
+            }
+            remaining -= 1
+
+    for dk in day_list:
+        if not _trading_day_ok(int(dk)):
+            rets.append(0.0)
+            eq = float(eq) * 1.0
+            curve.append({"day": int(dk), "equity": float(eq), "r": 0.0, "codes": list(positions.keys()), "probs": [positions[c].get("prob") for c in positions.keys()]})
+            prev_eq = float(eq)
+            continue
+
         if risk_by_day is not None:
             s = str(risk_by_day.get(int(dk)) or "").strip().lower()
             if s == "flat":
-                rets.append(0.0)
-                eq = float(eq) * 1.0
-                curve.append({"day": int(dk), "equity": float(eq), "r": 0.0, "codes": [], "probs": []})
-                continue
-            day_tn = 1 if s == "reduce" else tn
+                day_tn = 0
+                risk_flat = True
+            else:
+                day_tn = 1 if s == "reduce" else tn
+                risk_flat = False
         else:
             day_tn = tn
+            risk_flat = False
+
         rows = by_day.get(int(dk)) or []
         if intraday_cfg and bool(intraday_cfg.get("enabled")) and rows:
             try:
@@ -547,12 +751,9 @@ def _simulate_universe_daily_topn(
                 missing.append("current_price")
             if missing:
                 if fail_mode == "flat":
-                    rets.append(0.0)
-                    eq = float(eq) * 1.0
-                    curve.append({"day": int(dk), "equity": float(eq), "r": 0.0, "codes": [], "probs": []})
-                    continue
-                if fail_mode == "reduce":
-                    day_tn = 1
+                    day_tn = 0
+                elif fail_mode == "reduce":
+                    day_tn = min(int(day_tn), 1) if int(day_tn) > 0 else 0
 
             next_rows = []
             for r in rows:
@@ -587,33 +788,123 @@ def _simulate_universe_daily_topn(
                     continue
                 next_rows.append(r)
             rows = next_rows
+
         rows.sort(key=lambda x: float(x.get("prob", float("-inf"))), reverse=True)
-        sel = rows[: int(day_tn)]
-        if not sel:
-            rets.append(0.0)
-            curve.append({"day": int(dk), "equity": float(eq), "r": 0.0, "codes": [], "probs": []})
-            continue
-        pnls = []
-        codes = []
-        probs = []
-        for r in sel:
+        sel = rows[: int(day_tn)] if int(day_tn) > 0 else []
+
+        target_rows = sel
+        target_codes = [str(r.get("code") or "").strip() for r in (target_rows or []) if str(r.get("code") or "").strip()]
+        target_codes = list(dict.fromkeys(target_codes))
+        has_targets = bool(target_codes)
+
+        forced_sell = []
+        for code, p in list((positions or {}).items()):
+            o, c = _get_oc(code, dk)
+            if c is None or c <= 0.0:
+                continue
+            last_close[str(code)] = float(c)
             try:
-                pr = float(r.get("profit"))
+                ep = float(p.get("entry_price") or 0.0)
             except Exception:
-                pr = 0.0
-            if not np.isfinite(pr):
-                pr = 0.0
-            pnls.append(float(pr) - float(tc))
-            codes.append(r.get("code"))
-            try:
-                probs.append(float(r.get("prob")))
-            except Exception:
-                probs.append(None)
-        rr = float(sum(pnls) / float(len(pnls))) if pnls else 0.0
-        trade_days += 1
+                ep = 0.0
+            if ep > 0.0:
+                ret = float(c / ep - 1.0)
+                if float(ret) <= float(sl):
+                    forced_sell.append(str(code))
+
+        if (not has_targets) and (not risk_flat):
+            target_codes = list(positions.keys())
+
+        if risk_flat:
+            target_codes = []
+
+        current_codes = list(positions.keys())
+        rebalance_out = [c for c in current_codes if c and c not in target_codes]
+        sell_codes = list(dict.fromkeys([c for c in (forced_sell + rebalance_out) if c]))
+
+        if sell_mode in ("t1_gap_roll", "gap_roll", "advanced") and sell_codes:
+            prev_day_key = _prev_weekday_day_key(int(dk))
+            rebalance_set = set(rebalance_out or [])
+            forced_set = set(forced_sell or [])
+            filtered_sell = []
+            for c in sell_codes:
+                if c in forced_set:
+                    filtered_sell.append(c)
+                    continue
+                if c not in rebalance_set:
+                    filtered_sell.append(c)
+                    continue
+                p = positions.get(str(c))
+                if not p:
+                    filtered_sell.append(c)
+                    continue
+                try:
+                    ed = int(p.get("entry_day") or 0)
+                except Exception:
+                    ed = 0
+                if prev_day_key is None or int(ed) != int(prev_day_key):
+                    filtered_sell.append(c)
+                    continue
+                o, _ = _get_oc(str(c), int(dk))
+                _, pc = _get_oc(str(c), int(prev_day_key))
+                op = None
+                if o is not None and pc is not None and float(o) > 0.0 and float(pc) > 0.0:
+                    op = float(o / pc - 1.0)
+                if op is not None and float(op) > float(very_strong_th):
+                    continue
+                if op is not None and float(op) < float(weak_th):
+                    filtered_sell.append(c)
+                    continue
+                if int(decision_min) <= 10 * 60:
+                    continue
+                filtered_sell.append(c)
+            sell_codes = filtered_sell
+
+        if bool(enforce_t1) and sell_codes:
+            sell_ok = []
+            for c in sell_codes:
+                p = positions.get(str(c))
+                if not p:
+                    sell_ok.append(c)
+                    continue
+                try:
+                    ed = int(p.get("entry_day") or 0)
+                except Exception:
+                    ed = 0
+                if ed and int(ed) >= int(dk):
+                    continue
+                sell_ok.append(c)
+            sell_codes = sell_ok
+
+        do_close_rebalance = sell_mode in ("delayed", "delay", "scheme1", "t1_delay")
+        trade_px_close = bool(do_close_rebalance)
+
+        if not trade_px_close:
+            _sell_at_px(sell_codes, int(dk), use_close=False)
+            if has_targets and int(day_tn) > 0:
+                open_slots = max(0, int(day_tn) - int(len(positions)))
+                buy_rows = [r for r in (target_rows or []) if str(r.get("code") or "").strip() not in positions]
+                _buy_at_px(buy_rows, int(dk), use_close=False, target_slots=int(open_slots))
+
+        eq = _equity_at_px(int(dk), use_close=True)
+        rr = float(eq / prev_eq - 1.0) if prev_eq > 0 else 0.0
         rets.append(float(rr))
-        eq = float(eq) * float(1.0 + float(rr))
-        curve.append({"day": int(dk), "equity": float(eq), "r": float(rr), "codes": codes, "probs": probs})
+        if positions:
+            trade_days += 1
+        curve.append({"day": int(dk), "equity": float(eq), "r": float(rr), "codes": list(positions.keys()), "probs": [positions[c].get("prob") for c in positions.keys()]})
+        prev_eq = float(eq)
+
+        if trade_px_close:
+            _sell_at_px(sell_codes, int(dk), use_close=True)
+            if has_targets and int(day_tn) > 0:
+                open_slots = max(0, int(day_tn) - int(len(positions)))
+                buy_rows = [r for r in (target_rows or []) if str(r.get("code") or "").strip() not in positions]
+                _buy_at_px(buy_rows, int(dk), use_close=True, target_slots=int(open_slots))
+
+        for code in list(positions.keys()):
+            _, c = _get_oc(str(code), int(dk))
+            if c is not None and c > 0.0:
+                last_close[str(code)] = float(c)
 
     win_rate = float(sum(1 for x in rets if float(x) > 0.0) / float(trade_days)) if trade_days > 0 else 0.0
     pos_sum = float(sum([x for x in rets if float(x) > 0.0])) if rets else 0.0
@@ -669,6 +960,8 @@ def _calc_code_candidates(
     level: KL_TYPE,
     data_src: DATA_SRC,
     autype: AUTYPE,
+    rolling_sample_mode: Optional[str],
+    rolling_stride: Optional[int],
     enable_rolling_lookback: bool,
     min_prob: float,
     profit_threshold: Optional[float],
@@ -678,14 +971,15 @@ def _calc_code_candidates(
     stop_loss: float = -0.03,
     enforce_t1: bool = True,
     filter_start_date: Optional[str] = None,
-) -> Tuple[str, List[dict], Optional[dict]]:
+) -> Tuple[str, List[dict], Optional[dict], Dict[int, Dict[str, float]]]:
     code = normalize_code(code)
     use_online_latest = bool(data_src == DATA_SRC.CLICK_HOUSE)
     kl_list = fetch_stock_data(code, level, start_date, end_date, data_src, autype=autype, use_online_latest=use_online_latest)
+    daily_oc = _daily_oc_from_kl_list(kl_list)
 
     min_kl = _env_int("MLCHAN_MIN_KL_SIZE", 500)
     if not kl_list or len(kl_list) < min_kl:
-        return code, [], {"detail": "no_data", "kl": int(len(kl_list) if kl_list else 0)}
+        return code, [], {"detail": "no_data", "kl": int(len(kl_list) if kl_list else 0)}, daily_oc
 
     _, bsp_dict, _, _ = get_chan_data(
         code,
@@ -699,11 +993,13 @@ def _calc_code_candidates(
         end_time=end_date,
         enable_rolling_lookback=enable_rolling_lookback,
         autype=autype,
+        rolling_sample_mode=rolling_sample_mode,
+        rolling_stride=rolling_stride,
     )
 
     min_bsp = _env_int("MLCHAN_MIN_BSP_SIZE", 200)
     if not bsp_dict or len(bsp_dict) < min_bsp:
-        return code, [], {"detail": "no_bsp", "bsp": int(len(bsp_dict) if bsp_dict else 0)}
+        return code, [], {"detail": "no_bsp", "bsp": int(len(bsp_dict) if bsp_dict else 0)}, daily_oc
 
     fixed_ts = None
     if filter_start_date:
@@ -818,7 +1114,7 @@ def _calc_code_candidates(
         except Exception:
             pass
 
-    return code, out, {"detail": "ok", "candidates": int(len(out))}
+    return code, out, {"detail": "ok", "candidates": int(len(out))}, daily_oc
 
 
 class WolfpackBacktester:
@@ -831,6 +1127,8 @@ class WolfpackBacktester:
         data_src: str = "clickhouse",
         autype: str = "qfq",
         enable_rolling_lookback: bool = True,
+        rolling_sample_mode: str = "every_bar",
+        rolling_stride: int = 1,
         min_prob: float = 0.25,
         holding_period: int = 3,
         trade_cost: float = 0.0002,
@@ -843,6 +1141,11 @@ class WolfpackBacktester:
         index_ma_window: int = 20,
         stop_loss: float = -0.03,
         enforce_t1: bool = True,
+        sell_mode: str = "baseline",
+        t1_decision_time: str = "10:00",
+        t1_gap_strong_threshold: float = 0.03,
+        t1_gap_weak_threshold: float = -0.02,
+        t1_gap_very_strong_threshold: float = 0.05,
         risk_filter_enabled: bool = False,
         risk_mode: str = "both",
         risk_drop_threshold: float = -0.03,
@@ -889,6 +1192,7 @@ class WolfpackBacktester:
 
         all_candidates = []
         per_code = {}
+        daily_oc_by_code: Dict[str, Dict[int, Dict[str, float]]] = {}
         allow_by_day = None
         if bool(index_filter_enabled):
             allow_by_day = _load_index_filter_day_set(index_code, start_date, end_date, src, au, ma_window=int(index_ma_window))
@@ -998,6 +1302,8 @@ class WolfpackBacktester:
                     level,
                     src,
                     au,
+                    str(rolling_sample_mode or "").strip().lower() or "every_bar",
+                    int(rolling_stride) if rolling_stride is not None else 1,
                     bool(enable_rolling_lookback),
                     float(mp),
                     profit_threshold,
@@ -1013,7 +1319,7 @@ class WolfpackBacktester:
             for fut in concurrent.futures.as_completed(futures):
                 code = futures.get(fut)
                 try:
-                    cc, rows, meta = fut.result()
+                    cc, rows, meta, daily_oc = fut.result()
                 except Exception as e:
                     per_code[str(code)] = {"detail": str(e)}
                     continue
@@ -1021,6 +1327,11 @@ class WolfpackBacktester:
                     per_code[str(cc)] = dict(meta)
                 if rows:
                     all_candidates.extend(rows)
+                if daily_oc:
+                    try:
+                        daily_oc_by_code[str(cc)] = dict(daily_oc)
+                    except Exception:
+                        pass
 
         portfolio = _simulate_universe_daily_topn(
             all_candidates,
@@ -1031,6 +1342,14 @@ class WolfpackBacktester:
             index_allow_by_day=allow_by_day,
             risk_by_day=risk_by_day,
             intraday_cfg=intraday_cfg,
+            daily_oc_by_code=daily_oc_by_code,
+            sell_mode=str(sell_mode or "baseline").strip().lower() or "baseline",
+            t1_decision_time=str(t1_decision_time or "10:00"),
+            t1_gap_strong_threshold=float(t1_gap_strong_threshold),
+            t1_gap_weak_threshold=float(t1_gap_weak_threshold),
+            t1_gap_very_strong_threshold=float(t1_gap_very_strong_threshold),
+            enforce_t1=bool(enforce_t1),
+            stop_loss=float(stop_loss),
         )
         return {
             "status": "success",
@@ -1042,6 +1361,8 @@ class WolfpackBacktester:
                 "autype": raw_autype,
                 "start_date": str(start_date),
                 "end_date": str(end_date),
+                "rolling_sample_mode": str(rolling_sample_mode or "").strip().lower() or "every_bar",
+                "rolling_stride": int(rolling_stride) if rolling_stride is not None else 1,
                 "min_prob": float(mp),
                 "holding_period": int(holding_period),
                 "trade_cost": float(trade_cost or 0.0),
@@ -1053,6 +1374,11 @@ class WolfpackBacktester:
                 "index_ma_window": int(index_ma_window),
                 "stop_loss": float(stop_loss),
                 "enforce_t1": bool(enforce_t1),
+                "sell_mode": str(sell_mode or "baseline").strip().lower() or "baseline",
+                "t1_decision_time": str(t1_decision_time or "10:00"),
+                "t1_gap_strong_threshold": float(t1_gap_strong_threshold),
+                "t1_gap_weak_threshold": float(t1_gap_weak_threshold),
+                "t1_gap_very_strong_threshold": float(t1_gap_very_strong_threshold),
                 "risk_filter_enabled": bool(risk_filter_enabled),
                 "risk_mode": str(risk_mode or "both"),
                 "risk_drop_threshold": float(risk_drop_threshold),

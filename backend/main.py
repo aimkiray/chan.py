@@ -1206,12 +1206,20 @@ class WolfpackBacktestRequest(BaseModel):
     holding_period: int = 3
     min_prob: float = 0.25
     trade_cost: float = 0.0002
+    walk_forward_max_folds: int = 25
+    rolling_sample_mode: str = "every_bar"
+    rolling_stride: int = 1
     portfolio_top_n: int = 2
     index_filter_enabled: bool = True
     index_code: str = "399006"
     index_ma_window: int = 20
     stop_loss: float = -0.03
     enforce_t1: bool = True
+    sell_mode: str = "baseline"
+    t1_decision_time: str = "10:00"
+    t1_gap_strong_threshold: float = 0.03
+    t1_gap_weak_threshold: float = -0.02
+    t1_gap_very_strong_threshold: float = 0.05
     risk_filter_enabled: bool = True
     risk_mode: str = "both"
     risk_drop_threshold: float = -0.03
@@ -1342,12 +1350,20 @@ async def run_wolfpack_backtest(req: WolfpackBacktestRequest):
         min_prob=req.min_prob,
         holding_period=req.holding_period,
         trade_cost=req.trade_cost,
+        walk_forward_max_folds=req.walk_forward_max_folds,
+        rolling_sample_mode=req.rolling_sample_mode,
+        rolling_stride=req.rolling_stride,
         portfolio_top_n=req.portfolio_top_n,
         index_filter_enabled=req.index_filter_enabled,
         index_code=req.index_code,
         index_ma_window=req.index_ma_window,
         stop_loss=req.stop_loss,
         enforce_t1=req.enforce_t1,
+        sell_mode=req.sell_mode,
+        t1_decision_time=req.t1_decision_time,
+        t1_gap_strong_threshold=req.t1_gap_strong_threshold,
+        t1_gap_weak_threshold=req.t1_gap_weak_threshold,
+        t1_gap_very_strong_threshold=req.t1_gap_very_strong_threshold,
         risk_filter_enabled=req.risk_filter_enabled,
         risk_mode=req.risk_mode,
         risk_drop_threshold=req.risk_drop_threshold,
@@ -2274,6 +2290,11 @@ class LivePaperTradeStepRequest(BaseModel):
     risk_trend_ma_window: int = 20
     risk_data_fail_mode: str = "reduce"
     risk_intraday_data_fail_mode: str = "reduce"
+    sell_mode: str = "baseline"
+    t1_decision_time: str = "10:00"
+    t1_gap_strong_threshold: float = 0.03
+    t1_gap_weak_threshold: float = -0.02
+    t1_gap_very_strong_threshold: float = 0.05
 
 class LiveSimUpsertRequest(BaseModel):
     sim_id: str
@@ -3572,6 +3593,8 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
             except Exception:
                 return 0
 
+        sell_mode = str(getattr(req, "sell_mode", None) or "baseline").strip().lower() or "baseline"
+
         market = str(getattr(req, "market", None) or "cn_a").strip().lower()
         enforce_t1 = market in ["cn", "cn_a", "a", "a_share", "ashare"]
         blocked = []
@@ -3579,6 +3602,20 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
             t1_next_day = _next_trading_day(_cn_dt(now_ts).date())
             t1_min_day = int(t1_next_day.strftime("%Y%m%d"))
             t1_exec_ts = _cn_ts(datetime.datetime(t1_next_day.year, t1_next_day.month, t1_next_day.day, 9, 25))
+            if sell_mode in ("delayed", "delay", "scheme1", "t1_delay"):
+                raw_decision = str(getattr(req, "t1_decision_time", None) or "10:00").strip()
+                decision_hh = 10
+                decision_mm = 0
+                try:
+                    parts = raw_decision.split(":")
+                    decision_hh = int(parts[0]) if parts and parts[0].strip() else 10
+                    decision_mm = int(parts[1]) if len(parts) > 1 and parts[1].strip() else 0
+                    decision_hh = max(0, min(23, decision_hh))
+                    decision_mm = max(0, min(59, decision_mm))
+                except Exception:
+                    decision_hh = 10
+                    decision_mm = 0
+                t1_exec_ts = _cn_ts(datetime.datetime(t1_next_day.year, t1_next_day.month, t1_next_day.day, int(decision_hh), int(decision_mm)))
             sell_ok = []
             for c in sell_codes:
                 p = pos_map.get(c)
@@ -3593,6 +3630,188 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
             sell_codes = sell_ok
 
         storage.replace_blocked_live_orders(blocked, requested_ts=int(now_ts), sim_id=sim_id, portfolio_id=pid)
+        if sell_mode in ("t1_gap_roll", "gap_roll", "advanced"):
+            try:
+                t1_gap_strong_th = float(getattr(req, "t1_gap_strong_threshold", 0.03) or 0.03)
+            except Exception:
+                t1_gap_strong_th = 0.03
+            try:
+                t1_gap_weak_th = float(getattr(req, "t1_gap_weak_threshold", -0.02) or -0.02)
+            except Exception:
+                t1_gap_weak_th = -0.02
+            try:
+                t1_gap_very_strong_th = float(getattr(req, "t1_gap_very_strong_threshold", 0.05) or 0.05)
+            except Exception:
+                t1_gap_very_strong_th = 0.05
+
+            raw_decision = str(getattr(req, "t1_decision_time", None) or "10:00").strip()
+            decision_min = 10 * 60
+            try:
+                parts = raw_decision.split(":")
+                hh = int(parts[0]) if parts and parts[0].strip() else 10
+                mm = int(parts[1]) if len(parts) > 1 and parts[1].strip() else 0
+                hh = max(0, min(23, hh))
+                mm = max(0, min(59, mm))
+                decision_min = hh * 60 + mm
+            except Exception:
+                decision_min = 10 * 60
+
+            close_guard_min = 14 * 60 + 57
+
+            def _prev_trading_day(d: datetime.date) -> datetime.date:
+                pd = d - datetime.timedelta(days=1)
+                while pd.weekday() >= 5:
+                    pd = pd - datetime.timedelta(days=1)
+                return pd
+
+            def _t1_open_pct(code: str) -> Optional[float]:
+                code = str(code or "").strip()
+                if not code:
+                    return None
+                try:
+                    kl_list = fetch_stock_data(
+                        code,
+                        level,
+                        begin,
+                        end,
+                        data_src,
+                        autype=autype,
+                        use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
+                    )
+                except Exception:
+                    kl_list = None
+                if not kl_list or len(kl_list) < 1:
+                    return None
+                k = kl_list[-1]
+                prev = kl_list[-2] if len(kl_list) > 1 else None
+                try:
+                    o = float(getattr(k, "open", 0.0) or 0.0)
+                except Exception:
+                    o = 0.0
+                try:
+                    pc = float(getattr(prev, "close", 0.0) or 0.0) if prev is not None else 0.0
+                except Exception:
+                    pc = 0.0
+                if o > 0.0 and pc > 0.0:
+                    return float(o / pc - 1.0)
+                return None
+
+            dt_cn = _cn_dt(now_ts)
+            now_min = int(dt_cn.hour) * 60 + int(dt_cn.minute)
+            prev_day_key = int(_prev_trading_day(dt_cn.date()).strftime("%Y%m%d"))
+            rebalance_set = set(rebalance_out or [])
+            forced_set = set(to_force_sell or [])
+            filtered_sell = []
+            for c in sell_codes:
+                if c in forced_set:
+                    filtered_sell.append(c)
+                    continue
+                if c not in rebalance_set:
+                    filtered_sell.append(c)
+                    continue
+                p = pos_map.get(c)
+                if not p:
+                    filtered_sell.append(c)
+                    continue
+                ed = _pos_entry_day(p)
+                if int(ed or 0) != int(prev_day_key or 0):
+                    filtered_sell.append(c)
+                    continue
+                op = _t1_open_pct(c)
+                if now_min < int(decision_min):
+                    if op is not None and float(op) < float(t1_gap_weak_th):
+                        filtered_sell.append(c)
+                    else:
+                        continue
+                else:
+                    if op is not None and float(op) > float(t1_gap_very_strong_th) and now_min < int(close_guard_min):
+                        continue
+                    filtered_sell.append(c)
+            sell_codes = filtered_sell
+
+        if market_open and sell_mode in ("delayed", "delay", "scheme1", "t1_delay"):
+            raw_decision = str(getattr(req, "t1_decision_time", None) or "10:00").strip()
+            decision_min = 10 * 60
+            try:
+                parts = raw_decision.split(":")
+                hh = int(parts[0]) if parts and parts[0].strip() else 10
+                mm = int(parts[1]) if len(parts) > 1 and parts[1].strip() else 0
+                hh = max(0, min(23, hh))
+                mm = max(0, min(59, mm))
+                decision_min = hh * 60 + mm
+            except Exception:
+                decision_min = 10 * 60
+
+            dt_cn = _cn_dt(now_ts)
+            now_min = int(dt_cn.hour) * 60 + int(dt_cn.minute)
+            if now_min < int(decision_min):
+                delayed_pos = storage.list_positions(sim_id=sim_id, portfolio_id=pid)
+                for p in delayed_pos or []:
+                    if not p.get("stock_name"):
+                        p["stock_name"] = str(get_stock_name(p.get("stock_code")) or "")
+                resp = {
+                    "ts": int(now_ts),
+                    "day": int(cur_day or 0),
+                    "pool_id": pool_id,
+                    "frequency": freq_raw,
+                    "model_key": str(bundle.get("key") or ""),
+                    "rank_mode": str((bundle.get("meta") or {}).get("rank_mode") or ""),
+                    "max_workers": int(mw),
+                    "sell_mode": str(sell_mode),
+                    "market_open": True,
+                    "market_session": market_session,
+                    "next_exec_ts": int(next_exec_ts or 0),
+                    "executed_pending": bool(executed_pending),
+                    "risk": {
+                        "enabled": bool(getattr(req, "risk_filter_enabled", True)),
+                        "level": str(risk_level),
+                        "effective_top_n": int(effective_top_n),
+                        "index_code": str(getattr(req, "risk_index_code", "399006") or "399006"),
+                        "ret1d": (risk or {}).get("ret1d") if isinstance(risk, dict) else None,
+                        "atr_pct": (risk or {}).get("atr_pct") if isinstance(risk, dict) else None,
+                        "gap_open_pct": (risk or {}).get("gap_open_pct") if isinstance(risk, dict) else None,
+                        "today_open": (risk or {}).get("today_open") if isinstance(risk, dict) else None,
+                        "prev_close": (risk or {}).get("prev_close") if isinstance(risk, dict) else None,
+                        "ma20": (risk or {}).get("ma20") if isinstance(risk, dict) else None,
+                        "trend_ma_window": int(getattr(req, "risk_trend_ma_window", 20) or 20),
+                        "intraday_enabled": bool(getattr(req, "risk_intraday_enabled", True)),
+                        "intraday_bear_threshold": float(getattr(req, "risk_intraday_bear_threshold", -0.015) or -0.015),
+                        "intraday_bull_threshold": float(getattr(req, "risk_intraday_bull_threshold", -0.03) or -0.03),
+                        "intraday": (risk or {}).get("intraday") if isinstance(risk, dict) else None,
+                        "reason": (risk or {}).get("reason") if isinstance(risk, dict) else None,
+                        "data_fail_mode": str(getattr(req, "risk_data_fail_mode", "reduce") or "reduce"),
+                        "data_missing": (risk or {}).get("data_missing") if isinstance(risk, dict) else None,
+                        "intraday_data_fail_mode": str(getattr(req, "risk_intraday_data_fail_mode", "reduce") or "reduce"),
+                        "intraday_missing": (risk or {}).get("intraday_missing") if isinstance(risk, dict) else None,
+                        "gap_down_threshold": float(getattr(req, "risk_gap_down_threshold", -0.015) or -0.015),
+                        "mode": str(getattr(req, "risk_mode", "both") or "both"),
+                    },
+                    "targets": targets,
+                    "sell": [],
+                    "buy": [],
+                    "pending_orders": storage.list_live_orders(status=None, limit=1000, sim_id=sim_id, portfolio_id=pid),
+                    "trades": storage.list_live_trades(limit=200, sim_id=sim_id, portfolio_id=pid),
+                    "positions": delayed_pos,
+                }
+                try:
+                    storage.add_live_step_record(
+                        sim_id=sim_id,
+                        run_id=str(getattr(req, "run_id", None) or ""),
+                        step_ts=int(resp.get("ts") or 0),
+                        day=int(resp.get("day") or 0),
+                        portfolio_id=pid,
+                        risk=resp.get("risk") if isinstance(resp.get("risk"), dict) else {},
+                        targets=targets,
+                        sell=[],
+                        buy=[],
+                        blocked=blocked,
+                        summary={},
+                        result=resp,
+                        error=None,
+                    )
+                except Exception:
+                    pass
+                return resp
 
         if not market_open:
             pending = []
@@ -3610,6 +3829,7 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
                 "model_key": str(bundle.get("key") or ""),
                 "rank_mode": str((bundle.get("meta") or {}).get("rank_mode") or ""),
                 "max_workers": int(mw),
+                "sell_mode": str(sell_mode),
                 "market_open": False,
                 "market_session": market_session,
                 "next_exec_ts": int(next_exec_ts or 0),
@@ -3827,6 +4047,7 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
             "model_key": str(bundle.get("key") or ""),
             "rank_mode": str((bundle.get("meta") or {}).get("rank_mode") or ""),
             "max_workers": int(mw),
+            "sell_mode": str(sell_mode),
             "market_open": True,
             "market_session": market_session,
             "next_exec_ts": int(next_exec_ts or 0),

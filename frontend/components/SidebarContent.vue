@@ -458,7 +458,7 @@
         </UButton>
       </div>
 
-      <div v-if="activeTab === 'paper' && (!collapsed || mode === 'desktop')" class="space-y-3">
+      <div v-if="activeTab === 'backtest' && (!collapsed || mode === 'desktop')" class="space-y-3">
         <div>
           <div class="flex items-center justify-between gap-2 mb-2">
             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.simId') }}</label>
@@ -543,6 +543,54 @@
             </div>
           </div>
 
+          <div class="pt-2 border-t border-gray-100 dark:border-gray-700 space-y-2">
+            <div class="flex items-center justify-between gap-2">
+              <UCheckbox v-model="proxyPaperParams.use_latest_available_day" :label="t('strategy.useLatestAvailableDay')" />
+            </div>
+            <div class="space-y-2">
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.walkForwardMaxFolds') }}</label>
+                <UInput v-model="proxyPaperParams.walk_forward_max_folds" type="number" class="w-full" />
+              </div>
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.rollingSampleMode') }}</label>
+                <USelectMenu v-model="proxyPaperParams.rolling_sample_mode" :options="paperRollingSampleModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
+              </div>
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.rollingStride') }}</label>
+                <UInput v-model="proxyPaperParams.rolling_stride" type="number" class="w-full" />
+              </div>
+            </div>
+          </div>
+
+          <div class="pt-2 border-t border-gray-100 dark:border-gray-700 space-y-2">
+            <div>
+              <label class="text-xs text-gray-500">{{ t('strategy.sellMode') }}</label>
+              <USelectMenu v-model="proxyPaperParams.sell_mode" :options="sellModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
+              <div class="mt-1 text-xs text-gray-500">{{ paperSellModeHint }}</div>
+            </div>
+            <div v-if="paperDecisionTimeVisible">
+              <label class="text-xs text-gray-500">{{ t('strategy.t1DecisionTime') }}</label>
+              <UInput v-model="proxyPaperParams.t1_decision_time" :placeholder="t('strategy.t1DecisionTimePlaceholder')" class="w-full" />
+              <div v-if="t1DecisionTimeError" class="mt-1 text-xs text-red-500">{{ t1DecisionTimeError }}</div>
+            </div>
+            <div v-if="paperGapRollVisible" class="space-y-2 pl-2 border-l-2 border-gray-200 dark:border-gray-700">
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.t1GapWeakThreshold') }}</label>
+                <UInput v-model="proxyPaperParams.t1_gap_weak_threshold" type="number" step="0.001" class="w-full" />
+              </div>
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.t1GapStrongThreshold') }}</label>
+                <UInput v-model="proxyPaperParams.t1_gap_strong_threshold" type="number" step="0.001" class="w-full" />
+              </div>
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.t1GapVeryStrongThreshold') }}</label>
+                <UInput v-model="proxyPaperParams.t1_gap_very_strong_threshold" type="number" step="0.001" class="w-full" />
+              </div>
+              <div v-if="t1GapThresholdError" class="text-xs text-red-500">{{ t1GapThresholdError }}</div>
+            </div>
+          </div>
+
           <div>
             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('strategy.pretrainedModelKey') }}</label>
             <UInput v-model="proxyPaperParams.pretrained_model_key" :placeholder="t('strategy.pretrainedModelKeyPlaceholder')" class="w-full" />
@@ -573,6 +621,10 @@
                 <label class="text-xs text-gray-500">{{ t('strategy.riskFlatDropThreshold') }}</label>
                 <UInput v-model="proxyPaperParams.risk_flat_drop_threshold" type="number" class="w-full" />
               </div>
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.riskDataFailMode') }}</label>
+                <USelectMenu v-model="proxyPaperParams.risk_data_fail_mode" :options="riskFailModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
+              </div>
             </div>
             <div class="pt-2 border-t border-gray-100 dark:border-gray-700">
               <UCheckbox v-model="proxyPaperParams.risk_intraday_enabled" :label="t('strategy.riskIntradayEnabled')" />
@@ -590,14 +642,23 @@
                 <label class="text-xs text-gray-500">{{ t('strategy.riskIntradayBullThreshold') }}</label>
                 <UInput v-model="proxyPaperParams.risk_intraday_bull_threshold" type="number" class="w-full" />
               </div>
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.riskIntradayDataFailMode') }}</label>
+                <USelectMenu v-model="proxyPaperParams.risk_intraday_data_fail_mode" :options="riskFailModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
+              </div>
             </div>
           </div>
         </div>
 
-        <div class="pt-4 border-t border-gray-100 dark:border-gray-800 space-y-2">
-          <UButton block color="primary" @click="$emit('runPaperStep')">{{ t('strategy.runStep') }}</UButton>
-          <UButton block color="gray" variant="soft" @click="$emit('refreshPaperPositions')">{{ t('strategy.refreshPositions') }}</UButton>
-          <UButton block color="red" variant="soft" @click="$emit('resetPaperPositions')">{{ t('strategy.resetPositions') }}</UButton>
+        <div class="pt-4 border-t border-gray-100 dark:border-gray-800 space-y-2 pb-4">
+          <UButton block color="primary" :disabled="loading || backtestLoading" :loading="backtestLoading" @click="$emit('runBacktest')">{{ t('portfolio.runBacktest') }}</UButton>
+          <UButton block color="gray" variant="soft" :disabled="paperRunDisabled" @click="$emit('runPaperStep')">{{ t('portfolio.runPaperDirect') }}</UButton>
+        </div>
+      </div>
+
+      <div v-else-if="activeTab === 'paper' && (!collapsed || mode === 'desktop')" class="space-y-2 pb-4">
+        <div class="text-xs text-gray-500">
+          {{ t('portfolio.paperRunCreateHint') }}
         </div>
       </div>
 
@@ -824,6 +885,20 @@ const riskModeOptions = computed(() => [
   { label: t('strategy.riskModeAtr'), value: 'atr' },
   { label: t('strategy.riskModeBoth'), value: 'both' }
 ])
+const sellModeOptions = computed(() => [
+  { label: t('strategy.sellModeBaseline'), value: 'baseline' },
+  { label: t('strategy.sellModeDelayed'), value: 'delayed' },
+  { label: t('strategy.sellModeGapRoll'), value: 't1_gap_roll' }
+])
+const riskFailModeOptions = computed(() => [
+  { label: t('strategy.failModePass'), value: 'pass' },
+  { label: t('strategy.failModeReduce'), value: 'reduce' },
+  { label: t('strategy.failModeFlat'), value: 'flat' }
+])
+const paperRollingSampleModeOptions = computed(() => [
+  { label: t('strategy.rollingModeEveryBar'), value: 'every_bar' },
+  { label: t('strategy.rollingModeBsp'), value: 'bsp' }
+])
 
 const props = defineProps({
   activeTab: { type: String, default: 'analysis' },
@@ -834,6 +909,7 @@ const props = defineProps({
   rankTransformEnabled: { type: Boolean, default: true },
   onlyFeatures: { type: String, default: '' },
   loading: Boolean,
+  backtestLoading: { type: Boolean, default: false },
   // Daily Props
   blend: { type: Boolean, default: false },
   // Intraday Props
@@ -876,7 +952,8 @@ const emit = defineEmits([
   'update:strategyForm', 'update:strategyChanConfig', 'update:pretrainConfig',
   'update:paperConfig', 'update:paperParams',
   'analyze', 'toggle', 'refreshPretrained', 'refresh', 'runStrategy', 'runPretrain',
-  'runPaperStep', 'refreshPaperPositions', 'resetPaperPositions'
+  'runPaperStep',
+  'runBacktest'
 ])
 
 const proxyCode = computed({
@@ -967,6 +1044,44 @@ const proxyPaperConfig = computed({
 const proxyPaperParams = computed({
   get: () => props.paperParams,
   set: (val) => emit('update:paperParams', val)
+})
+
+const paperDecisionTimeVisible = computed(() => {
+  const mode = String(proxyPaperParams.value?.sell_mode || 'baseline')
+  return ['delayed', 't1_gap_roll'].includes(mode)
+})
+
+const paperGapRollVisible = computed(() => {
+  const mode = String(proxyPaperParams.value?.sell_mode || 'baseline')
+  return mode === 't1_gap_roll'
+})
+
+const paperSellModeHint = computed(() => {
+  const mode = String(proxyPaperParams.value?.sell_mode || 'baseline')
+  if (mode === 'delayed') return t('strategy.sellModeHintDelayed')
+  if (mode === 't1_gap_roll') return t('strategy.sellModeHintGapRoll')
+  return t('strategy.sellModeHintBaseline')
+})
+
+const t1DecisionTimeError = computed(() => {
+  if (!paperDecisionTimeVisible.value) return ''
+  const raw = String(proxyPaperParams.value?.t1_decision_time || '').trim()
+  if (!raw) return t('strategy.t1DecisionTimeInvalid')
+  const ok = /^([01]\d|2[0-3]):([0-5]\d)$/.test(raw)
+  return ok ? '' : t('strategy.t1DecisionTimeInvalid')
+})
+
+const t1GapThresholdError = computed(() => {
+  if (!paperGapRollVisible.value) return ''
+  const strong = Number(proxyPaperParams.value?.t1_gap_strong_threshold)
+  const veryStrong = Number(proxyPaperParams.value?.t1_gap_very_strong_threshold)
+  if (!Number.isFinite(strong) || !Number.isFinite(veryStrong)) return ''
+  return veryStrong < strong ? t('strategy.t1GapThresholdInvalid') : ''
+})
+
+const paperRunDisabled = computed(() => {
+  if (props.activeTab !== 'backtest') return false
+  return !!t1DecisionTimeError.value || !!t1GapThresholdError.value
 })
 
 const generateSimId = () => {
