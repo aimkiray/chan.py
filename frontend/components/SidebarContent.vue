@@ -1222,12 +1222,12 @@ onMounted(async () => {
             })
             // Set default if not set
             if (!proxyStrategyForm.value.index_code && indexOptions.value.length > 0) {
-               // Default to 000001 (Shanghai Composite) if exists
-                const def = indexOptions.value.find(x => x.value === '000001' || x.value === 'sh000001')
+                const def = indexOptions.value.find(x => x.value === '399006' || x.value === 'sz399006')
+                  || indexOptions.value.find(x => x.value === '000001' || x.value === 'sh000001')
                 if (def) {
                     proxyStrategyForm.value.index_code = def.value
                 } else {
-                    proxyStrategyForm.value.index_code = 'sh000001'
+                    proxyStrategyForm.value.index_code = '399006'
                 }
             }
         }

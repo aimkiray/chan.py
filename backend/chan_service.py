@@ -965,6 +965,21 @@ def fetch_stock_data(code, level, begin_time, end_time, data_src_type, autype=AU
                     setattr(k, "adj_factor", float(factor))
             except Exception:
                 pass
+        try:
+            warns = getattr(stock_api, "warnings", None)
+            if warns:
+                uniq = []
+                seen = set()
+                for w in warns:
+                    s = str(w)
+                    if not s or s in seen:
+                        continue
+                    seen.add(s)
+                    uniq.append(s)
+                for s in uniq[:20]:
+                    print(s)
+        except Exception:
+            pass
         return dedup
     finally:
         StockAPI.do_close()
@@ -4154,6 +4169,7 @@ def _walk_forward_eval_infos(
     rank_transform_enabled: Optional[bool] = None,
     only_features=None,
     enforce_t1: bool = False,
+    fixed_test_start_ts: Optional[int] = None,
 ):
     n = len(infos or [])
     if n <= 0:
@@ -4209,7 +4225,7 @@ def _walk_forward_eval_infos(
     if start_train_end <= 0:
         start_train_end = 1
 
-    desired_train_years = 6.0
+    desired_train_years = _env_float("MLCHAN_DESIRED_TRAIN_YEARS", 1.0)
     try:
         first_ts = int(getattr((infos[0] or {}).get("open_time"), "ts", 0) or 0)
     except Exception:
@@ -4268,13 +4284,40 @@ def _walk_forward_eval_infos(
     last_fold_feature_meta = None
 
     train_end = int(start_train_end)
+    if fixed_test_start_ts is not None:
+        fixed_idx = None
+        try:
+            fixed_ts = int(fixed_test_start_ts)
+        except Exception:
+            fixed_ts = 0
+        if fixed_ts > 0:
+            for i in range(n):
+                try:
+                    ts = int(getattr((infos[i] or {}).get("open_time"), "ts", 0) or 0)
+                except Exception:
+                    ts = 0
+                if ts and int(ts) >= int(fixed_ts):
+                    fixed_idx = int(i)
+                    break
+        if fixed_idx is not None:
+            min_train_needed = max(int(min_train), 100, 1)
+            max_val_len = int(fixed_idx) - int(min_train_needed)
+            if int(max_val_len) >= 1:
+                val_window2 = min(int(val_window), int(max_val_len))
+                train_end2 = int(fixed_idx) - int(val_window2)
+                if int(train_end2) >= int(min_train_needed) and int(train_end2) >= 1:
+                    train_end = int(train_end2)
+                    val_window = int(val_window2)
     used_folds = 0
     while used_folds < max_folds:
         val_start = train_end
         val_end = train_end + val_window
         test_start = val_end
-        test_end = test_start + test_window
-        if test_end > n:
+        if test_start >= n:
+            break
+        test_end = min(test_start + test_window, n)
+        min_test_len = _env_int("MLCHAN_MIN_TEST_FOLD_SIZE", 1)
+        if (test_end - test_start) < int(min_test_len):
             break
 
         train_infos = infos[:train_end]
@@ -4852,7 +4895,7 @@ def evaluate_model_accuracy(model, X, y, threshold=0.5):
 
     return correct, total, (correct / total if total > 0 else 0.0)
 
-def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, val_ratio=0.2, threshold=0.5, calibrate_method="none", min_train=200, min_val=200, min_test=500, n_jobs=-1, profit_threshold: Optional[float] = 0.02, auto_profit_quantile: float = 0.7, profit_lookahead: int = 3, use_atr_label: bool = False, atr_period: int = 14, atr_mult: float = 1.0, use_scale_pos_weight: bool = False, xgb_max_depth: Optional[int] = None, xgb_reg_alpha: Optional[float] = None, xgb_reg_lambda: Optional[float] = None, lgb_max_depth: Optional[int] = None, lgb_reg_alpha: Optional[float] = None, lgb_reg_lambda: Optional[float] = None, backtest_mode: str = "auto", walk_forward_max_folds: int = 20, walk_forward_test_window: Optional[int] = None, walk_forward_val_window: Optional[int] = None, walk_forward_step: Optional[int] = None, trade_cost: float = 0.0, topk_frac: float = 0.2, quantile_bin_count: int = 5, rank_transform_enabled: Optional[bool] = None, only_features=None, enforce_t1: bool = False):
+def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, val_ratio=0.2, threshold=0.5, calibrate_method="none", min_train=200, min_val=200, min_test=500, n_jobs=-1, profit_threshold: Optional[float] = 0.02, auto_profit_quantile: float = 0.7, profit_lookahead: int = 3, use_atr_label: bool = False, atr_period: int = 14, atr_mult: float = 1.0, use_scale_pos_weight: bool = False, xgb_max_depth: Optional[int] = None, xgb_reg_alpha: Optional[float] = None, xgb_reg_lambda: Optional[float] = None, lgb_max_depth: Optional[int] = None, lgb_reg_alpha: Optional[float] = None, lgb_reg_lambda: Optional[float] = None, backtest_mode: str = "auto", walk_forward_max_folds: int = 20, walk_forward_test_window: Optional[int] = None, walk_forward_val_window: Optional[int] = None, walk_forward_step: Optional[int] = None, trade_cost: float = 0.0, topk_frac: float = 0.2, quantile_bin_count: int = 5, rank_transform_enabled: Optional[bool] = None, only_features=None, enforce_t1: bool = False, fixed_test_start_ts: Optional[int] = None):
     empty_model = None
     empty_meta = []
     if not bsp_dict:
@@ -4977,6 +5020,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             rank_transform_enabled=rank_transform_enabled,
             only_features=only_features_list,
             enforce_t1=enforce_t1,
+            fixed_test_start_ts=fixed_test_start_ts,
         )
 
         feature_meta = build_feature_meta(bsp_dict)

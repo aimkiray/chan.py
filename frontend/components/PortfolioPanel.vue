@@ -607,7 +607,7 @@ const wolfpackConfig = ref({
   trade_cost: 0.0002,
   portfolio_top_n: 2,
   index_filter_enabled: true,
-  index_code: 'sh000001',
+  index_code: '399006',
   index_ma_window: 20,
   stop_loss: -0.03,
   enforce_t1: true,
@@ -668,13 +668,13 @@ onMounted(async () => {
                 const name = typeof c === 'string' ? c : (c.name || code)
                 return { label: `${name} (${code})`, value: code, name: name }
             })
-            // Default check
-            if (wolfpackConfig.value.index_code && !indexOptions.value.find(x => x.value === wolfpackConfig.value.index_code)) {
-               // keep existing or set default? Keep existing for now.
-            } else if (!wolfpackConfig.value.index_code && indexOptions.value.length > 0) {
-               if (indexOptions.value.find(x => x.value === 'sh000001')) {
-                   wolfpackConfig.value.index_code = 'sh000001'
-               }
+            const cur = String(wolfpackConfig.value.index_code || '').trim()
+            const hasCur = !!(cur && indexOptions.value.find(x => x.value === cur))
+            if (!hasCur && indexOptions.value.length > 0) {
+              const def = indexOptions.value.find(x => x.value === '399006' || x.value === 'sz399006')
+                || indexOptions.value.find(x => x.value === '000001' || x.value === 'sh000001')
+                || indexOptions.value[0]
+              if (def?.value) wolfpackConfig.value.index_code = def.value
             }
         }
     } catch (e) {

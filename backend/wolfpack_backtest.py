@@ -2,6 +2,8 @@ import datetime
 import concurrent.futures
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
+import os
+from bisect import bisect_right
 
 from Common.CEnum import KL_TYPE, DATA_SRC, AUTYPE
 from backend.chan_service import (
@@ -10,6 +12,18 @@ from backend.chan_service import (
     train_time_split_backtest,
     normalize_code,
 )
+
+def _env_int(key, default):
+    try:
+        return int(os.environ.get(key, default))
+    except:
+        return int(default)
+
+def _env_float(key, default):
+    try:
+        return float(os.environ.get(key, default))
+    except:
+        return float(default)
 
 
 def _day_key_from_ts(ts: int) -> Optional[int]:
@@ -663,11 +677,14 @@ def _calc_code_candidates(
     walk_forward_max_folds: int,
     stop_loss: float = -0.03,
     enforce_t1: bool = True,
+    filter_start_date: Optional[str] = None,
 ) -> Tuple[str, List[dict], Optional[dict]]:
     code = normalize_code(code)
     use_online_latest = bool(data_src == DATA_SRC.CLICK_HOUSE)
     kl_list = fetch_stock_data(code, level, start_date, end_date, data_src, autype=autype, use_online_latest=use_online_latest)
-    if not kl_list or len(kl_list) < 500:
+
+    min_kl = _env_int("MLCHAN_MIN_KL_SIZE", 500)
+    if not kl_list or len(kl_list) < min_kl:
         return code, [], {"detail": "no_data", "kl": int(len(kl_list) if kl_list else 0)}
 
     _, bsp_dict, _, _ = get_chan_data(
@@ -683,8 +700,17 @@ def _calc_code_candidates(
         enable_rolling_lookback=enable_rolling_lookback,
         autype=autype,
     )
-    if not bsp_dict or len(bsp_dict) < 200:
+
+    min_bsp = _env_int("MLCHAN_MIN_BSP_SIZE", 200)
+    if not bsp_dict or len(bsp_dict) < min_bsp:
         return code, [], {"detail": "no_bsp", "bsp": int(len(bsp_dict) if bsp_dict else 0)}
+
+    fixed_ts = None
+    if filter_start_date:
+        try:
+            fixed_ts = int(datetime.datetime.strptime(str(filter_start_date), "%Y-%m-%d").timestamp())
+        except Exception:
+            fixed_ts = None
 
     _, _, acc = train_time_split_backtest(
         bsp_dict,
@@ -697,6 +723,7 @@ def _calc_code_candidates(
         profit_lookahead=int(holding_period),
         trade_cost=float(trade_cost or 0.0),
         enforce_t1=bool(enforce_t1),
+        fixed_test_start_ts=fixed_ts,
     )
     preds = []
     if isinstance(acc, dict):
@@ -783,6 +810,14 @@ def _calc_code_candidates(
         except Exception:
             ts = 0
         out.append({"day": int(dk), "ts": int(ts), "prob": float(r.get("prob")), "profit": float(realized), "code": code})
+    
+    if filter_start_date:
+        try:
+            fs_ts = int(datetime.datetime.strptime(filter_start_date, "%Y-%m-%d").timestamp())
+            out = [r for r in out if r.get("ts", 0) >= fs_ts]
+        except Exception:
+            pass
+
     return code, out, {"detail": "ok", "candidates": int(len(out))}
 
 
@@ -944,12 +979,21 @@ class WolfpackBacktester:
                     "daily_low_by_day": {},
                     "get_index_close_at_ts": None,
                 }
+        try:
+            train_years = _env_float("MLCHAN_DESIRED_TRAIN_YEARS", 1.0)
+            lookback_days = int((train_years + 3.0) * 365)
+            s_dt = datetime.datetime.strptime(str(start_date), "%Y-%m-%d")
+            ext_s_dt = s_dt - datetime.timedelta(days=lookback_days)
+            extended_start_date = ext_s_dt.strftime("%Y-%m-%d")
+        except Exception:
+            extended_start_date = str(start_date)
+
         with concurrent.futures.ProcessPoolExecutor(max_workers=mw) as executor:
             futures = {
                 executor.submit(
                     _calc_code_candidates,
                     code,
-                    start_date,
+                    extended_start_date,
                     end_date,
                     level,
                     src,
@@ -962,6 +1006,7 @@ class WolfpackBacktester:
                     int(walk_forward_max_folds),
                     float(stop_loss),
                     bool(enforce_t1),
+                    str(start_date),
                 ): code
                 for code in pool_codes
             }

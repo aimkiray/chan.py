@@ -2,7 +2,7 @@ import os
 import datetime
 import threading
 from bisect import bisect_left, bisect_right
-from typing import Iterable, Optional
+from typing import Iterable, Optional, List
 from dotenv import load_dotenv
 from clickhouse_driver import Client
 
@@ -941,6 +941,341 @@ class CClickHouseAPI(CCommonStockApi):
 
         return data_list
 
+    def _normalize_datetime_bound(self, value: str, is_end: bool) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return raw
+        if " " in raw or "T" in raw:
+            return raw.replace("T", " ")
+        if len(raw) == 10:
+            try:
+                datetime.datetime.strptime(raw, "%Y-%m-%d")
+                return f"{raw} 23:59:59" if is_end else f"{raw} 00:00:00"
+            except Exception:
+                return raw
+        if len(raw) == 8 and raw.isdigit():
+            try:
+                dt = datetime.datetime.strptime(raw, "%Y%m%d")
+                s = dt.strftime("%Y-%m-%d")
+                return f"{s} 23:59:59" if is_end else f"{s} 00:00:00"
+            except Exception:
+                return raw
+        return raw
+
+    def _get_trading_dates(self, normalized_code: str, begin_date: str, end_date: str):
+        self._ensure_connection()
+        if not self._client:
+            return []
+        begin_dt = self._parse_ymd(begin_date) or datetime.date(1990, 1, 1)
+        end_dt = self._parse_ymd(end_date) or datetime.date.today()
+        if end_dt < begin_dt:
+            begin_dt, end_dt = end_dt, begin_dt
+        table = "index_daily" if str(self.asset_type or "").upper() == "INDEX" else "stock_daily"
+        try:
+            rows = self._client.execute(
+                f"""
+                SELECT date
+                FROM {table}
+                WHERE code = %(code)s
+                  AND date >= %(begin)s
+                  AND date <= %(end)s
+                ORDER BY date ASC
+                """,
+                {"code": normalized_code, "begin": begin_dt.strftime("%Y-%m-%d"), "end": end_dt.strftime("%Y-%m-%d")},
+            )
+        except Exception:
+            rows = []
+        out = []
+        for (d,) in rows:
+            dt = self._parse_ymd(d)
+            if dt is None:
+                continue
+            out.append(dt)
+        return out
+
+    def _group_date_segments(self, dates: List[datetime.date]):
+        if not dates:
+            return []
+        dates = sorted(list(dict.fromkeys(dates)))
+        segs = []
+        s = dates[0]
+        prev = dates[0]
+        for d in dates[1:]:
+            if (d - prev).days == 1:
+                prev = d
+                continue
+            segs.append((s, prev))
+            s = d
+            prev = d
+        segs.append((s, prev))
+        return segs
+
+    def _resample_intraday_from_lower_data(
+        self,
+        target_k_type: KL_TYPE,
+        lower_data: List[CKLine_Unit],
+        used_lower_k_type: KL_TYPE,
+        begin_date: str,
+        end_date: str,
+    ):
+        interval_map = {
+            KL_TYPE.K_5M: 5,
+            KL_TYPE.K_15M: 15,
+            KL_TYPE.K_30M: 30,
+            KL_TYPE.K_60M: 60,
+        }
+        interval_min = interval_map.get(target_k_type)
+        if interval_min is None:
+            return []
+
+        def _klu_dt(klu: CKLine_Unit) -> Optional[datetime.datetime]:
+            t = getattr(klu, "time", None)
+            if t is None:
+                return None
+            try:
+                return datetime.datetime(int(t.year), int(t.month), int(t.day), int(t.hour), int(t.minute))
+            except Exception:
+                return None
+
+        def _trade_metric(klu: CKLine_Unit, key: DATA_FIELD) -> float:
+            try:
+                return float(getattr(getattr(klu, "trade_info", None), "metric", {}).get(key, 0.0) or 0.0)
+            except Exception:
+                return 0.0
+
+        def _is_trade_time(dt: datetime.datetime) -> bool:
+            hhmm = int(dt.hour) * 60 + int(dt.minute)
+            if 9 * 60 + 25 <= hhmm < 9 * 60 + 30:
+                return True
+            if 9 * 60 + 30 <= hhmm < 11 * 60 + 30:
+                return True
+            if 13 * 60 <= hhmm < 15 * 60:
+                return True
+            return False
+
+        def _bucket_start(dt: datetime.datetime) -> Optional[datetime.datetime]:
+            hhmm = int(dt.hour) * 60 + int(dt.minute)
+            d = dt.date()
+            if 9 * 60 + 25 <= hhmm < 9 * 60 + 30:
+                dt = datetime.datetime(d.year, d.month, d.day, 9, 30)
+                hhmm = 9 * 60 + 30
+            if 9 * 60 + 30 <= hhmm < 11 * 60 + 30:
+                anchor = datetime.datetime(d.year, d.month, d.day, 9, 30)
+                offset = int((dt - anchor).total_seconds() // 60)
+                b = int(offset // int(interval_min)) * int(interval_min)
+                return anchor + datetime.timedelta(minutes=b)
+            if 13 * 60 <= hhmm < 15 * 60:
+                anchor = datetime.datetime(d.year, d.month, d.day, 13, 0)
+                offset = int((dt - anchor).total_seconds() // 60)
+                b = int(offset // int(interval_min)) * int(interval_min)
+                return anchor + datetime.timedelta(minutes=b)
+            return None
+
+        if used_lower_k_type == KL_TYPE.K_1M:
+            by_dt = {}
+            for klu in lower_data:
+                dt = _klu_dt(klu)
+                if dt is None or not _is_trade_time(dt):
+                    continue
+                by_dt[dt] = klu
+
+            def _fill_session(day: datetime.date, start_h: int, start_m: int, end_h: int, end_m: int):
+                start = datetime.datetime(day.year, day.month, day.day, start_h, start_m)
+                end = datetime.datetime(day.year, day.month, day.day, end_h, end_m)
+                first = None
+                for dt in sorted([k for k in by_dt.keys() if start <= k < end]):
+                    first = by_dt.get(dt)
+                    if first is not None:
+                        break
+                base_px = None
+                if first is not None:
+                    try:
+                        base_px = float(getattr(first, "open", 0.0) or 0.0) or float(getattr(first, "close", 0.0) or 0.0)
+                    except Exception:
+                        base_px = None
+                last_close = None
+                cur = start
+                while cur < end:
+                    if cur in by_dt:
+                        klu = by_dt[cur]
+                        try:
+                            c = float(getattr(klu, "close", 0.0) or 0.0)
+                        except Exception:
+                            c = 0.0
+                        if c > 0:
+                            last_close = c
+                        cur += datetime.timedelta(minutes=1)
+                        continue
+                    px = last_close
+                    if px is None:
+                        px = base_px
+                    if px is None:
+                        cur += datetime.timedelta(minutes=1)
+                        continue
+                    t = CTime(cur.year, cur.month, cur.day, cur.hour, cur.minute, auto=False)
+                    by_dt[cur] = CKLine_Unit(
+                        {
+                            DATA_FIELD.FIELD_TIME: t,
+                            DATA_FIELD.FIELD_OPEN: float(px),
+                            DATA_FIELD.FIELD_HIGH: float(px),
+                            DATA_FIELD.FIELD_LOW: float(px),
+                            DATA_FIELD.FIELD_CLOSE: float(px),
+                            DATA_FIELD.FIELD_VOLUME: 0.0,
+                            DATA_FIELD.FIELD_TURNOVER: 0.0,
+                        }
+                    )
+                    last_close = px
+                    cur += datetime.timedelta(minutes=1)
+
+            days = sorted(list({dt.date() for dt in by_dt.keys()}))
+            for day in days:
+                _fill_session(day, 9, 30, 11, 30)
+                _fill_session(day, 13, 0, 15, 0)
+            lower_data = [by_dt[dt] for dt in sorted(by_dt.keys())]
+
+        grouped = {}
+        for klu in lower_data:
+            dt = _klu_dt(klu)
+            if dt is None or not _is_trade_time(dt):
+                continue
+            b = _bucket_start(dt)
+            if b is None:
+                continue
+            grouped.setdefault(b, []).append(klu)
+
+        if not grouped:
+            return []
+
+        normalized_code = self.code.lower().replace(".", "")
+        factor_trading_dates = []
+        factor_by_date = {}
+        if self.autype == AUTYPE.QFQ:
+            factor_trading_dates, factor_by_date = self._get_qfq_factors_by_date(
+                normalized_code=normalized_code, begin_date=begin_date, end_date=end_date
+            )
+        elif self.autype == AUTYPE.HFQ:
+            factor_trading_dates, factor_by_date = self._get_hfq_factors_by_date(
+                normalized_code=normalized_code, begin_date=begin_date, end_date=end_date
+            )
+
+        out = []
+        for bdt in sorted(grouped.keys()):
+            rows = sorted(grouped[bdt], key=lambda x: int(getattr(getattr(x, "time", None), "ts", 0) or 0))
+            if not rows:
+                continue
+
+            first = rows[0]
+            last = rows[-1]
+            try:
+                o = float(getattr(first, "open", 0.0) or 0.0)
+                c = float(getattr(last, "close", 0.0) or 0.0)
+            except Exception:
+                continue
+            if c <= 0:
+                continue
+            if o <= 0:
+                o = c
+
+            highs = []
+            lows = []
+            vol_sum = 0.0
+            amt_sum = 0.0
+            for klu in rows:
+                try:
+                    h = float(getattr(klu, "high", 0.0) or 0.0)
+                    l = float(getattr(klu, "low", 0.0) or 0.0)
+                    cc = float(getattr(klu, "close", 0.0) or 0.0)
+                except Exception:
+                    continue
+                if cc <= 0:
+                    continue
+                if h <= 0:
+                    h = cc
+                if l <= 0:
+                    l = cc
+                highs.append(max(h, cc))
+                lows.append(min(l, cc))
+                vol_sum += _trade_metric(klu, DATA_FIELD.FIELD_VOLUME)
+                amt_sum += _trade_metric(klu, DATA_FIELD.FIELD_TURNOVER)
+            if not highs or not lows:
+                continue
+            h = float(max(highs + [o, c]))
+            l = float(min(lows + [o, c]))
+
+            factor = None
+            if factor_by_date:
+                d = bdt.date()
+                factor = factor_by_date.get(d)
+                if factor is None and factor_trading_dates:
+                    idx = bisect_right(factor_trading_dates, d) - 1
+                    if idx >= 0:
+                        factor = factor_by_date.get(factor_trading_dates[idx])
+            if factor is not None:
+                o = float(o) * factor
+                h = float(h) * factor
+                l = float(l) * factor
+                c = float(c) * factor
+
+            t = CTime(bdt.year, bdt.month, bdt.day, bdt.hour, bdt.minute, auto=False)
+            out.append(
+                CKLine_Unit(
+                    {
+                        DATA_FIELD.FIELD_TIME: t,
+                        DATA_FIELD.FIELD_OPEN: float(round(o, 2)),
+                        DATA_FIELD.FIELD_HIGH: float(round(h, 2)),
+                        DATA_FIELD.FIELD_LOW: float(round(l, 2)),
+                        DATA_FIELD.FIELD_CLOSE: float(round(c, 2)),
+                        DATA_FIELD.FIELD_VOLUME: float(vol_sum),
+                        DATA_FIELD.FIELD_TURNOVER: float(amt_sum),
+                    }
+                )
+            )
+        return out
+
+    def _resample_intraday_from_lower(self, target_k_type: KL_TYPE, begin_date: str, end_date: str):
+        interval_map = {
+            KL_TYPE.K_5M: 5,
+            KL_TYPE.K_15M: 15,
+            KL_TYPE.K_30M: 30,
+            KL_TYPE.K_60M: 60,
+        }
+        interval_min = interval_map.get(target_k_type)
+        if interval_min is None:
+            return []
+
+        candidates = [KL_TYPE.K_1M, KL_TYPE.K_5M]
+        lower_data = []
+        used_lower_k_type = None
+        for lower_k_type in candidates:
+            lower_api = CClickHouseAPI(
+                code=self.code,
+                k_type=lower_k_type,
+                begin_date=begin_date,
+                end_date=end_date,
+                autype=AUTYPE.NONE,
+                asset_type=self.asset_type,
+            )
+            try:
+                lower_api._client = self._client
+            except Exception:
+                pass
+            tmp = list(lower_api.get_kl_data() or [])
+            if tmp:
+                lower_data = tmp
+                used_lower_k_type = lower_k_type
+                break
+
+        if not lower_data or used_lower_k_type is None:
+            return []
+
+        return self._resample_intraday_from_lower_data(
+            target_k_type=target_k_type,
+            lower_data=lower_data,
+            used_lower_k_type=used_lower_k_type,
+            begin_date=begin_date,
+            end_date=end_date,
+        )
+
     def get_kl_data(self) -> Iterable[CKLine_Unit]:
         self._ensure_connection()
         if not self._client:
@@ -1010,11 +1345,16 @@ class CClickHouseAPI(CCommonStockApi):
         
         begin_date = self.begin_date if self.begin_date else "1990-01-01"
         end_date = self.end_date if self.end_date else datetime.date.today().strftime("%Y-%m-%d")
+        begin_query = begin_date
+        end_query = end_date
+        if time_col == "datetime":
+            begin_query = self._normalize_datetime_bound(begin_date, is_end=False)
+            end_query = self._normalize_datetime_bound(end_date, is_end=True)
 
         params = {
             'code': normalized_code,
-            'begin': begin_date,
-            'end': end_date
+            'begin': begin_query,
+            'end': end_query
         }
         
         # print(f"DEBUG: Querying {table} with params: {params}")
@@ -1066,6 +1406,47 @@ class CClickHouseAPI(CCommonStockApi):
                 if rows2 is not None:
                     rows = rows2
                     use_precomputed_qfq = False
+
+        patched_extra = []
+        if rows and query_k_type in (KL_TYPE.K_30M, KL_TYPE.K_60M):
+            try:
+                trading_dates = self._get_trading_dates(normalized_code, begin_date=begin_date, end_date=end_date)
+                present = set()
+                for r in rows:
+                    dt0 = r[0]
+                    d0 = dt0.date() if isinstance(dt0, datetime.datetime) else dt0
+                    if isinstance(d0, datetime.date):
+                        present.add(d0)
+                missing = [d for d in trading_dates if d not in present]
+                if len(missing) > 0:
+                    cap_days = 120
+                    if len(missing) > cap_days:
+                        missing = sorted(missing)[-cap_days:]
+                    segs = self._group_date_segments(missing)
+                    for a, b in segs:
+                        seg_begin = a.strftime("%Y-%m-%d")
+                        seg_end = b.strftime("%Y-%m-%d")
+                        patched_extra.extend(self._resample_intraday_from_lower(query_k_type, begin_date=seg_begin, end_date=seg_end))
+                    if patched_extra:
+                        try:
+                            self.warnings.append(
+                                f"clickhouse_patch_gap:{normalized_code}:{query_k_type.name}:missing_days:{len(missing)}:{begin_date}~{end_date}"
+                            )
+                        except Exception:
+                            pass
+            except Exception:
+                patched_extra = []
+
+        if (not rows) and query_k_type in (KL_TYPE.K_30M, KL_TYPE.K_60M):
+            resampled = self._resample_intraday_from_lower(query_k_type, begin_date=begin_date, end_date=end_date)
+            if resampled:
+                try:
+                    self.warnings.append(
+                        f"clickhouse_resample:{normalized_code}:{query_k_type.name}:from:{KL_TYPE.K_5M.name}:{begin_date}~{end_date}"
+                    )
+                except Exception:
+                    pass
+                return resampled
 
         factor_trading_dates = []
         factor_by_date = {}
@@ -1177,6 +1558,22 @@ class CClickHouseAPI(CCommonStockApi):
                     }
                 )
             )
+
+        if patched_extra:
+            data_list = list(data_list) + list(patched_extra)
+            data_list.sort(key=lambda x: int(getattr(getattr(x, "time", None), "ts", 0) or 0))
+            dedup = []
+            last_ts = None
+            for k in data_list:
+                ts = int(getattr(getattr(k, "time", None), "ts", 0) or 0)
+                if ts <= 0:
+                    continue
+                if last_ts is not None and ts == last_ts:
+                    dedup[-1] = k
+                    continue
+                dedup.append(k)
+                last_ts = ts
+            data_list = dedup
 
         return data_list
 
