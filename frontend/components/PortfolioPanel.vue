@@ -387,7 +387,7 @@
 
         <div>
           <label class="block text-sm font-medium mb-1">{{ t('strategy.indexCode') }}</label>
-          <USelectMenu v-model="wolfpackConfig.index_code" :options="indexOptions" value-attribute="value" option-attribute="label" class="w-full" :searchable="true" />
+          <USelectMenu v-model="wolfpackConfig.index_code" :searchable="searchIndices" :searchable-placeholder="t('common.typeToSearch')" :loading="searchingIndices" :options="indexOptions" value-attribute="value" option-attribute="label" class="w-full" />
         </div>
         <div>
           <label class="block text-sm font-medium mb-1">{{ t('strategy.indexMaWindow') }}</label>
@@ -655,32 +655,148 @@ const riskModeOptions = computed(() => ([
 
 const poolOptions = ref([{ label: '创业板50 (50)', value: 'index:IDX399673' }])
 const indexOptions = ref([])
+const INDEX_OPTIONS_CACHE_KEY = 'mlchan_index_options_cache_v1'
+const INDEX_OPTIONS_CACHE_MAX = 200
+
+const loadIndexOptionsCache = () => {
+  try {
+    if (typeof window === 'undefined') return []
+    const raw = localStorage.getItem(INDEX_OPTIONS_CACHE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    const cleaned = parsed
+      .map(x => ({
+        value: String(x?.value || x?.code || '').trim(),
+        label: String(x?.label || '').trim(),
+        name: String(x?.name || '').trim()
+      }))
+      .filter(x => x.value)
+      .map(x => ({
+        value: x.value,
+        name: x.name || x.value,
+        label: x.label || `${x.name || x.value} (${x.value})`
+      }))
+    return cleaned.slice(0, INDEX_OPTIONS_CACHE_MAX)
+  } catch (e) {
+    return []
+  }
+}
+
+const persistIndexOptionsCache = (items) => {
+  try {
+    if (typeof window === 'undefined') return
+    const arr = (items || [])
+      .map(x => ({
+        value: String(x?.value || '').trim(),
+        label: String(x?.label || '').trim(),
+        name: String(x?.name || '').trim()
+      }))
+      .filter(x => x.value)
+    localStorage.setItem(INDEX_OPTIONS_CACHE_KEY, JSON.stringify(arr.slice(0, INDEX_OPTIONS_CACHE_MAX)))
+  } catch (e) {
+  }
+}
+
+const ensureIndexOption = (code) => {
+  const cur = String(code || '').trim()
+  if (!cur) return
+  if ((indexOptions.value || []).find(x => x.value === cur)) return
+  indexOptions.value = [{ label: `${cur} (${cur})`, value: cur, name: cur }, ...(indexOptions.value || [])].slice(0, INDEX_OPTIONS_CACHE_MAX)
+  persistIndexOptionsCache(indexOptions.value)
+}
 
 onMounted(async () => {
     fetchPortfolios()
     
-    // Fetch Indices
+    const savedIndex = localStorage.getItem('mlchan_wolfpack_index_code')
+    if (savedIndex) {
+        wolfpackConfig.value.index_code = savedIndex
+    }
+
+    const cached = loadIndexOptionsCache()
+    if (cached.length > 0) {
+        indexOptions.value = cached
+        ensureIndexOption(wolfpackConfig.value.index_code)
+        return
+    }
+
     try {
-        const res = await axios.get('/api/indices?limit=5000')
+        const cur = savedIndex || String(wolfpackConfig.value.index_code || '').trim() || '399006'
+        
+        if (indexOptions.value.length === 0) {
+            searchingIndices.value = true
+        }
+        
+        const res = await axios.get('/api/indices', { params: { limit: 50, keyword: cur } })
         if (res.data && res.data.items) {
-            indexOptions.value = res.data.items.map(c => {
+            const items = res.data.items.map(c => {
                 const code = typeof c === 'string' ? c : (c.code || '')
                 const name = typeof c === 'string' ? c : (c.name || code)
                 return { label: `${name} (${code})`, value: code, name: name }
             })
-            const cur = String(wolfpackConfig.value.index_code || '').trim()
-            const hasCur = !!(cur && indexOptions.value.find(x => x.value === cur))
+            indexOptions.value = items
+            persistIndexOptionsCache(items)
+            const curVal = String(cur || '').trim()
+            if (curVal && !items.find(x => x.value === curVal)) {
+                const curDigits = curVal.replace(/\D/g, '')
+                const match = (curDigits ? items.find(x => String(x.value || '').replace(/\D/g, '') === curDigits) : null)
+                    || (curDigits ? items.find(x => String(x.value || '').replace(/\D/g, '').endsWith(curDigits)) : null)
+                if (match && match.value) {
+                    wolfpackConfig.value.index_code = match.value
+                }
+            }
+
+            const hasCur = !!(wolfpackConfig.value.index_code && indexOptions.value.find(x => x.value === wolfpackConfig.value.index_code))
             if (!hasCur && indexOptions.value.length > 0) {
-              const def = indexOptions.value.find(x => x.value === '399006' || x.value === 'sz399006')
-                || indexOptions.value.find(x => x.value === '000001' || x.value === 'sh000001')
-                || indexOptions.value[0]
-              if (def?.value) wolfpackConfig.value.index_code = def.value
+                if (!wolfpackConfig.value.index_code) {
+                    wolfpackConfig.value.index_code = items[0].value
+                }
             }
         }
     } catch (e) {
-        // ignore
+    } finally {
+        searchingIndices.value = false
     }
 })
+
+const searchingIndices = ref(false)
+const searchIndices = async (query) => {
+    if (!query) return indexOptions.value
+    searchingIndices.value = true
+    try {
+        const res = await axios.get('/api/indices', { params: { limit: 100, keyword: query } })
+        if (res.data && res.data.items) {
+            const items = res.data.items.map(c => {
+                const code = typeof c === 'string' ? c : (c.code || '')
+                const name = typeof c === 'string' ? c : (c.name || code)
+                return { label: `${name} (${code})`, value: code, name: name }
+            })
+            const merged = [...items, ...(indexOptions.value || [])]
+            const seen = new Set()
+            const uniq = []
+            for (const it of merged) {
+              const v = String(it?.value || '').trim()
+              if (!v || seen.has(v)) continue
+              seen.add(v)
+              uniq.push(it)
+            }
+            indexOptions.value = uniq.slice(0, INDEX_OPTIONS_CACHE_MAX)
+            persistIndexOptionsCache(indexOptions.value)
+            return items
+        }
+        return []
+    } catch (e) {
+        return []
+    } finally {
+        searchingIndices.value = false
+    }
+}
+
+watch(() => wolfpackConfig.value.index_code, (val) => {
+    if (val) localStorage.setItem('mlchan_wolfpack_index_code', val)
+    ensureIndexOption(val)
+}, { deep: true })
 
 const backtestKindOptions = computed(() => ([
   { label: t('portfolio.wolfpackBacktest'), value: 'wolfpack' },

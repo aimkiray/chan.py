@@ -970,16 +970,27 @@ class CClickHouseAPI(CCommonStockApi):
         end_dt = self._parse_ymd(end_date) or datetime.date.today()
         if end_dt < begin_dt:
             begin_dt, end_dt = end_dt, begin_dt
-        table = "index_daily" if str(self.asset_type or "").upper() == "INDEX" else "stock_daily"
+        asset = str(self.asset_type or "").upper()
+        if asset == "INDEX":
+            table = "etf_daily" if self._table_exists("etf_daily") else "index_daily"
+        else:
+            table = "stock_daily"
+
+        cols = self._get_table_columns(table)
+        cols_lower = {c.lower(): c for c in cols}
+        date_col = self._pick_column(cols_lower, ["date", "trade_date", "dt"])
+        code_col = self._pick_column(cols_lower, ["code", "ts_code", "symbol", "sec_code", "fund_code"])
+        if not date_col or not code_col:
+            return []
         try:
             rows = self._client.execute(
                 f"""
-                SELECT date
+                SELECT {date_col}
                 FROM {table}
-                WHERE code = %(code)s
-                  AND date >= %(begin)s
-                  AND date <= %(end)s
-                ORDER BY date ASC
+                WHERE {code_col} = %(code)s
+                  AND {date_col} >= %(begin)s
+                  AND {date_col} <= %(end)s
+                ORDER BY {date_col} ASC
                 """,
                 {"code": normalized_code, "begin": begin_dt.strftime("%Y-%m-%d"), "end": end_dt.strftime("%Y-%m-%d")},
             )
@@ -1282,7 +1293,11 @@ class CClickHouseAPI(CCommonStockApi):
             print("ClickHouse client not initialized")
             return []
 
-        prefix = "index_" if self.asset_type == "INDEX" else "stock_"
+        asset = str(self.asset_type or "").upper()
+        if asset == "INDEX":
+            prefix = "etf_" if self._table_exists("etf_daily") else "index_"
+        else:
+            prefix = "stock_"
 
         table_map = {
             KL_TYPE.K_1M: f"{prefix}1min",
@@ -1327,16 +1342,23 @@ class CClickHouseAPI(CCommonStockApi):
                     table = qfq_table
                     use_precomputed_qfq = True
 
+        if asset == "INDEX" and query_k_type in (KL_TYPE.K_WEEK, KL_TYPE.K_MON) and table and (not self._table_exists(table)):
+            need_aggregate = True
+            query_k_type = KL_TYPE.K_DAY
+            table = table_map.get(query_k_type)
+            use_precomputed_qfq = False
+            if self.autype == AUTYPE.QFQ and table:
+                qfq_table = f"{table}_qfq"
+                if self._table_exists(qfq_table):
+                    table = qfq_table
+                    use_precomputed_qfq = True
+
         if not table:
             raise Exception(f"Unsupported k_type for ClickHouse: {query_k_type}")
 
         base_table = table_map.get(query_k_type)
 
-        time_col = (
-            "datetime"
-            if query_k_type in [KL_TYPE.K_1M, KL_TYPE.K_5M, KL_TYPE.K_15M, KL_TYPE.K_30M, KL_TYPE.K_60M]
-            else "date"
-        )
+        is_intraday = query_k_type in [KL_TYPE.K_1M, KL_TYPE.K_5M, KL_TYPE.K_15M, KL_TYPE.K_30M, KL_TYPE.K_60M]
         
         # Normalize code: remove dot for ClickHouse query
         # For indices, we might need to be careful. 
@@ -1347,7 +1369,7 @@ class CClickHouseAPI(CCommonStockApi):
         end_date = self.end_date if self.end_date else datetime.date.today().strftime("%Y-%m-%d")
         begin_query = begin_date
         end_query = end_date
-        if time_col == "datetime":
+        if is_intraday:
             begin_query = self._normalize_datetime_bound(begin_date, is_end=False)
             end_query = self._normalize_datetime_bound(end_date, is_end=True)
 
@@ -1359,11 +1381,53 @@ class CClickHouseAPI(CCommonStockApi):
         
         # print(f"DEBUG: Querying {table} with params: {params}")
 
+        def pick_cols_for_table(table_name: str):
+            cols = self._get_table_columns(table_name)
+            if not cols:
+                return None
+            cols_lower = {c.lower(): c for c in cols}
+            time_col = self._pick_column(
+                cols_lower,
+                ["datetime", "time", "ts", "trade_time", "timestamp"]
+                if is_intraday
+                else ["date", "trade_date", "datetime", "dt"],
+            )
+            code_col = self._pick_column(cols_lower, ["code", "ts_code", "symbol", "sec_code", "fund_code"])
+            open_col = self._pick_column(cols_lower, ["open", "open_price"])
+            high_col = self._pick_column(cols_lower, ["high", "high_price"])
+            low_col = self._pick_column(cols_lower, ["low", "low_price"])
+            close_col = self._pick_column(cols_lower, ["close", "close_price"])
+            vol_col = self._pick_column(cols_lower, ["volume", "vol", "trade_volume"])
+            amt_col = self._pick_column(cols_lower, ["amount", "amt", "turnover", "trade_amount"])
+            if not (time_col and code_col and open_col and high_col and low_col and close_col):
+                return None
+            return {
+                "time_col": time_col,
+                "code_col": code_col,
+                "open_col": open_col,
+                "high_col": high_col,
+                "low_col": low_col,
+                "close_col": close_col,
+                "vol_expr": vol_col if vol_col else "0",
+                "amt_expr": amt_col if amt_col else "0",
+            }
+
         def run_query(table_name: str):
+            picked = pick_cols_for_table(table_name)
+            if not picked:
+                return None
+            time_col = picked["time_col"]
+            code_col = picked["code_col"]
+            open_col = picked["open_col"]
+            high_col = picked["high_col"]
+            low_col = picked["low_col"]
+            close_col = picked["close_col"]
+            vol_expr = picked["vol_expr"]
+            amt_expr = picked["amt_expr"]
             q = f"""
-                SELECT {time_col}, open, high, low, close, volume, amount 
+                SELECT {time_col}, {open_col}, {high_col}, {low_col}, {close_col}, {vol_expr}, {amt_expr}
                 FROM {table_name}
-                WHERE code = %(code)s 
+                WHERE {code_col} = %(code)s 
                 AND {time_col} >= %(begin)s 
                 AND {time_col} <= %(end)s
                 ORDER BY {time_col} ASC
@@ -1578,58 +1642,106 @@ class CClickHouseAPI(CCommonStockApi):
         return data_list
 
     def SetBasciInfo(self):
-        # Query stock_info table
         self._ensure_connection()
         if not self._client:
             return
             
         normalized_code = self.code.lower().replace(".", "")
-        query = "SELECT name FROM stock_info WHERE code = %(code)s LIMIT 1"
-        
-        try:
-            rows = self._client.execute(query, {'code': normalized_code})
-            if rows:
-                self.name = rows[0][0]
-            else:
-                self.name = self.code
-        except Exception as e:
-            print(f"SetBasciInfo failed: {e}")
-            self.name = self.code
+        asset = str(self.asset_type or "").upper()
+
+        def try_table(table: str, code_candidates: List[str], name_candidates: List[str]) -> Optional[str]:
+            if not self._table_exists(table):
+                return None
+            cols = self._get_table_columns(table)
+            if not cols:
+                return None
+            cols_lower = {c.lower(): c for c in cols}
+            code_col = self._pick_column(cols_lower, code_candidates)
+            name_col = self._pick_column(cols_lower, name_candidates)
+            if not code_col or not name_col:
+                return None
+            try:
+                rows = self._client.execute(
+                    f"SELECT {name_col} FROM {table} WHERE {code_col} = %(code)s LIMIT 1",
+                    {"code": normalized_code},
+                )
+                if rows and rows[0] and rows[0][0]:
+                    return str(rows[0][0])
+            except Exception:
+                return None
+            return None
+
+        name = None
+        if asset == "INDEX":
+            name = try_table(
+                "etf_info",
+                ["code", "ts_code", "symbol", "sec_code", "fund_code"],
+                ["name", "fund_name", "sec_name", "short_name", "fullname", "full_name"],
+            )
+            if name is None:
+                name = try_table("index_info", ["code", "ts_code", "symbol"], ["name", "index_name", "fullname", "full_name"])
+        if name is None:
+            name = try_table("stock_info", ["code", "ts_code", "symbol"], ["name", "stock_name", "sec_name", "short_name"])
+
+        self.name = name if name is not None else self.code
 
     @classmethod
-    def list_indices(cls, limit: int = 2000):
+    def list_indices(cls, limit: int = 2000, keyword: str = None):
         client = cls.get_client()
         if not client:
             return []
         
-        if not cls._table_exists("index_daily"):
+        daily_table = "etf_daily" if cls._table_exists("etf_daily") else "index_daily"
+        if not cls._table_exists(daily_table):
             return []
-            
-        cols = cls._get_table_columns("index_daily")
+
+        cols = cls._get_table_columns(daily_table)
         col_set = set([c.lower() for c in cols])
         
         code_col_name = "code"
-        if "ts_code" in col_set: code_col_name = "ts_code"
-        elif "symbol" in col_set: code_col_name = "symbol"
-        elif "code" in col_set: code_col_name = "code"
+        if "code" in col_set:
+            code_col_name = "code"
+        elif "ts_code" in col_set:
+            code_col_name = "ts_code"
+        elif "symbol" in col_set:
+            code_col_name = "symbol"
         
-        # We need to get distinct codes from index_daily, then try to get names from index_info
-        # If index_info exists, join or separate query. 
-        # For simplicity and ClickHouse optimization:
-        # Get codes first, then names? Or LEFT JOIN. 
-        # Let's try LEFT JOIN if index_info exists.
-        
-        has_info = cls._table_exists("index_info")
+        info_table = None
+        if cls._table_exists("etf_info"):
+            info_table = "etf_info"
+        elif cls._table_exists("index_info"):
+            info_table = "index_info"
+
+        info_code_col = None
+        info_name_col = None
+        if info_table:
+            info_cols = cls._get_table_columns(info_table)
+            info_lower = {c.lower(): c for c in info_cols}
+            info_code_col = cls._pick_column(info_lower, ["code", "ts_code", "symbol", "sec_code", "fund_code"])
+            info_name_col = cls._pick_column(info_lower, ["name", "fund_name", "sec_name", "short_name", "fullname", "full_name", "index_name"])
+            if not info_code_col or not info_name_col:
+                info_table = None
         
         try:
-            if has_info:
+            where_clause = ""
+            params = {"limit": limit}
+            if keyword:
+                kw = f"%{keyword}%"
+                params["kw"] = kw
+                if info_table:
+                    where_clause = f"WHERE a.{code_col_name} ILIKE %(kw)s OR b.{info_name_col} ILIKE %(kw)s"
+                else:
+                    where_clause = f"WHERE {code_col_name} ILIKE %(kw)s"
+
+            if info_table:
                 query = f"""
-                    SELECT DISTINCT a.{code_col_name} as code, b.name 
-                    FROM index_daily a
-                    LEFT JOIN index_info b ON a.{code_col_name} = b.code
+                    SELECT DISTINCT a.{code_col_name} as code, b.{info_name_col} 
+                    FROM {daily_table} a
+                    LEFT JOIN {info_table} b ON a.{code_col_name} = b.{info_code_col}
+                    {where_clause}
                     LIMIT %(limit)s
                 """
-                rows = client.execute(query, {"limit": limit})
+                rows = client.execute(query, params)
                 result = []
                 for r in rows:
                     c = str(r[0])
@@ -1639,10 +1751,11 @@ class CClickHouseAPI(CCommonStockApi):
             else:
                 query = f"""
                     SELECT DISTINCT {code_col_name} as code 
-                    FROM index_daily 
+                    FROM {daily_table} 
+                    {where_clause}
                     LIMIT %(limit)s
                 """
-                rows = client.execute(query, {"limit": limit})
+                rows = client.execute(query, params)
                 return [{"code": str(r[0]), "name": str(r[0])} for r in rows]
         except Exception as e:
             print(f"List indices failed: {e}")

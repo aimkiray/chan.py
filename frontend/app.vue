@@ -9,10 +9,10 @@
        </div>
        
        <!-- Custom Tabs -->
-       <div class="relative flex items-end self-stretch">
+       <div class="relative flex items-end self-stretch flex-1 min-w-0">
           <div
             ref="desktopTabsEl"
-            class="flex items-end self-stretch gap-1 overflow-x-auto overflow-y-hidden whitespace-nowrap px-1 scroll-px-1 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            class="flex items-end self-stretch gap-1 overflow-x-auto overflow-y-hidden whitespace-nowrap px-1 scroll-px-1 snap-x snap-mandatory [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
             style="-webkit-overflow-scrolling: touch;"
             @scroll="updateDesktopTabsHint"
           >
@@ -20,7 +20,9 @@
                v-for="tab in tabs" 
                :key="tab.name" 
                @click="activeTab = tab.name"
-               class="shrink-0 px-4 h-full flex items-center gap-2 text-sm transition-colors border-b-2 outline-none select-none"
+               :data-tab-name="tab.name"
+               type="button"
+               class="shrink-0 px-4 h-full flex items-center gap-2 text-sm transition-colors border-b-2 outline-none select-none snap-start"
                :class="activeTab === tab.name ? 'border-blue-600 text-blue-600 font-medium bg-white dark:bg-gray-900' : 'border-transparent text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200 hover:bg-gray-100/50 dark:hover:bg-gray-800/50'"
             >
                <svg width="16" height="16" viewBox="0 0 24 24"><path :d="tab.icon" /></svg>
@@ -28,11 +30,23 @@
             </button>
           </div>
 
-          <div v-show="desktopTabsCanScrollLeft" class="pointer-events-none absolute left-0 top-0 bottom-0 w-10 bg-gradient-to-r from-gray-50 dark:from-gray-950 to-transparent" />
-          <div v-show="desktopTabsCanScrollRight" class="pointer-events-none absolute right-0 top-0 bottom-0 w-10 bg-gradient-to-l from-gray-50 dark:from-gray-950 to-transparent" />
+          <button
+            v-show="desktopTabsCanScrollLeft"
+            type="button"
+            class="absolute left-0 top-0 bottom-0 w-10 bg-gradient-to-r from-gray-50 dark:from-gray-950 to-transparent flex items-center justify-start pl-1 z-10"
+            @click="scrollDesktopTabs('left')"
+          >
+            <UIcon name="i-heroicons-chevron-left" class="w-4 h-4 text-gray-400" />
+          </button>
+          <button
+            v-show="desktopTabsCanScrollRight"
+            type="button"
+            class="absolute right-0 top-0 bottom-0 w-10 bg-gradient-to-l from-gray-50 dark:from-gray-950 to-transparent flex items-center justify-end pr-1 z-10"
+            @click="scrollDesktopTabs('right')"
+          >
+            <UIcon name="i-heroicons-chevron-right" class="w-4 h-4 text-gray-400" />
+          </button>
        </div>
-       
-       <div class="flex-1"></div>
        
        <!-- Lang Switch -->
        <div class="pr-4">
@@ -116,6 +130,8 @@
               v-for="tab in tabs" 
               :key="tab.name" 
               @click="activeTab = tab.name"
+              :data-tab-name="tab.name"
+              type="button"
               class="shrink-0 px-3 h-11 flex items-center gap-2 text-sm transition-colors border-b-2 snap-start"
               :class="activeTab === tab.name ? 'bg-white dark:bg-gray-900 text-blue-600 border-blue-600 font-medium' : 'text-gray-600 dark:text-gray-400 border-transparent hover:bg-gray-100 dark:hover:bg-gray-800'"
             >
@@ -435,6 +451,21 @@ const updateDesktopTabsHint = () => {
 const updateTabsHint = () => {
   updateMobileTabsHint()
   updateDesktopTabsHint()
+}
+
+const scrollTabsIntoView = (tabName, el) => {
+  if (!tabName || !el) return
+  const target = el.querySelector(`[data-tab-name="${tabName}"]`)
+  if (!target) return
+  target.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' })
+}
+
+const scrollDesktopTabs = (direction) => {
+  const el = desktopTabsEl.value
+  if (!el) return
+  const delta = Math.max(80, Math.floor(el.clientWidth * 0.7))
+  el.scrollBy({ left: direction === 'left' ? -delta : delta, behavior: 'smooth' })
+  nextTick(() => updateDesktopTabsHint())
 }
 
 const handleManualClose = () => {
@@ -880,6 +911,12 @@ watch(activeTab, (newVal) => {
   if (newVal === 'intraday' || newVal === 'analysis') {
      fetchIntradayPretrainedModels({ quiet: true })
   }
+
+  nextTick(() => {
+    scrollTabsIntoView(newVal, mobileTabsEl.value)
+    scrollTabsIntoView(newVal, desktopTabsEl.value)
+    updateTabsHint()
+  })
 })
 
 watch(lang, (newVal) => {

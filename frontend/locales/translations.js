@@ -53,7 +53,8 @@ export const translations = {
             buy: "买入",
             sell: "卖出",
             all: "全部",
-            yearShort: "年"
+            yearShort: "年",
+            typeToSearch: "输入关键词搜索..."
         },
         sidebar: {
             params: "参数设置",
@@ -802,7 +803,8 @@ export const translations = {
             buy: "Buy",
             sell: "Sell",
             all: "All",
-            yearShort: "y"
+            yearShort: "Y",
+            typeToSearch: "Type to search..."
         },
         sidebar: {
             params: "Settings",

@@ -2134,10 +2134,10 @@ async def pretrain_model(req: PretrainRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/indices")
-async def list_indices(limit: int = 2000):
+async def list_indices(limit: int = 2000, keyword: Optional[str] = None):
     try:
         from DataAPI.ClickHouseAPI import CClickHouseAPI
-        items = CClickHouseAPI.list_indices(limit=limit)
+        items = CClickHouseAPI.list_indices(limit=limit, keyword=keyword)
         return {"items": items}
     except Exception as e:
         import traceback

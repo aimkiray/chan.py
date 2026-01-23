@@ -559,7 +559,7 @@
               </div>
               <div>
                  <label class="text-xs text-gray-500">{{ t('strategy.riskIndexCode') }}</label>
-                 <USelectMenu v-model="proxyPaperParams.risk_index_code" :options="indexOptions" value-attribute="value" option-attribute="label" class="w-full" :searchable="true" />
+                 <USelectMenu v-model="proxyPaperParams.risk_index_code" :searchable="searchIndices" :searchable-placeholder="t('common.typeToSearch')" :loading="searchingIndices" :options="indexOptions" value-attribute="value" option-attribute="label" class="w-full" />
               </div>
               <div>
                 <label class="text-xs text-gray-500">{{ t('strategy.riskGapDownThreshold') }}</label>
@@ -624,7 +624,7 @@
              <div class="flex items-center gap-1 mb-2">
                 <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.indexCode') }}</label>
              </div>
-             <USelectMenu v-model="proxyStrategyForm.index_code" :options="indexOptions" value-attribute="value" option-attribute="label" class="w-full" :searchable="true" />
+             <USelectMenu v-model="computedIndexCode" :searchable="searchIndices" :searchable-placeholder="t('common.typeToSearch')" :loading="searchingIndices" :options="indexOptions" value-attribute="value" option-attribute="label" class="w-full" />
           </div>
 
           <!-- Model -->
@@ -1120,6 +1120,56 @@ const poolMembersLoading = ref(false)
 const poolMetaLabel = ref('')
 
 const indexOptions = ref([])
+const INDEX_OPTIONS_CACHE_KEY = 'mlchan_index_options_cache_v1'
+const INDEX_OPTIONS_CACHE_MAX = 200
+
+const loadIndexOptionsCache = () => {
+  try {
+    if (typeof window === 'undefined') return []
+    const raw = localStorage.getItem(INDEX_OPTIONS_CACHE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    const cleaned = parsed
+      .map(x => ({
+        value: String(x?.value || x?.code || '').trim(),
+        label: String(x?.label || '').trim(),
+        name: String(x?.name || '').trim()
+      }))
+      .filter(x => x.value)
+      .map(x => ({
+        value: x.value,
+        name: x.name || x.value,
+        label: x.label || `${x.name || x.value} (${x.value})`
+      }))
+    return cleaned.slice(0, INDEX_OPTIONS_CACHE_MAX)
+  } catch (e) {
+    return []
+  }
+}
+
+const persistIndexOptionsCache = (items) => {
+  try {
+    if (typeof window === 'undefined') return
+    const arr = (items || [])
+      .map(x => ({
+        value: String(x?.value || '').trim(),
+        label: String(x?.label || '').trim(),
+        name: String(x?.name || '').trim()
+      }))
+      .filter(x => x.value)
+    localStorage.setItem(INDEX_OPTIONS_CACHE_KEY, JSON.stringify(arr.slice(0, INDEX_OPTIONS_CACHE_MAX)))
+  } catch (e) {
+  }
+}
+
+const ensureIndexOption = (code) => {
+  const cur = String(code || '').trim()
+  if (!cur) return
+  if ((indexOptions.value || []).find(x => x.value === cur)) return
+  indexOptions.value = [{ label: `${cur} (${cur})`, value: cur, name: cur }, ...(indexOptions.value || [])].slice(0, INDEX_OPTIONS_CACHE_MAX)
+  persistIndexOptionsCache(indexOptions.value)
+}
 
 const frequencyOptions = computed(() => [
   { label: t('periods.1d'), value: '1d' },
@@ -1212,29 +1262,111 @@ onMounted(async () => {
         // ignore
     }
 
+    // Load persisted index code
+    const savedIndex = localStorage.getItem('mlchan_sidebar_index_code')
+    // We must use savedIndex directly for the initial query because the computed prop update 
+    // might not have propagated back from parent yet.
+    if (savedIndex) {
+        computedIndexCode.value = savedIndex
+    }
+
+    const cached = loadIndexOptionsCache()
+    if (cached.length > 0) {
+        indexOptions.value = cached
+        ensureIndexOption(computedIndexCode.value)
+        ensureIndexOption(proxyPaperParams.value?.risk_index_code)
+        return
+    }
+
     try {
-        const res = await axios.get('/api/indices?limit=5000')
+        const currentCode = savedIndex || computedIndexCode.value || '399006'
+        if (indexOptions.value.length === 0) {
+            searchingIndices.value = true
+        }
+
+        const res = await axios.get('/api/indices', { params: { limit: 50, keyword: currentCode } })
         if (res.data && res.data.items) {
-            indexOptions.value = res.data.items.map(c => {
+            const items = res.data.items.map(c => {
                 const code = typeof c === 'string' ? c : (c.code || '')
                 const name = typeof c === 'string' ? c : (c.name || code)
                 return { label: `${name} (${code})`, value: code, name: name }
             })
-            // Set default if not set
-            if (!proxyStrategyForm.value.index_code && indexOptions.value.length > 0) {
-                const def = indexOptions.value.find(x => x.value === '399006' || x.value === 'sz399006')
-                  || indexOptions.value.find(x => x.value === '000001' || x.value === 'sh000001')
-                if (def) {
-                    proxyStrategyForm.value.index_code = def.value
-                } else {
-                    proxyStrategyForm.value.index_code = '399006'
+            indexOptions.value = items
+            persistIndexOptionsCache(items)
+
+            const curVal = String(computedIndexCode.value || '').trim()
+            if (curVal && !items.find(x => x.value === curVal)) {
+                const curDigits = curVal.replace(/\D/g, '')
+                const match = (curDigits ? items.find(x => String(x.value || '').replace(/\D/g, '') === curDigits) : null)
+                    || (curDigits ? items.find(x => String(x.value || '').replace(/\D/g, '').endsWith(curDigits)) : null)
+                    || items[0]
+                if (match && match.value) {
+                    computedIndexCode.value = match.value
                 }
+            }
+
+            if (!currentCode && !computedIndexCode.value && items.length > 0) {
+                 computedIndexCode.value = items[0].value
             }
         }
     } catch (e) {
         // ignore
+    } finally {
+        searchingIndices.value = false
     }
 })
+
+const searchingIndices = ref(false)
+
+const computedIndexCode = computed({
+    get: () => proxyStrategyForm.value.index_code,
+    set: (val) => {
+        const newForm = { ...proxyStrategyForm.value, index_code: val }
+        emit('update:strategyForm', newForm)
+    }
+})
+
+const searchIndices = async (query) => {
+    if (!query) return indexOptions.value
+    searchingIndices.value = true
+    try {
+        const res = await axios.get('/api/indices', { params: { limit: 100, keyword: query } })
+        if (res.data && res.data.items) {
+            const items = res.data.items.map(c => {
+                const code = typeof c === 'string' ? c : (c.code || '')
+                const name = typeof c === 'string' ? c : (c.name || code)
+                return { label: `${name} (${code})`, value: code, name: name }
+            })
+            const merged = [...items, ...(indexOptions.value || [])]
+            const seen = new Set()
+            const uniq = []
+            for (const it of merged) {
+              const v = String(it?.value || '').trim()
+              if (!v || seen.has(v)) continue
+              seen.add(v)
+              uniq.push(it)
+            }
+            indexOptions.value = uniq.slice(0, INDEX_OPTIONS_CACHE_MAX)
+            persistIndexOptionsCache(indexOptions.value)
+            return items
+        }
+        return []
+    } catch (e) {
+        return []
+    } finally {
+        searchingIndices.value = false
+    }
+}
+
+watch(() => proxyStrategyForm.value.index_code, (val) => {
+    if (val) localStorage.setItem('mlchan_sidebar_index_code', val)
+    ensureIndexOption(val)
+}, { deep: true })
+
+watch(() => proxyPaperParams.value?.risk_index_code, (val) => {
+    ensureIndexOption(val)
+}, { deep: true })
+
 
 watch(() => proxyPretrainConfig.value.selectedPoolId, (newId) => {
     const pool = poolOptions.value.find(p => p.value === newId)
