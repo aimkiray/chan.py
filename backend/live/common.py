@@ -1,4 +1,5 @@
 import datetime
+import math
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from Common.CEnum import AUTYPE, DATA_SRC, KL_TYPE
@@ -51,6 +52,181 @@ def day_key_from_ts(ts: int) -> Optional[int]:
     except Exception:
         return None
     return int(dt.year) * 10000 + int(dt.month) * 100 + int(dt.day)
+
+
+def cn_dt_from_ts(ts: int) -> datetime.datetime:
+    try:
+        return datetime.datetime.fromtimestamp(int(ts), tz=datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=8)
+    except Exception:
+        return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=8)
+
+
+def cn_day_key_from_ts(ts: int) -> Optional[int]:
+    dt = cn_dt_from_ts(int(ts))
+    return int(dt.year) * 10000 + int(dt.month) * 100 + int(dt.day)
+
+
+def parse_hhmm_to_minutes(v: Optional[str], default_min: int = 10 * 60) -> int:
+    raw = str(v or "").strip()
+    if not raw:
+        return int(default_min)
+    try:
+        parts = raw.split(":")
+        hh = int(parts[0]) if parts and parts[0].strip() else 10
+        mm = int(parts[1]) if len(parts) > 1 and parts[1].strip() else 0
+        hh = max(0, min(23, int(hh)))
+        mm = max(0, min(59, int(mm)))
+        return int(hh * 60 + mm)
+    except Exception:
+        return int(default_min)
+
+
+def cn_ts_from_day_key_minutes(day_key: int, minute_of_day: int) -> Optional[int]:
+    try:
+        s = str(int(day_key))
+    except Exception:
+        return None
+    if len(s) != 8 or (not s.isdigit()):
+        return None
+    try:
+        y = int(s[0:4])
+        m = int(s[4:6])
+        d = int(s[6:8])
+    except Exception:
+        return None
+    try:
+        mm = int(minute_of_day)
+    except Exception:
+        mm = 10 * 60
+    mm = max(0, min(23 * 60 + 59, int(mm)))
+    hh = int(mm // 60)
+    mi = int(mm % 60)
+    try:
+        dt_utc = datetime.datetime(y, m, d, hh, mi, 0, tzinfo=datetime.timezone.utc) - datetime.timedelta(hours=8)
+        return int(dt_utc.timestamp())
+    except Exception:
+        return None
+
+
+def pick_kl_bar_asof(kl_list, asof_ts: int):
+    if not kl_list:
+        return None
+    try:
+        t = int(asof_ts or 0)
+    except Exception:
+        t = 0
+    picked = None
+    for k in kl_list:
+        try:
+            ts = int(getattr(getattr(k, "time", None), "ts", 0) or 0)
+        except Exception:
+            ts = 0
+        if ts <= 0:
+            continue
+        if t and int(ts) > int(t):
+            continue
+        picked = k
+    if picked is None:
+        picked = kl_list[-1]
+    return picked
+
+
+def pick_kl_bar_asof_with_prev(kl_list, asof_ts: int):
+    if not kl_list:
+        return None, None
+    try:
+        t = int(asof_ts or 0)
+    except Exception:
+        t = 0
+    picked = None
+    picked_i = -1
+    for i, k in enumerate(kl_list):
+        try:
+            ts = int(getattr(getattr(k, "time", None), "ts", 0) or 0)
+        except Exception:
+            ts = 0
+        if ts <= 0:
+            continue
+        if t and int(ts) > int(t):
+            continue
+        picked = k
+        picked_i = i
+    if picked is None:
+        picked = kl_list[-1]
+        picked_i = len(kl_list) - 1
+    prev = kl_list[picked_i - 1] if picked_i > 0 else None
+    return picked, prev
+
+
+def daily_oc_from_kl_list(kl_list, decision_min: Optional[int] = None) -> Dict[int, Dict[str, float]]:
+    by_day: Dict[int, Dict[str, Any]] = {}
+    for k in (kl_list or []):
+        try:
+            ts = int(getattr(getattr(k, "time", None), "ts", 0) or 0)
+        except Exception:
+            ts = 0
+        if ts <= 0:
+            continue
+        dk = cn_day_key_from_ts(ts)
+        if dk is None:
+            continue
+        bar_min = None
+        if decision_min is not None:
+            try:
+                dt = cn_dt_from_ts(int(ts))
+                bar_min = int(dt.hour) * 60 + int(dt.minute)
+            except Exception:
+                bar_min = None
+        try:
+            o = float(getattr(k, "open", 0.0) or 0.0)
+        except Exception:
+            o = 0.0
+        try:
+            c = float(getattr(k, "close", 0.0) or 0.0)
+        except Exception:
+            c = 0.0
+        if c <= 0.0:
+            continue
+        if o <= 0.0:
+            o = c
+        dd = by_day.get(int(dk))
+        if dd is None:
+            by_day[int(dk)] = {
+                "open": float(o),
+                "close": float(c),
+                "ts_first": int(ts),
+                "ts_last": int(ts),
+                "decision_ts": int(ts) if (decision_min is not None and bar_min is not None and int(bar_min) <= int(decision_min)) else 0,
+                "decision_px": float(c) if (decision_min is not None and bar_min is not None and int(bar_min) <= int(decision_min)) else None,
+            }
+            continue
+        if int(ts) <= int(dd.get("ts_first") or 0):
+            dd["ts_first"] = int(ts)
+            dd["open"] = float(o)
+        if int(ts) >= int(dd.get("ts_last") or 0):
+            dd["ts_last"] = int(ts)
+            dd["close"] = float(c)
+        if decision_min is not None and bar_min is not None and int(bar_min) <= int(decision_min):
+            if int(ts) >= int(dd.get("decision_ts") or 0):
+                dd["decision_ts"] = int(ts)
+                dd["decision_px"] = float(c)
+    out: Dict[int, Dict[str, float]] = {}
+    for dk, dd in by_day.items():
+        try:
+            row: Dict[str, float] = {"open": float(dd.get("open") or 0.0), "close": float(dd.get("close") or 0.0)}
+            if decision_min is not None:
+                dp = dd.get("decision_px")
+                try:
+                    dp = float(dp) if dp is not None else None
+                except Exception:
+                    dp = None
+                if dp is None or (isinstance(dp, float) and (not math.isfinite(dp))) or (dp is not None and dp <= 0.0):
+                    dp = float(row.get("open") or 0.0)
+                row["decision_px"] = float(dp) if dp and dp > 0.0 else float(row.get("open") or 0.0)
+            out[int(dk)] = row
+        except Exception:
+            continue
+    return out
 
 
 def compute_volatility_250(kl_list) -> float:

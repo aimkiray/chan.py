@@ -26,6 +26,7 @@ from backend.chan_service import (
     predict_bsp,
     stragety_feature,
     extract_state_features_from_cur_lv,
+    cross_section_rank_transform_rows,
     get_stock_name,
     download_stock_history,
     fetch_stock_data,
@@ -56,6 +57,7 @@ strategy_runner = StrategyRunner(storage)
 _live_run_scheduler_started = False
 _live_run_scheduler_lock = threading.Lock()
 _live_run_running = set()
+_live_run_running_lock = threading.Lock()
 
 _pretrain_jobs_lock = threading.Lock()
 _pretrain_jobs = {}
@@ -66,6 +68,11 @@ _task_queue_cv = threading.Condition()
 _task_queue = []
 _task_current = {}
 _task_worker_started = False
+
+_live_task_queue_cv = threading.Condition()
+_live_task_queue = []
+_live_task_current = {}
+_live_task_worker_started = False
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -130,6 +137,151 @@ def _next_cn_30m_exec_ts(now_ts: int, offset_seconds: int = 5) -> int:
     dt = datetime.datetime(nd.year, nd.month, nd.day, times[0][0], times[0][1], 0) + datetime.timedelta(seconds=int(off))
     return int(_cn_ts_from_dt(dt))
 
+def _ensure_live_task_worker_started():
+    global _live_task_worker_started
+    with _live_task_queue_cv:
+        if _live_task_worker_started:
+            return
+        _live_task_worker_started = True
+
+    try:
+        workers = int(os.environ.get("MLCHAN_LIVE_TASK_WORKERS", "1") or 1)
+    except Exception:
+        workers = 1
+    workers = 1
+
+    def _worker_loop(worker_id: int):
+        global _live_task_current
+        while True:
+            task = None
+            with _live_task_queue_cv:
+                while not _live_task_queue:
+                    _live_task_queue_cv.wait()
+                task = _live_task_queue.pop(0)
+                _live_task_current[worker_id] = task
+            try:
+                fn = task.get("fn")
+                if callable(fn):
+                    fn()
+            except Exception:
+                pass
+            finally:
+                with _live_task_queue_cv:
+                    _live_task_current.pop(worker_id, None)
+
+    for i in range(int(workers)):
+        t = threading.Thread(target=lambda wid=i: _worker_loop(wid), daemon=True)
+        t.start()
+
+def _enqueue_live_task(kind: str, ref_id: str, fn: Callable[[], None]):
+    _ensure_live_task_worker_started()
+    with _live_task_queue_cv:
+        _live_task_queue.append({
+            "kind": str(kind),
+            "ref_id": str(ref_id),
+            "enqueued_at": _utc_now_str(),
+            "fn": fn,
+        })
+        _live_task_queue_cv.notify()
+
+def _enqueue_live_task_dedup(kind: str, ref_id: str, fn: Callable[[], None]) -> bool:
+    _ensure_live_task_worker_started()
+    k = str(kind)
+    rid = str(ref_id)
+    with _live_task_queue_cv:
+        for t in _live_task_queue:
+            try:
+                if str(t.get("kind")) == k and str(t.get("ref_id")) == rid:
+                    return False
+            except Exception:
+                continue
+        for cur in (_live_task_current or {}).values():
+            try:
+                if str((cur or {}).get("kind")) == k and str((cur or {}).get("ref_id")) == rid:
+                    return False
+            except Exception:
+                continue
+        _live_task_queue.append({
+            "kind": k,
+            "ref_id": rid,
+            "enqueued_at": _utc_now_str(),
+            "fn": fn,
+        })
+        _live_task_queue_cv.notify()
+    return True
+
+def _live_tasks_busy() -> bool:
+    with _live_task_queue_cv:
+        if _live_task_queue:
+            return True
+        for cur in (_live_task_current or {}).values():
+            if cur:
+                return True
+        return False
+
+def _run_live_step_task(run_id: str, sim_id: str, notify_enabled: bool, offset_seconds: int):
+    from backend.live.notifier import send_spug_sms, send_text, send_text_env
+
+    try:
+        run = storage.get_live_run(run_id) or {}
+        params = run.get("params") or {}
+        if not isinstance(params, dict):
+            params = {}
+        params = dict(params)
+        params["run_id"] = str(run_id)
+        params["sim_id"] = str(sim_id or params.get("sim_id") or "").strip() or "default"
+        if params.get("portfolio_id") is None:
+            params["portfolio_id"] = run.get("portfolio_id")
+        if "enable_rolling_lookback" not in params:
+            params["enable_rolling_lookback"] = True
+
+        req = LivePaperTradeStepRequest(**params)
+        out = _live_paper_trade_step_impl(req)
+        if isinstance(out, dict):
+            step_ts = int(out.get("ts") or 0)
+            steps = int(run.get("steps") or 0) + 1
+            next_ts = _next_cn_30m_exec_ts(int(time.time()), int(offset_seconds or 5))
+            storage.update_live_run_fields(run_id, {
+                "steps": int(steps),
+                "last_step_ts": int(step_ts),
+                "next_exec_ts": int(next_ts),
+                "last_result_json": json.dumps(out, ensure_ascii=False),
+                "error": "",
+            })
+            if notify_enabled:
+                try:
+                    risk = out.get("risk") or {}
+                    lvl = str(risk.get("level") or "")
+                    reason = str(risk.get("reason") or "")
+                    targets = out.get("targets") or []
+                    codes = [str(t.get("code")) for t in targets if isinstance(t, dict) and t.get("code")]
+                    msg = f"sim={params['sim_id']} pid={params.get('portfolio_id')} risk={lvl} reason={reason} top={codes} sell={(out.get('sell') or [])} buy={(out.get('buy') or [])}"
+                    ok_any = False
+                    nk = str(run.get("notify_kind") or "").strip()
+                    nw = str(run.get("notify_webhook") or "").strip()
+                    ns_raw = str(run.get("notify_secret") or "").strip()
+                    ns = ns_raw if ns_raw else None
+                    if nk and nw:
+                        ok_any = bool(send_text(kind=nk, webhook=nw, text=msg, timeout_sec=8.0, secret=ns)) or ok_any
+                    if bool(run.get("sms_enabled")):
+                        sms_phone = str(run.get("sms_phone") or "").strip()
+                        sms_token = str(run.get("sms_token") or "").strip()
+                        if sms_phone and sms_token:
+                            ok_any = bool(send_spug_sms(token_or_url=sms_token, phone=sms_phone, text=msg, timeout_sec=8.0)) or ok_any
+                    if not ok_any:
+                        send_text_env(msg)
+                except Exception:
+                    pass
+    except Exception as e:
+        next_ts = _next_cn_30m_exec_ts(int(time.time()), int(offset_seconds or 5))
+        storage.update_live_run_fields(run_id, {"next_exec_ts": int(next_ts), "error": str(e)})
+    finally:
+        try:
+            with _live_run_running_lock:
+                _live_run_running.discard(str(run_id))
+        except Exception:
+            pass
+
 
 def _start_live_run_scheduler():
     global _live_run_scheduler_started
@@ -139,9 +291,6 @@ def _start_live_run_scheduler():
         _live_run_scheduler_started = True
 
     def _loop():
-        import asyncio as _asyncio
-        from backend.live.notifier import send_text_env
-
         while True:
             try:
                 now_ts = int(time.time())
@@ -150,8 +299,9 @@ def _start_live_run_scheduler():
                     rid = str(r.get("run_id") or "").strip()
                     if not rid:
                         continue
-                    if rid in _live_run_running:
-                        continue
+                    with _live_run_running_lock:
+                        if rid in _live_run_running:
+                            continue
                     try:
                         nxt = int(r.get("next_exec_ts") or 0)
                     except Exception:
@@ -166,59 +316,16 @@ def _start_live_run_scheduler():
                     if int(now_ts) < int(nxt):
                         continue
 
-                    _live_run_running.add(rid)
-
-                    def _run_one(run_id: str, sim_id: str, notify_enabled: bool):
-                        nonlocal now_ts, off
-                        try:
-                            run = storage.get_live_run(run_id) or {}
-                            params = run.get("params") or {}
-                            if not isinstance(params, dict):
-                                params = {}
-                            params = dict(params)
-                            params["run_id"] = str(run_id)
-                            params["sim_id"] = str(sim_id or params.get("sim_id") or "").strip() or "default"
-                            if params.get("portfolio_id") is None:
-                                params["portfolio_id"] = run.get("portfolio_id")
-                            if "enable_rolling_lookback" not in params:
-                                params["enable_rolling_lookback"] = True
-                            req = LivePaperTradeStepRequest(**params)
-                            out = _asyncio.run(live_paper_trade_step(req))
-                            if isinstance(out, dict):
-                                step_ts = int(out.get("ts") or 0)
-                                steps = int(run.get("steps") or 0) + 1
-                                next_ts = _next_cn_30m_exec_ts(int(time.time()), int(off))
-                                storage.update_live_run_fields(run_id, {
-                                    "steps": int(steps),
-                                    "last_step_ts": int(step_ts),
-                                    "next_exec_ts": int(next_ts),
-                                    "last_result_json": json.dumps(out, ensure_ascii=False),
-                                    "error": "",
-                                })
-                                if notify_enabled:
-                                    try:
-                                        risk = out.get("risk") or {}
-                                        lvl = str(risk.get("level") or "")
-                                        reason = str(risk.get("reason") or "")
-                                        targets = out.get("targets") or []
-                                        codes = [str(t.get("code")) for t in targets if isinstance(t, dict) and t.get("code")]
-                                        msg = f"sim={params['sim_id']} pid={params.get('portfolio_id')} risk={lvl} reason={reason} top={codes} sell={(out.get('sell') or [])} buy={(out.get('buy') or [])}"
-                                        send_text_env(msg)
-                                    except Exception:
-                                        pass
-                        except Exception as e:
-                            next_ts = _next_cn_30m_exec_ts(int(time.time()), int(off))
-                            storage.update_live_run_fields(run_id, {"next_exec_ts": int(next_ts), "error": str(e)})
-                        finally:
-                            try:
-                                _live_run_running.discard(run_id)
-                            except Exception:
-                                pass
-
                     sim_id = str(r.get("sim_id") or "").strip() or "default"
                     notify_enabled = bool(r.get("notify_enabled"))
-                    t = threading.Thread(target=lambda rid=rid, sid=sim_id, ne=notify_enabled: _run_one(rid, sid, ne), daemon=True)
-                    t.start()
+                    enqueued = _enqueue_live_task_dedup(
+                        "live_step",
+                        str(rid),
+                        lambda rid=rid, sid=sim_id, ne=notify_enabled, off=int(off): _run_live_step_task(str(rid), str(sid), bool(ne), int(off)),
+                    )
+                    if enqueued:
+                        with _live_run_running_lock:
+                            _live_run_running.add(rid)
             except Exception:
                 pass
             time.sleep(1.0)
@@ -1381,6 +1488,48 @@ async def run_wolfpack_backtest(req: WolfpackBacktestRequest):
         max_workers=mw,
     )
 
+class BacktestPresetUpsertRequest(BaseModel):
+    name: str = ""
+    paper_config: dict = {}
+    paper_params: dict = {}
+
+@app.get("/api/backtest/presets")
+async def list_backtest_presets(limit: int = 200):
+    try:
+        items = storage.list_backtest_presets(limit=limit) or []
+        return {"items": items}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/backtest/presets")
+async def upsert_backtest_preset(req: BacktestPresetUpsertRequest):
+    try:
+        nm = str(req.name or "").strip()
+        if not nm:
+            raise HTTPException(status_code=400, detail="name required")
+        item = storage.upsert_backtest_preset(
+            name=nm,
+            paper_config=req.paper_config or {},
+            paper_params=req.paper_params or {},
+        )
+        return {"item": item}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/backtest/presets/{preset_id}")
+async def get_backtest_preset(preset_id: int):
+    try:
+        item = storage.get_backtest_preset(preset_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="preset not found")
+        return {"item": item}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/analyze")
 async def analyze_stock(req: AnalyzeRequest):
     print(f"Received analyze request: code={req.code}, freq={req.frequency}, model={req.model}, force_refresh={req.force_refresh}, data_length_years={req.data_length_years}")
@@ -1422,6 +1571,20 @@ async def analyze_stock(req: AnalyzeRequest):
                 req.only_features = None
         except Exception:
             pass
+
+        model_key = str(req.model or "").strip().lower()
+        if model_key in ["logistic_regression", "logreg", "lr"]:
+            if req.rank_transform_enabled is None:
+                req.rank_transform_enabled = True
+            try:
+                is_empty_list = isinstance(req.only_features, list) and len(req.only_features) == 0
+            except Exception:
+                is_empty_list = False
+            if req.only_features is None or is_empty_list:
+                req.only_features = ["volatility_250", "bsp3_zs_height"]
+            raw_mode = str(getattr(req, "backtest_mode", "") or "").strip().lower()
+            if raw_mode in ["", "auto"]:
+                req.backtest_mode = "walk_forward"
 
         # 1. Calculate Time Range First
         import datetime
@@ -2310,6 +2473,12 @@ class LiveRunCreateRequest(BaseModel):
     offset_seconds: int = 5
     auto_resume: bool = True
     notify_enabled: bool = False
+    notify_kind: str = ""
+    notify_webhook: str = ""
+    notify_secret: str = ""
+    sms_enabled: bool = False
+    sms_phone: str = ""
+    sms_token: str = ""
     start: bool = True
 
 @app.post("/api/live/scan_features")
@@ -2592,7 +2761,7 @@ async def live_create_run(req: LiveRunCreateRequest):
             pid = params.get("portfolio_id")
         params["portfolio_id"] = pid
         st = "running" if bool(req.start) else "stopped"
-        nxt = _next_cn_30m_exec_ts(int(time.time()), int(req.offset_seconds or 5)) if st == "running" else 0
+        nxt = int(time.time()) if st == "running" else 0
         out = storage.upsert_live_run(
             run_id=rid,
             sim_id=sim_id,
@@ -2604,7 +2773,27 @@ async def live_create_run(req: LiveRunCreateRequest):
             offset_seconds=int(req.offset_seconds or 5),
             auto_resume=bool(req.auto_resume),
             notify_enabled=bool(req.notify_enabled),
+            notify_kind=str(req.notify_kind or "").strip(),
+            notify_webhook=str(req.notify_webhook or "").strip(),
+            notify_secret=str(req.notify_secret or "").strip(),
+            sms_enabled=bool(req.sms_enabled),
+            sms_phone=str(req.sms_phone or "").strip(),
+            sms_token=str(req.sms_token or "").strip(),
         )
+        if st == "running":
+            try:
+                off = int(req.offset_seconds or 5)
+            except Exception:
+                off = 5
+            notify_enabled = bool(req.notify_enabled)
+            enqueued = _enqueue_live_task_dedup(
+                "live_step",
+                str(rid),
+                lambda rid=rid, sid=sim_id, ne=notify_enabled, off=int(off): _run_live_step_task(str(rid), str(sid), bool(ne), int(off)),
+            )
+            if enqueued:
+                with _live_run_running_lock:
+                    _live_run_running.add(str(rid))
         return {"item": out}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2695,8 +2884,28 @@ async def live_start_run(run_id: str):
         r = storage.get_live_run(run_id)
         if not r:
             raise HTTPException(status_code=404, detail="run not found")
-        nxt = _next_cn_30m_exec_ts(int(time.time()), int(r.get("offset_seconds") or 5))
+        nxt = int(time.time())
         out = storage.update_live_run_fields(run_id, {"status": "running", "next_exec_ts": int(nxt), "error": ""})
+        try:
+            sim_id = str((r or {}).get("sim_id") or "").strip() or "default"
+        except Exception:
+            sim_id = "default"
+        try:
+            notify_enabled = bool((r or {}).get("notify_enabled"))
+        except Exception:
+            notify_enabled = False
+        try:
+            off = int((r or {}).get("offset_seconds") or 5)
+        except Exception:
+            off = 5
+        enqueued = _enqueue_live_task_dedup(
+            "live_step",
+            str(run_id),
+            lambda rid=str(run_id), sid=sim_id, ne=notify_enabled, off=int(off): _run_live_step_task(str(rid), str(sid), bool(ne), int(off)),
+        )
+        if enqueued:
+            with _live_run_running_lock:
+                _live_run_running.add(str(run_id))
         return {"item": out}
     except HTTPException:
         raise
@@ -2972,26 +3181,51 @@ def _scan_feature_worker(code, level, begin, end, data_src, autype, enable_rolli
 
 @app.post("/api/live/paper_trade_step")
 async def live_paper_trade_step(req: LivePaperTradeStepRequest):
+    import asyncio
+    import os as _os
+
+    sim_id = str(req.sim_id or "").strip() or "default"
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+
+    def _fn():
+        try:
+            out = _live_paper_trade_step_impl(req)
+            loop.call_soon_threadsafe(fut.set_result, out)
+        except Exception as e:
+            loop.call_soon_threadsafe(fut.set_exception, e)
+
+    if not _enqueue_live_task_dedup("live_step_direct", sim_id, _fn):
+        raise HTTPException(status_code=409, detail="live step busy")
+
+    try:
+        timeout_sec = float(_os.environ.get("MLCHAN_LIVE_STEP_TIMEOUT_SEC", "900") or 900)
+    except Exception:
+        timeout_sec = 900.0
+
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout_sec)
+    except HTTPException:
+        raise
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="live step timeout")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
     try:
         import concurrent.futures
         import os
         import time
         from DataAPI.ClickHouseAPI import CClickHouseAPI
-        from backend.live.common import day_key_from_ts, get_cached_index_risk, intraday_plunge_risk, parse_autype, parse_data_src, parse_frequency
-        from backend.chan_service import cross_section_rank_transform_rows
+        from backend.live.common import cn_ts_from_day_key_minutes, day_key_from_ts, get_cached_index_risk, intraday_plunge_risk, parse_autype, parse_data_src, parse_frequency, parse_hhmm_to_minutes, pick_kl_bar_asof, pick_kl_bar_asof_with_prev
 
         sim_id = str(req.sim_id or "").strip() or "default"
-        
-        # Check for active runs before proceeding
-        # This provides a graceful exit mechanism: if the user stops the run in UI, 
-        # the runner (client) will receive this stop signal.
-        active_runs = storage.list_live_runs(sim_id=sim_id, status="running", limit=1)
-        if not active_runs:
-             return {
-                 "status": "stopped",
-                 "cmd": "stop",
-                 "reason": "No active run found for this simulation ID"
-             }
+        run_id = str(getattr(req, "run_id", "") or "").strip()
+        if run_id:
+            r = storage.get_live_run(run_id)
+            if not r or str(r.get("status") or "").strip().lower() != "running":
+                return {"status": "stopped", "cmd": "stop", "reason": "run stopped"}
 
         pid = req.portfolio_id
         if pid is None and getattr(req, "run_id", None):
@@ -3361,17 +3595,22 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
             cur_day = int(next_exec_day or 0)
 
         pending_orders = storage.list_live_orders(status=None, limit=1000, sim_id=sim_id, portfolio_id=pid)
-        can_execute_session = True
+        can_execute_session = bool(market_open)
         executed_pending = False
         if can_execute_session and pending_orders:
             quote_cache = {}
 
-            def _get_quote(code: str):
+            def _get_quote(code: str, asof_ts: Optional[int] = None):
                 code = str(code or "").strip()
                 if not code:
                     return None
-                if code in quote_cache:
-                    return quote_cache.get(code)
+                try:
+                    ts_key = int(asof_ts or now_ts)
+                except Exception:
+                    ts_key = int(now_ts)
+                cache_key = (code, int(ts_key // 60))
+                if cache_key in quote_cache:
+                    return quote_cache.get(cache_key)
                 out = None
                 try:
                     kl_list = fetch_stock_data(
@@ -3384,17 +3623,17 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
                         use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
                     )
                     if kl_list:
-                        k = kl_list[-1]
+                        k = pick_kl_bar_asof(kl_list, int(ts_key))
                         o = float(getattr(k, "open", 0.0) or 0.0)
                         c = float(getattr(k, "close", 0.0) or 0.0)
                         out = {"open": o, "close": c}
                 except Exception:
                     out = None
-                quote_cache[code] = out
+                quote_cache[cache_key] = out
                 return out
 
-            def _pick_px(code: str, session_name: str):
-                q = _get_quote(code)
+            def _pick_px(code: str, session_name: str, asof_ts: Optional[int] = None):
+                q = _get_quote(code, asof_ts=asof_ts)
                 if not q:
                     return 0.0
                 o = float(q.get("open") or 0.0)
@@ -3447,32 +3686,38 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
                     if not code or side not in ["buy", "sell"]:
                         continue
                     px_session = str(o.get("_exec_session") or "").strip() or market_session
+                    try:
+                        px_asof = int(o.get("execute_after_ts") or 0)
+                    except Exception:
+                        px_asof = 0
+                    if px_asof <= 0:
+                        px_asof = int(now_ts)
                     if side == "sell":
-                        sell_codes.append((code, px_session))
+                        sell_codes.append((code, px_session, int(px_asof)))
                     else:
-                        buy_items.append({"code": code, "px_session": px_session})
+                        buy_items.append({"code": code, "px_session": px_session, "px_asof": int(px_asof)})
 
                 if market_open:
                     storage.increment_bars_held(1, sim_id=sim_id, portfolio_id=pid)
                 sell_px = {}
                 sell_only = []
-                for c, sess_name in sell_codes:
+                for c, sess_name, px_asof in sell_codes:
                     sell_only.append(c)
-                    sell_px[c] = float(_pick_px(c, sess_name))
+                    sell_px[c] = float(_pick_px(c, sess_name, asof_ts=int(px_asof)))
                 if sell_only:
                     storage.delete_positions(sell_only, sim_id=sim_id, portfolio_id=pid)
                 for bi in buy_items:
                     if bi.get("code"):
-                        buy_px = float(_pick_px(str(bi["code"]), str(bi.get("px_session") or market_session)))
+                        buy_px = float(_pick_px(str(bi["code"]), str(bi.get("px_session") or market_session), asof_ts=int(bi.get("px_asof") or now_ts)))
                         storage.upsert_position(str(bi["code"]), int(now_ts), float(buy_px), 0, sim_id=sim_id, portfolio_id=pid)
 
                 trades = []
-                for c, sess_name in sell_codes:
+                for c, sess_name, _px_asof in sell_codes:
                     trades.append({"stock_code": c, "side": "sell", "status": "executed", "trade_ts": int(now_ts), "price": float(sell_px.get(c) or 0.0), "meta": {"source": "order", "session": sess_name or market_session}})
                 for bi in buy_items:
                     code = str(bi.get("code") or "")
                     sess_name = str(bi.get("px_session") or "").strip() or market_session
-                    trades.append({"stock_code": code, "side": "buy", "status": "executed", "trade_ts": int(now_ts), "price": float(_pick_px(code, sess_name)), "meta": {"source": "order", "session": sess_name}})
+                    trades.append({"stock_code": code, "side": "buy", "status": "executed", "trade_ts": int(now_ts), "price": float(_pick_px(code, sess_name, asof_ts=int(bi.get("px_asof") or now_ts))), "meta": {"source": "order", "session": sess_name}})
                 storage.add_live_trades(trades, sim_id=sim_id, portfolio_id=pid)
                 storage.mark_orders_executed([x for x in executed_ids if x], executed_ts=int(now_ts), sim_id=sim_id, portfolio_id=pid)
                 executed_pending = True
@@ -3498,31 +3743,53 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
             mw = req_mw if req_mw and req_mw > 0 else 8
         mw = max(1, min(int(mw), int(len(codes) if codes else 1)))
 
-        with concurrent.futures.ProcessPoolExecutor(max_workers=int(mw)) as ex:
-            futs = {
-                ex.submit(
-                    _scan_feature_worker,
-                    code,
-                    level,
-                    begin,
-                    end,
-                    data_src,
-                    autype,
-                    bool(req.enable_rolling_lookback),
-                    str(req.rolling_sample_mode or "every_bar"),
-                    int(req.rolling_stride or 1)
-                ): code
-                for code in codes
-            }
-            for fut in concurrent.futures.as_completed(futs):
+        if int(mw) <= 1 or not codes:
+            for code in codes:
                 try:
-                    r = fut.result()
+                    r = _scan_feature_worker(
+                        code,
+                        level,
+                        begin,
+                        end,
+                        data_src,
+                        autype,
+                        bool(req.enable_rolling_lookback),
+                        str(req.rolling_sample_mode or "every_bar"),
+                        int(req.rolling_stride or 1),
+                    )
                 except Exception:
                     r = None
                 if r:
                     results.append(r)
+        else:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=int(mw)) as ex:
+                futs = {
+                    ex.submit(
+                        _scan_feature_worker,
+                        code,
+                        level,
+                        begin,
+                        end,
+                        data_src,
+                        autype,
+                        bool(req.enable_rolling_lookback),
+                        str(req.rolling_sample_mode or "every_bar"),
+                        int(req.rolling_stride or 1)
+                    ): code
+                    for code in codes
+                }
+                for fut in concurrent.futures.as_completed(futs):
+                    try:
+                        r = fut.result()
+                    except Exception:
+                        r = None
+                    if r:
+                        results.append(r)
 
-        cross_section_rank_transform_rows(results, feature_meta, missing_value=-9999999.0)
+        try:
+            cross_section_rank_transform_rows(results, feature_meta, missing_value=-9999999.0)
+        except TypeError:
+            cross_section_rank_transform_rows(results)
         X = []
         for r in results:
             feat = r.get("feature") if isinstance(r.get("feature"), dict) else {}
@@ -3556,16 +3823,17 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
             r["prob"] = float(p)
 
         results.sort(key=lambda x: (int(x.get("day") or 0), float(x.get("prob") or 0.0)), reverse=True)
+        signal_day = int(cur_day or 0) if cur_day is not None else None
         todays = []
-        if cur_day is not None:
-            todays = [r for r in results if int(r.get("day") or 0) == int(cur_day)]
-        if (not todays) and bool(req.use_latest_available_day) and results:
+        if signal_day is not None:
+            todays = [r for r in results if int(r.get("day") or 0) == int(signal_day)]
+        if (not todays) and (bool(req.use_latest_available_day) or (not market_open)) and results:
             try:
-                cur_day = int(max(int(r.get("day") or 0) for r in results))
+                signal_day = int(max(int(r.get("day") or 0) for r in results))
             except Exception:
-                pass
-            if cur_day is not None:
-                todays = [r for r in results if int(r.get("day") or 0) == int(cur_day)]
+                signal_day = signal_day
+            if signal_day is not None:
+                todays = [r for r in results if int(r.get("day") or 0) == int(signal_day)]
 
         todays = [r for r in todays if float(r.get("prob") or 0.0) >= float(min_prob)]
         has_targets = bool(todays)
@@ -3603,18 +3871,9 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
             t1_min_day = int(t1_next_day.strftime("%Y%m%d"))
             t1_exec_ts = _cn_ts(datetime.datetime(t1_next_day.year, t1_next_day.month, t1_next_day.day, 9, 25))
             if sell_mode in ("delayed", "delay", "scheme1", "t1_delay"):
-                raw_decision = str(getattr(req, "t1_decision_time", None) or "10:00").strip()
-                decision_hh = 10
-                decision_mm = 0
-                try:
-                    parts = raw_decision.split(":")
-                    decision_hh = int(parts[0]) if parts and parts[0].strip() else 10
-                    decision_mm = int(parts[1]) if len(parts) > 1 and parts[1].strip() else 0
-                    decision_hh = max(0, min(23, decision_hh))
-                    decision_mm = max(0, min(59, decision_mm))
-                except Exception:
-                    decision_hh = 10
-                    decision_mm = 0
+                decision_min = int(parse_hhmm_to_minutes(getattr(req, "t1_decision_time", None), default_min=10 * 60))
+                decision_hh = int(decision_min // 60)
+                decision_mm = int(decision_min % 60)
                 t1_exec_ts = _cn_ts(datetime.datetime(t1_next_day.year, t1_next_day.month, t1_next_day.day, int(decision_hh), int(decision_mm)))
             sell_ok = []
             for c in sell_codes:
@@ -3644,17 +3903,7 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
             except Exception:
                 t1_gap_very_strong_th = 0.05
 
-            raw_decision = str(getattr(req, "t1_decision_time", None) or "10:00").strip()
-            decision_min = 10 * 60
-            try:
-                parts = raw_decision.split(":")
-                hh = int(parts[0]) if parts and parts[0].strip() else 10
-                mm = int(parts[1]) if len(parts) > 1 and parts[1].strip() else 0
-                hh = max(0, min(23, hh))
-                mm = max(0, min(59, mm))
-                decision_min = hh * 60 + mm
-            except Exception:
-                decision_min = 10 * 60
+            decision_min = int(parse_hhmm_to_minutes(getattr(req, "t1_decision_time", None), default_min=10 * 60))
 
             close_guard_min = 14 * 60 + 57
 
@@ -3887,12 +4136,17 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
 
         quote_cache = {}
 
-        def _get_quote(code: str):
+        def _get_quote(code: str, asof_ts: Optional[int] = None):
             code = str(code or "").strip()
             if not code:
                 return None
-            if code in quote_cache:
-                return quote_cache.get(code)
+            try:
+                ts_key = int(asof_ts or now_ts)
+            except Exception:
+                ts_key = int(now_ts)
+            cache_key = (code, int(ts_key // 60))
+            if cache_key in quote_cache:
+                return quote_cache.get(cache_key)
             out = None
             try:
                 kl_list = fetch_stock_data(
@@ -3905,8 +4159,7 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
                     use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
                 )
                 if kl_list:
-                    k = kl_list[-1]
-                    prev = kl_list[-2] if len(kl_list) > 1 else None
+                    k, prev = pick_kl_bar_asof_with_prev(kl_list, int(ts_key))
                     o = float(getattr(k, "open", 0.0) or 0.0)
                     c = float(getattr(k, "close", 0.0) or 0.0)
                     h = float(getattr(k, "high", 0.0) or 0.0)
@@ -3915,11 +4168,11 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
                     out = {"open": o, "close": c, "high": h, "low": l, "prev_close": pc}
             except Exception:
                 out = None
-            quote_cache[code] = out
+            quote_cache[cache_key] = out
             return out
 
-        def _pick_px(code: str, session_name: str):
-            q = _get_quote(code)
+        def _pick_px(code: str, session_name: str, asof_ts: Optional[int] = None):
+            q = _get_quote(code, asof_ts=asof_ts)
             if not q:
                 return 0.0
             o = float(q.get("open") or 0.0)
@@ -3951,18 +4204,45 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
         sim_info = storage.get_live_sim(sim_id)
         current_balance = float(sim_info.get("balance", 100000.0)) if sim_info else 100000.0
         trades = []
+
+        px_now_ts = int(now_ts)
+        if market_open and sell_mode in ("delayed", "delay", "scheme1", "t1_delay"):
+            raw_decision = str(getattr(req, "t1_decision_time", None) or "10:00").strip()
+            decision_hh = 10
+            decision_mm = 0
+            try:
+                parts = raw_decision.split(":")
+                decision_hh = int(parts[0]) if parts and parts[0].strip() else 10
+                decision_mm = int(parts[1]) if len(parts) > 1 and parts[1].strip() else 0
+                decision_hh = max(0, min(23, decision_hh))
+                decision_mm = max(0, min(59, decision_mm))
+            except Exception:
+                decision_hh = 10
+                decision_mm = 0
+            dt_cn = _cn_dt(int(now_ts))
+            try:
+                decision_ts_today = int(
+                    (
+                        datetime.datetime(dt_cn.year, dt_cn.month, dt_cn.day, int(decision_hh), int(decision_mm), 0, tzinfo=datetime.timezone.utc)
+                        - datetime.timedelta(hours=8)
+                    ).timestamp()
+                )
+            except Exception:
+                decision_ts_today = 0
+            if decision_ts_today and int(decision_ts_today) <= int(now_ts):
+                px_now_ts = int(decision_ts_today)
         
         # 1. Process Sells
         sold_codes = []
         for c in sell_codes:
             p = pos_map.get(c)
             if not p: continue
-            px = float(_pick_px(c, market_session))
+            px = float(_pick_px(c, market_session, asof_ts=int(px_now_ts)))
             if px <= 0.01: continue # Suspension or error
             
             # Check Limit Down
             rules = _get_board_rules(c)
-            q = _get_quote(c)
+            q = _get_quote(c, asof_ts=int(px_now_ts))
             if q:
                 pc = float(q.get("prev_close") or px)
                 if pc > 0 and px <= pc * (1.0 - rules["limit_rate"]) and abs(px - float(q.get("low") or 0.0)) < 0.01:
@@ -3992,7 +4272,7 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
                 code = str(t.get("code") or "")
                 if code not in buy_codes: continue
                 
-                px = float(_pick_px(code, market_session))
+                px = float(_pick_px(code, market_session, asof_ts=int(px_now_ts)))
                 if px <= 0.01: continue
                 
                 rules = _get_board_rules(code)

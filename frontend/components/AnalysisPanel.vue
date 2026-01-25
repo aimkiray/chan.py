@@ -86,18 +86,18 @@
       </div>
       
       <div class="mt-6">
-        <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('analysis.score') }}: <span class="text-primary font-bold">{{ ((signal.score || 0) * 100).toFixed(2) }}%</span></div>
+        <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('analysis.score') }}: <span class="text-primary font-bold">{{ scorePctText }}</span></div>
         <div class="flex items-center gap-3">
           <UMeter 
-            :value="Number(((signal.score || 0) * 100).toFixed(2))" 
-            :color="getScoreStatus(signal.score)" 
+            :value="scorePctValue" 
+            :color="getScoreStatus(displayScore)" 
             class="flex-1"
           />
         </div>
         
         <UAlert
-          :title="(signal.score || 0) > 0.5 ? t('analysis.highScore') : t('analysis.lowScore')"
-          :color="(signal.score || 0) > 0.5 ? 'green' : 'orange'"
+          :title="displayScore > 0.5 ? t('analysis.highScore') : t('analysis.lowScore')"
+          :color="displayScore > 0.5 ? 'green' : 'orange'"
           variant="subtle"
           icon="i-heroicons-information-circle"
           class="mt-3"
@@ -338,6 +338,16 @@ const props = defineProps({
   },
   loading: Boolean
 })
+
+const displayScore = computed(() => {
+  const raw = Number(props?.signal?.score)
+  if (!Number.isFinite(raw)) return 0
+  const clipped01 = Math.max(0, Math.min(1, raw))
+  return Math.min(0.9999, clipped01)
+})
+
+const scorePctValue = computed(() => Number((displayScore.value * 100).toFixed(2)))
+const scorePctText = computed(() => `${scorePctValue.value.toFixed(2)}%`)
 
 const targetWinPct = ref(50)
 const minTrades = ref(30)

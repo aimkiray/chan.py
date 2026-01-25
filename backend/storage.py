@@ -147,6 +147,16 @@ class StrategyRun(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     completed_at = Column(DateTime)
 
+class BacktestPreset(Base):
+    __tablename__ = 'backtest_preset'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(120), unique=True, index=True)
+    paper_config_json = Column(Text)
+    paper_params_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
 class PositionStatus(Base):
     __tablename__ = 'position_status'
 
@@ -214,6 +224,12 @@ class LiveRun(Base):
     offset_seconds = Column(Integer, default=5)
     auto_resume = Column(Integer, default=1)
     notify_enabled = Column(Integer, default=0)
+    notify_kind = Column(String(20))
+    notify_webhook = Column(Text)
+    notify_secret = Column(Text)
+    sms_enabled = Column(Integer, default=0)
+    sms_phone = Column(String(40))
+    sms_token = Column(Text)
     params_json = Column(Text)
     last_result_json = Column(Text)
     error = Column(Text)
@@ -425,6 +441,36 @@ class StorageManager:
                         conn.execute(text("ALTER TABLE live_run ADD COLUMN notify_enabled INTEGER"))
                     except Exception:
                         pass
+                if "notify_kind" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_run ADD COLUMN notify_kind VARCHAR(20)"))
+                    except Exception:
+                        pass
+                if "notify_webhook" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_run ADD COLUMN notify_webhook TEXT"))
+                    except Exception:
+                        pass
+                if "notify_secret" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_run ADD COLUMN notify_secret TEXT"))
+                    except Exception:
+                        pass
+                if "sms_enabled" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_run ADD COLUMN sms_enabled INTEGER"))
+                    except Exception:
+                        pass
+                if "sms_phone" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_run ADD COLUMN sms_phone VARCHAR(40)"))
+                    except Exception:
+                        pass
+                if "sms_token" not in names:
+                    try:
+                        conn.execute(text("ALTER TABLE live_run ADD COLUMN sms_token TEXT"))
+                    except Exception:
+                        pass
                 conn.execute(text("""CREATE TABLE IF NOT EXISTS live_run (
                     run_id VARCHAR(40) PRIMARY KEY,
                     name VARCHAR(120),
@@ -437,6 +483,12 @@ class StorageManager:
                     offset_seconds INTEGER,
                     auto_resume INTEGER,
                     notify_enabled INTEGER,
+                    notify_kind VARCHAR(20),
+                    notify_webhook TEXT,
+                    notify_secret TEXT,
+                    sms_enabled INTEGER,
+                    sms_phone VARCHAR(40),
+                    sms_token TEXT,
                     params_json TEXT,
                     last_result_json TEXT,
                     error TEXT,
@@ -1068,6 +1120,12 @@ class StorageManager:
         offset_seconds: int = 5,
         auto_resume: bool = True,
         notify_enabled: bool = False,
+        notify_kind: str = "",
+        notify_webhook: str = "",
+        notify_secret: str = "",
+        sms_enabled: bool = False,
+        sms_phone: str = "",
+        sms_token: str = "",
         error: str = None,
         last_result: dict = None,
     ) -> dict:
@@ -1090,6 +1148,12 @@ class StorageManager:
         off = max(0, min(int(off), 120))
         ar = 1 if bool(auto_resume) else 0
         ne = 1 if bool(notify_enabled) else 0
+        nk = str(notify_kind or "").strip().lower() or None
+        nw = str(notify_webhook or "").strip() or None
+        ns = str(notify_secret or "").strip() or None
+        se = 1 if bool(sms_enabled) else 0
+        sp = str(sms_phone or "").strip() or None
+        stoken = str(sms_token or "").strip() or None
         params_json = json.dumps(params or {}, ensure_ascii=False)
         last_result_json = json.dumps(last_result or {}, ensure_ascii=False) if last_result is not None else None
         with self.Session() as session:
@@ -1107,6 +1171,12 @@ class StorageManager:
             row.offset_seconds = int(off)
             row.auto_resume = int(ar)
             row.notify_enabled = int(ne)
+            row.notify_kind = nk
+            row.notify_webhook = nw
+            row.notify_secret = ns
+            row.sms_enabled = int(se)
+            row.sms_phone = sp
+            row.sms_token = stoken
             row.params_json = params_json
             if error is not None:
                 row.error = str(error)
@@ -1150,6 +1220,12 @@ class StorageManager:
                 "offset_seconds": int(r.offset_seconds or 0),
                 "auto_resume": bool(int(r.auto_resume or 0)),
                 "notify_enabled": bool(int(r.notify_enabled or 0)),
+                "notify_kind": str(r.notify_kind or ""),
+                "notify_webhook": str(r.notify_webhook or ""),
+                "notify_secret": str(r.notify_secret or ""),
+                "sms_enabled": bool(int(getattr(r, "sms_enabled", 0) or 0)),
+                "sms_phone": str(getattr(r, "sms_phone", "") or ""),
+                "sms_token": str(getattr(r, "sms_token", "") or ""),
                 "params": params,
                 "last_result": last,
                 "error": str(r.error or ""),
@@ -1191,6 +1267,12 @@ class StorageManager:
                     "offset_seconds": int(r.offset_seconds or 0),
                     "auto_resume": bool(int(r.auto_resume or 0)),
                     "notify_enabled": bool(int(r.notify_enabled or 0)),
+                    "notify_kind": str(r.notify_kind or ""),
+                    "notify_webhook": str(r.notify_webhook or ""),
+                    "notify_secret": str(r.notify_secret or ""),
+                    "sms_enabled": bool(int(getattr(r, "sms_enabled", 0) or 0)),
+                    "sms_phone": str(getattr(r, "sms_phone", "") or ""),
+                    "sms_token": str(getattr(r, "sms_token", "") or ""),
                     "error": str(r.error or ""),
                     "created_at": _dt_to_utc_iso(r.created_at),
                     "updated_at": _dt_to_utc_iso(r.updated_at),
@@ -1209,11 +1291,13 @@ class StorageManager:
             for k, v in (fields or {}).items():
                 if k in ["name", "sim_id", "status", "error", "params_json", "last_result_json"]:
                     setattr(r, k, v)
-                elif k in ["portfolio_id", "steps", "last_step_ts", "next_exec_ts", "offset_seconds", "auto_resume", "notify_enabled"]:
+                elif k in ["portfolio_id", "steps", "last_step_ts", "next_exec_ts", "offset_seconds", "auto_resume", "notify_enabled", "sms_enabled"]:
                     try:
                         setattr(r, k, int(v))
                     except Exception:
                         continue
+                elif k in ["notify_kind", "notify_webhook", "notify_secret", "sms_phone", "sms_token"]:
+                    setattr(r, k, v)
                 elif k in ["stopped_at"]:
                     setattr(r, k, v)
             r.updated_at = now
@@ -2148,6 +2232,90 @@ class StorageManager:
             return {"deleted": [], "failed": [{"result_id": None, "reason": str(e)}]}
         finally:
             session.close()
+
+    def list_backtest_presets(self, limit: int = 200) -> list:
+        try:
+            lim = int(limit or 200)
+        except Exception:
+            lim = 200
+        lim = max(1, min(int(lim), 2000))
+
+        with self.Session() as session:
+            q = session.query(BacktestPreset).order_by(BacktestPreset.updated_at.desc(), BacktestPreset.created_at.desc())
+            rows = q.limit(lim).all()
+            out = []
+            for r in rows or []:
+                out.append({
+                    "id": int(r.id),
+                    "name": str(r.name or ""),
+                    "created_at": _dt_to_utc_iso(r.created_at),
+                    "updated_at": _dt_to_utc_iso(r.updated_at),
+                })
+            return out
+
+    def get_backtest_preset(self, preset_id: int) -> Optional[dict]:
+        try:
+            pid = int(preset_id)
+        except Exception:
+            pid = 0
+        if pid <= 0:
+            return None
+
+        with self.Session() as session:
+            r = session.query(BacktestPreset).filter(BacktestPreset.id == pid).first()
+            if not r:
+                return None
+            cfg = {}
+            prm = {}
+            if r.paper_config_json:
+                try:
+                    cfg = json.loads(r.paper_config_json) or {}
+                except Exception:
+                    cfg = {}
+            if r.paper_params_json:
+                try:
+                    prm = json.loads(r.paper_params_json) or {}
+                except Exception:
+                    prm = {}
+            return {
+                "id": int(r.id),
+                "name": str(r.name or ""),
+                "paper_config": cfg,
+                "paper_params": prm,
+                "created_at": _dt_to_utc_iso(r.created_at),
+                "updated_at": _dt_to_utc_iso(r.updated_at),
+            }
+
+    def upsert_backtest_preset(self, name: str, paper_config: dict, paper_params: dict) -> dict:
+        nm = str(name or "").strip()
+        if not nm:
+            raise ValueError("name required")
+        cfg_json = json.dumps(paper_config or {}, ensure_ascii=False)
+        prm_json = json.dumps(paper_params or {}, ensure_ascii=False)
+        now = datetime.datetime.utcnow()
+
+        with self.Session() as session:
+            r = session.query(BacktestPreset).filter(BacktestPreset.name == nm).first()
+            if r:
+                r.paper_config_json = cfg_json
+                r.paper_params_json = prm_json
+                r.updated_at = now
+                session.commit()
+                pid = int(r.id)
+            else:
+                r = BacktestPreset(
+                    name=nm,
+                    paper_config_json=cfg_json,
+                    paper_params_json=prm_json,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(r)
+                session.commit()
+                pid = int(r.id)
+
+        out = self.get_backtest_preset(pid)
+        return out or {"id": pid, "name": nm, "paper_config": paper_config or {}, "paper_params": paper_params or {}}
 
     def get_result_by_id(self, result_id):
         session = self.Session()

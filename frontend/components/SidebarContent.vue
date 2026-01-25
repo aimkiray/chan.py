@@ -464,7 +464,7 @@
             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.simId') }}</label>
             <UButton size="2xs" color="gray" variant="ghost" icon="i-heroicons-plus" @click="generateSimId">{{ t('strategy.newSim') }}</UButton>
           </div>
-          <UInput v-model="proxyPaperConfig.sim_id" :placeholder="t('strategy.simIdPlaceholder')" class="w-full" />
+          <UInput v-model="proxyBacktestSimId" :placeholder="t('strategy.simIdPlaceholder')" class="w-full" />
         </div>
 
         <div>
@@ -650,15 +650,81 @@
           </div>
         </div>
 
+        <div class="pt-2 border-t border-gray-100 dark:border-gray-800 space-y-2">
+          <div class="text-xs text-gray-500">{{ t('portfolio.backtestConfigManage') }}</div>
+          <div class="grid grid-cols-2 gap-2">
+            <UButton size="xs" color="gray" variant="soft" @click="openBacktestSave">{{ t('portfolio.saveConfig') }}</UButton>
+            <UButton size="xs" color="gray" variant="soft" @click="openBacktestLoad">{{ t('portfolio.loadConfig') }}</UButton>
+            <UButton size="xs" color="gray" variant="soft" @click="openBacktestExport">{{ t('portfolio.exportConfig') }}</UButton>
+            <UButton size="xs" color="gray" variant="soft" @click="openBacktestImport">{{ t('portfolio.importConfig') }}</UButton>
+          </div>
+        </div>
+
         <div class="pt-4 border-t border-gray-100 dark:border-gray-800 space-y-2 pb-4">
           <UButton block color="primary" :disabled="loading || backtestLoading" :loading="backtestLoading" @click="$emit('runBacktest')">{{ t('portfolio.runBacktest') }}</UButton>
           <UButton block color="gray" variant="soft" :disabled="paperRunDisabled" @click="$emit('runPaperStep')">{{ t('portfolio.runPaperDirect') }}</UButton>
         </div>
       </div>
 
-      <div v-else-if="activeTab === 'paper' && (!collapsed || mode === 'desktop')" class="space-y-2 pb-4">
+      <div v-else-if="activeTab === 'paper' && (!collapsed || mode === 'desktop')" class="space-y-3 pb-4">
         <div class="text-xs text-gray-500">
           {{ t('portfolio.paperRunCreateHint') }}
+        </div>
+
+        <div>
+          <label class="text-xs text-gray-500">{{ t('strategy.runName') }}</label>
+          <UInput v-model="proxyPaperRunForm.name" class="w-full" />
+        </div>
+
+        <div>
+          <label class="text-xs text-gray-500">{{ t('strategy.offsetSeconds') }}</label>
+          <UInput v-model="proxyPaperRunForm.offset_seconds" type="number" class="w-full" />
+        </div>
+
+        <div class="flex items-center justify-between gap-2">
+          <UCheckbox v-model="proxyPaperRunForm.auto_resume" :label="t('strategy.autoResume')" />
+        </div>
+
+        <div class="space-y-2 pt-2 border-t border-gray-100 dark:border-gray-800">
+          <div class="flex items-center justify-between gap-2">
+            <UCheckbox v-model="proxyPaperRunForm.notify_enabled" :label="t('strategy.notify')" />
+          </div>
+
+          <div v-if="proxyPaperRunForm.notify_enabled" class="space-y-2 pl-2 border-l-2 border-gray-200 dark:border-gray-700">
+            <div>
+              <label class="text-xs text-gray-500">{{ t('strategy.notifyMode') }}</label>
+              <USelectMenu v-model="paperNotifyMode" :options="notifyModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
+            </div>
+
+            <div v-if="paperNotifyShowDingtalk" class="space-y-2">
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.dingtalkWebhook') }}</label>
+                <UInput v-model="proxyPaperRunForm.dingtalk_webhook" class="w-full" />
+              </div>
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.dingtalkSecret') }}</label>
+                <UInput v-model="proxyPaperRunForm.dingtalk_secret" class="w-full" />
+              </div>
+            </div>
+
+            <div v-if="paperNotifyShowSms" class="space-y-2">
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.smsPhone') }}</label>
+                <UInput v-model="proxyPaperRunForm.sms_phone" class="w-full" />
+              </div>
+              <div>
+                <label class="text-xs text-gray-500">{{ t('strategy.smsToken') }}</label>
+                <UInput v-model="proxyPaperRunForm.sms_token" class="w-full" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="pt-2 space-y-2">
+          <div class="flex items-center justify-between gap-2">
+            <UCheckbox v-model="proxyPaperRunForm.start" :label="t('strategy.startImmediately')" />
+          </div>
+          <UButton block color="primary" :disabled="loading" @click="$emit('createPaperRun')">{{ t('strategy.createRun') }}</UButton>
         </div>
       </div>
 
@@ -787,6 +853,67 @@
 
 
     </div>
+
+    <UModal v-model="backtestSaveOpen">
+      <UCard :ui="{ body: { padding: 'p-4' } }">
+        <div class="text-sm font-medium text-gray-700 dark:text-gray-200 mb-3">{{ t('portfolio.saveConfig') }}</div>
+        <div class="space-y-3">
+          <UInput v-model="backtestSaveName" :placeholder="t('portfolio.configNamePlaceholder')" />
+          <div class="flex justify-end gap-2">
+            <UButton size="sm" color="gray" variant="ghost" :disabled="backtestSaveLoading" @click="backtestSaveOpen = false">
+              {{ t('portfolio.close') }}
+            </UButton>
+            <UButton size="sm" color="primary" :loading="backtestSaveLoading" @click="saveBacktestPreset">
+              {{ t('portfolio.save') }}
+            </UButton>
+          </div>
+        </div>
+      </UCard>
+    </UModal>
+
+    <UModal v-model="backtestLoadOpen">
+      <UCard :ui="{ body: { padding: 'p-4' } }">
+        <div class="text-sm font-medium text-gray-700 dark:text-gray-200 mb-3">{{ t('portfolio.loadConfig') }}</div>
+        <div class="space-y-3">
+          <USelectMenu v-model="backtestLoadId" :options="backtestPresetOptions" value-attribute="value" option-attribute="label" class="w-full" />
+          <div class="flex justify-end gap-2">
+            <UButton size="sm" color="gray" variant="ghost" :disabled="backtestLoadLoading" @click="backtestLoadOpen = false">
+              {{ t('portfolio.close') }}
+            </UButton>
+            <UButton size="sm" color="primary" :loading="backtestLoadLoading" @click="applyBacktestPreset">
+              {{ t('portfolio.apply') }}
+            </UButton>
+          </div>
+        </div>
+      </UCard>
+    </UModal>
+
+    <UModal v-model="backtestExportOpen">
+      <UCard :ui="{ body: { padding: 'p-4' } }">
+        <div class="text-sm font-medium text-gray-700 dark:text-gray-200 mb-3">{{ t('portfolio.exportConfig') }}</div>
+        <textarea v-model="backtestExportText" readonly class="w-full h-64 p-2 text-xs font-mono border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900"></textarea>
+        <div class="flex justify-end gap-2 mt-3">
+          <UButton size="sm" color="gray" variant="ghost" @click="backtestExportOpen = false">
+            {{ t('portfolio.close') }}
+          </UButton>
+        </div>
+      </UCard>
+    </UModal>
+
+    <UModal v-model="backtestImportOpen">
+      <UCard :ui="{ body: { padding: 'p-4' } }">
+        <div class="text-sm font-medium text-gray-700 dark:text-gray-200 mb-3">{{ t('portfolio.importConfig') }}</div>
+        <textarea v-model="backtestImportText" class="w-full h-64 p-2 text-xs font-mono border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900"></textarea>
+        <div class="flex justify-end gap-2 mt-3">
+          <UButton size="sm" color="gray" variant="ghost" @click="backtestImportOpen = false">
+            {{ t('portfolio.close') }}
+          </UButton>
+          <UButton size="sm" color="primary" :loading="backtestImportLoading" @click="applyBacktestImport">
+            {{ t('portfolio.apply') }}
+          </UButton>
+        </div>
+      </UCard>
+    </UModal>
   </div>
 </template>
 
@@ -797,6 +924,7 @@ import { MemoryBook, MemoryChevronDown, MemoryChevronLeft } from '@pictogrammers
 import { useI18n } from '../composables/useI18n'
 
 const { t } = useI18n()
+const toast = useToast()
 
 // Define the structure of the help documentation
 const tocStructure = [
@@ -900,6 +1028,32 @@ const paperRollingSampleModeOptions = computed(() => [
   { label: t('strategy.rollingModeBsp'), value: 'bsp' }
 ])
 
+const notifyModeOptions = computed(() => [
+  { label: t('strategy.notifyModeDingtalk'), value: 'dingtalk' },
+  { label: t('strategy.notifyModeSms'), value: 'sms' },
+  { label: t('strategy.notifyModeBoth'), value: 'both' }
+])
+
+const paperNotifyMode = computed({
+  get: () => String(proxyPaperRunForm.value?.notify_mode || 'dingtalk'),
+  set: (val) => {
+    const v = String(val || 'dingtalk')
+    proxyPaperRunForm.value = { ...(proxyPaperRunForm.value || {}), notify_mode: v }
+  }
+})
+
+const paperNotifyShowDingtalk = computed(() => {
+  if (!proxyPaperRunForm.value?.notify_enabled) return false
+  const mode = String(proxyPaperRunForm.value?.notify_mode || 'dingtalk')
+  return mode === 'dingtalk' || mode === 'both'
+})
+
+const paperNotifyShowSms = computed(() => {
+  if (!proxyPaperRunForm.value?.notify_enabled) return false
+  const mode = String(proxyPaperRunForm.value?.notify_mode || 'dingtalk')
+  return mode === 'sms' || mode === 'both'
+})
+
 const props = defineProps({
   activeTab: { type: String, default: 'analysis' },
   code: String,
@@ -931,7 +1085,9 @@ const props = defineProps({
   strategyChanConfig: { type: Object, default: () => ({}) },
 
   paperConfig: { type: Object, default: () => ({}) },
+  backtestSimId: { type: String, default: 'default' },
   paperParams: { type: Object, default: () => ({}) },
+  paperRunForm: { type: Object, default: () => ({}) },
   
   // Pretrain Props
   pretrainConfig: { type: Object, default: () => ({}) },
@@ -950,10 +1106,11 @@ const emit = defineEmits([
   'update:dataSrc', 'update:model', 'update:intradayFreq', 'update:dataLengthYears',
   'update:pretrainedChoice', 'update:intradayBlend', 'update:enableRollingLookback',
   'update:strategyForm', 'update:strategyChanConfig', 'update:pretrainConfig',
-  'update:paperConfig', 'update:paperParams',
+  'update:paperConfig', 'update:backtestSimId', 'update:paperParams', 'update:paperRunForm',
   'analyze', 'toggle', 'refreshPretrained', 'refresh', 'runStrategy', 'runPretrain',
   'runPaperStep',
-  'runBacktest'
+  'runBacktest',
+  'createPaperRun'
 ])
 
 const proxyCode = computed({
@@ -1041,9 +1198,19 @@ const proxyPaperConfig = computed({
   set: (val) => emit('update:paperConfig', val)
 })
 
+const proxyBacktestSimId = computed({
+  get: () => props.backtestSimId,
+  set: (val) => emit('update:backtestSimId', val)
+})
+
 const proxyPaperParams = computed({
   get: () => props.paperParams,
   set: (val) => emit('update:paperParams', val)
+})
+
+const proxyPaperRunForm = computed({
+  get: () => props.paperRunForm,
+  set: (val) => emit('update:paperRunForm', val)
 })
 
 const paperDecisionTimeVisible = computed(() => {
@@ -1084,6 +1251,130 @@ const paperRunDisabled = computed(() => {
   return !!t1DecisionTimeError.value || !!t1GapThresholdError.value
 })
 
+const backtestSaveOpen = ref(false)
+const backtestSaveName = ref('')
+const backtestSaveLoading = ref(false)
+const backtestLoadOpen = ref(false)
+const backtestLoadId = ref(null)
+const backtestLoadLoading = ref(false)
+const backtestExportOpen = ref(false)
+const backtestExportText = ref('')
+const backtestImportOpen = ref(false)
+const backtestImportText = ref('')
+const backtestImportLoading = ref(false)
+const backtestPresetsLoading = ref(false)
+const backtestPresetItems = ref([])
+
+const backtestPresetOptions = computed(() => {
+  const items = Array.isArray(backtestPresetItems.value) ? backtestPresetItems.value : []
+  return items.map(x => ({
+    label: String(x?.name || ''),
+    value: Number(x?.id || 0)
+  })).filter(x => Number.isFinite(x.value) && x.value > 0 && x.label)
+})
+
+const openBacktestSave = () => {
+  backtestSaveName.value = ''
+  backtestSaveOpen.value = true
+}
+
+const openBacktestLoad = async () => {
+  await fetchBacktestPresets()
+  if (!backtestPresetOptions.value.length) {
+    toast.add({ title: t('portfolio.noSavedConfigs'), color: 'gray' })
+    return
+  }
+  backtestLoadId.value = backtestPresetOptions.value[0]?.value || null
+  backtestLoadOpen.value = true
+}
+
+const openBacktestExport = () => {
+  const cfg = proxyPaperConfig.value || {}
+  const prm = proxyPaperParams.value || {}
+  backtestExportText.value = JSON.stringify({ version: 1, paper_config: cfg, paper_params: prm }, null, 2)
+  backtestExportOpen.value = true
+}
+
+const openBacktestImport = () => {
+  backtestImportText.value = ''
+  backtestImportOpen.value = true
+}
+
+const fetchBacktestPresets = async () => {
+  if (backtestPresetsLoading.value) return
+  backtestPresetsLoading.value = true
+  try {
+    const res = await axios.get('/api/backtest/presets', { params: { limit: 200 } })
+    backtestPresetItems.value = Array.isArray(res.data?.items) ? res.data.items : []
+  } catch (e) {
+    toast.add({ title: t('portfolio.loadFailed'), description: String(e?.response?.data?.detail || e?.message || e), color: 'red' })
+  } finally {
+    backtestPresetsLoading.value = false
+  }
+}
+
+const saveBacktestPreset = async () => {
+  const nm = String(backtestSaveName.value || '').trim()
+  if (!nm) {
+    toast.add({ title: t('portfolio.nameRequired'), color: 'red' })
+    return
+  }
+  backtestSaveLoading.value = true
+  try {
+    const payload = {
+      name: nm,
+      paper_config: JSON.parse(JSON.stringify(proxyPaperConfig.value || {})),
+      paper_params: JSON.parse(JSON.stringify(proxyPaperParams.value || {})),
+    }
+    await axios.post('/api/backtest/presets', payload)
+    toast.add({ title: t('portfolio.saved'), color: 'green' })
+    backtestSaveOpen.value = false
+    await fetchBacktestPresets()
+  } catch (e) {
+    toast.add({ title: t('portfolio.saveFailed'), description: String(e?.response?.data?.detail || e?.message || e), color: 'red' })
+  } finally {
+    backtestSaveLoading.value = false
+  }
+}
+
+const applyBacktestPreset = async () => {
+  const pid = Number(backtestLoadId.value || 0)
+  if (!Number.isFinite(pid) || pid <= 0) return
+  backtestLoadLoading.value = true
+  try {
+    const res = await axios.get(`/api/backtest/presets/${encodeURIComponent(String(pid))}`)
+    const item = res.data?.item || {}
+    const cfg = item.paper_config && typeof item.paper_config === 'object' ? item.paper_config : {}
+    const prm = item.paper_params && typeof item.paper_params === 'object' ? item.paper_params : {}
+    proxyPaperConfig.value = { ...(proxyPaperConfig.value || {}), ...cfg }
+    proxyPaperParams.value = { ...(proxyPaperParams.value || {}), ...prm }
+    toast.add({ title: t('portfolio.loaded'), color: 'green' })
+    backtestLoadOpen.value = false
+  } catch (e) {
+    toast.add({ title: t('portfolio.loadFailed'), description: String(e?.response?.data?.detail || e?.message || e), color: 'red' })
+  } finally {
+    backtestLoadLoading.value = false
+  }
+}
+
+const applyBacktestImport = async () => {
+  backtestImportLoading.value = true
+  try {
+    const raw = String(backtestImportText.value || '').trim()
+    const obj = raw ? JSON.parse(raw) : {}
+    const cfg = (obj.paper_config || obj.paperConfig) && typeof (obj.paper_config || obj.paperConfig) === 'object' ? (obj.paper_config || obj.paperConfig) : {}
+    const prm = (obj.paper_params || obj.paperParams) && typeof (obj.paper_params || obj.paperParams) === 'object' ? (obj.paper_params || obj.paperParams) : {}
+    proxyPaperConfig.value = { ...(proxyPaperConfig.value || {}), ...cfg }
+    proxyPaperParams.value = { ...(proxyPaperParams.value || {}), ...prm }
+    toast.add({ title: t('portfolio.loaded'), color: 'green' })
+    backtestImportOpen.value = false
+  } catch (e) {
+    toast.add({ title: t('portfolio.invalidJson'), description: String(e?.message || e), color: 'red' })
+  } finally {
+    backtestImportLoading.value = false
+  }
+}
+
 const generateSimId = () => {
   let sid = ''
   try {
@@ -1094,8 +1385,7 @@ const generateSimId = () => {
   if (!sid) {
     sid = `${Date.now()}-${Math.random().toString(16).slice(2)}`
   }
-  const cur = proxyPaperConfig.value || {}
-  proxyPaperConfig.value = { ...cur, sim_id: sid }
+  proxyBacktestSimId.value = sid
 }
 
 const autoProfitThreshold = computed({

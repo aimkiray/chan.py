@@ -317,6 +317,13 @@
            <div class="h-[300px]" style="width: 100%; min-width: 0;" ref="chartContainer"></div>
         </UCard>
 
+        <UCard>
+          <template #header>{{ t('strategy.tradeHistory') }}</template>
+          <div class="max-h-[420px] overflow-auto">
+            <UTable :rows="backtestTradeRows" :columns="backtestTradeColumns" class="w-full" :ui="{ th: { base: 'sticky top-0 bg-gray-50 dark:bg-gray-900 z-10' } }" />
+          </div>
+        </UCard>
+
         <div class="flex flex-col gap-2">
           <UCheckbox v-model="backtestConfirmed" :label="t('portfolio.confirmBacktest')" />
           <UButton
@@ -405,6 +412,7 @@ const props = defineProps({
   initialMode: { type: String, default: 'portfolio' },
   fixedMode: { type: String, default: '' },
   paperConfig: { type: Object, default: () => ({}) },
+  backtestSimId: { type: String, default: 'default' },
   paperParams: { type: Object, default: () => ({}) },
   paperRunForm: { type: Object, default: () => ({}) }
 })
@@ -835,6 +843,54 @@ const tradeColumns = computed(() => ([
   { key: 'price_text', label: t('strategy.price') }
 ]))
 
+const backtestTradeRows = computed(() => {
+  const logs = currentBacktestResult.value?.trade_logs
+  const items = Array.isArray(logs) ? logs : []
+  return items.map((x, idx) => {
+    const side = String(x?.side || '').toLowerCase()
+    const timeText = String(x?.time || '').trim()
+    const useClose = !!x?.use_close
+    const code = String(x?.code || x?.stock_code || '').trim()
+    const px = Number(x?.price)
+    const sh = Number(x?.shares)
+    const pnlPct = x?.pnl_pct === null || x?.pnl_pct === undefined ? null : Number(x?.pnl_pct)
+    const reason = String(x?.reason || '').trim()
+    const tradeTs = Number(x?.trade_ts || 0)
+    const timeByTs = Number.isFinite(tradeTs) && tradeTs > 0 ? formatTs(tradeTs) : ''
+    const timeBase = timeText || timeByTs || formatDay(x?.day)
+    let suffix = ''
+    const m = typeof timeBase === 'string' ? timeBase.match(/(\d{2}:\d{2})$/) : null
+    const hhmm = m?.[1] || ''
+    if (hhmm) {
+      if (hhmm === '09:30') suffix = '(开盘)'
+      else if (hhmm === '15:00') suffix = '(收盘)'
+    } else {
+      suffix = useClose ? '(收盘)' : '(开盘)'
+    }
+    const timeLabel = timeBase === '-' ? '-' : (suffix ? `${timeBase} ${suffix}` : timeBase)
+    return {
+      id: idx + 1,
+      day_text: timeLabel,
+      side_text: formatSide(side),
+      stock_code: code || '-',
+      price_text: Number.isFinite(px) ? px.toFixed(4) : '-',
+      shares_text: Number.isFinite(sh) ? sh.toFixed(4) : '-',
+      pnl_pct_text: pnlPct !== null && Number.isFinite(pnlPct) ? formatPct(pnlPct) : '-',
+      reason_text: reason || '-'
+    }
+  })
+})
+
+const backtestTradeColumns = computed(() => ([
+  { key: 'day_text', label: t('strategy.timeHuman') },
+  { key: 'side_text', label: t('strategy.side') },
+  { key: 'stock_code', label: t('sidebar.stockCode') },
+  { key: 'price_text', label: t('strategy.price') },
+  { key: 'shares_text', label: t('portfolio.volume') },
+  { key: 'pnl_pct_text', label: t('strategy.positionReturn') },
+  { key: 'reason_text', label: t('strategy.reason') }
+]))
+
 const targetByCode = computed(() => {
   const m = {}
   for (const x of (stepResult.value?.targets || [])) {
@@ -880,6 +936,13 @@ const formatSide = (s) => {
   if (raw === 'buy') return t('common.buy')
   if (raw === 'sell') return t('common.sell')
   return raw || '-'
+}
+
+const formatDay = (day) => {
+  const s = String(day ?? '').trim()
+  if (!s) return '-'
+  if (/^\d{8}$/.test(s)) return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`
+  return s
 }
 
 const formatLiveStatus = (status, side) => {
@@ -1056,6 +1119,7 @@ const runWolfpackBacktest = async () => {
       equity: Number(x?.equity ?? 0)
     }))
     const lastEquity = curve.length ? Number(curve[curve.length - 1]?.equity) : 1
+    const tradeLogs = Array.isArray(pf.trade_logs) ? pf.trade_logs : []
     wolfpackBacktestResult.value = {
       metrics: {
         total_return: Number(pf.total_return ?? (lastEquity - 1)),
@@ -1063,7 +1127,8 @@ const runWolfpackBacktest = async () => {
         max_drawdown: Number(pf.max_drawdown ?? 0),
         final_equity: Number.isFinite(lastEquity) ? lastEquity : 1
       },
-      equity_curve: curve
+      equity_curve: curve,
+      trade_logs: tradeLogs
     }
     lastBacktestPaperConfig.value = { ...(props.paperConfig || {}) }
     lastBacktestPaperParams.value = { ...(props.paperParams || {}) }
@@ -1107,7 +1172,7 @@ const runPaperFromBacktest = async () => {
     const snapCfg = lastBacktestPaperConfig.value || props.paperConfig || {}
     const snapPrm = lastBacktestPaperParams.value || props.paperParams || {}
 
-    const sid = resolveRunSimId(snapCfg?.sim_id)
+    const sid = resolveRunSimId(props.backtestSimId)
     const params = buildLiveParams(snapCfg, snapPrm, sid)
     const payload = {
       name: '',
@@ -1315,6 +1380,7 @@ const createRun = async () => {
   runsError.value = ''
   runsLoading.value = true
   try {
+    const hadRunning = (liveRuns.value || []).some(r => String(r?.status || '').toLowerCase() === 'running')
     const cfg = props.paperConfig || {}
     const baseSid = String(activeSimId.value || '').trim() || 'default'
     const sid = baseSid === 'default'
@@ -1329,6 +1395,10 @@ const createRun = async () => {
       portfolio_id: activePortfolioId.value,
       enable_rolling_lookback: true
     }
+    const notifyEnabled = !!props.paperRunForm?.notify_enabled
+    const notifyMode = String(props.paperRunForm?.notify_mode || 'dingtalk')
+    const enableDingtalk = notifyEnabled && (notifyMode === 'dingtalk' || notifyMode === 'both')
+    const enableSms = notifyEnabled && (notifyMode === 'sms' || notifyMode === 'both')
     const payload = {
       name: String(props.paperRunForm?.name || '').trim(),
       sim_id: sid,
@@ -1336,7 +1406,13 @@ const createRun = async () => {
       params,
       offset_seconds: Number(props.paperRunForm?.offset_seconds || 0),
       auto_resume: !!props.paperRunForm?.auto_resume,
-      notify_enabled: !!props.paperRunForm?.notify_enabled,
+      notify_enabled: notifyEnabled,
+      notify_kind: enableDingtalk ? 'dingtalk' : '',
+      notify_webhook: enableDingtalk ? String(props.paperRunForm?.dingtalk_webhook || '').trim() : '',
+      notify_secret: enableDingtalk ? String(props.paperRunForm?.dingtalk_secret || '').trim() : '',
+      sms_enabled: enableSms,
+      sms_phone: enableSms ? String(props.paperRunForm?.sms_phone || '').trim() : '',
+      sms_token: enableSms ? String(props.paperRunForm?.sms_token || '').trim() : '',
       start: !!props.paperRunForm?.start
     }
     const res = await axios.post('/api/live/runs', payload)
@@ -1350,6 +1426,14 @@ const createRun = async () => {
     await loadPositions()
     await loadStepLogs()
     await loadEquity()
+    if (!!props.paperRunForm?.start && !hadRunning) {
+      setTimeout(() => {
+        loadRuns()
+        loadPositions()
+        loadStepLogs()
+        loadEquity()
+      }, 1500)
+    }
   } catch (e) {
     runsError.value = String(e?.response?.data?.detail || e?.message || e)
   } finally {

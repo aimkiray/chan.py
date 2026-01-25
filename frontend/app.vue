@@ -83,11 +83,13 @@
           v-model:strategyForm="strategyForm"
           v-model:strategyChanConfig="strategyChanConfig"
           v-model:paperConfig="paperConfig"
+          v-model:backtestSimId="backtestSimId"
           v-model:paperParams="paperParams"
+          v-model:paperRunForm="paperRunForm"
           v-model:pretrainConfig="pretrainConfig"
           :activeTab="activeTab"
           :loading="loading"
-          :backtestLoading="backtestPanelRef?.wolfpackLoading?.value || false"
+          :backtestLoading="backtestLoading"
           :dataLengthMin="dataLengthMin"
           :dataLengthMax="dataLengthMax"
           :dataLengthStep="dataLengthStep"
@@ -98,7 +100,8 @@
           @runStrategy="strategyPanelRef.runStrategy()"
           @runPretrain="pretrainPanelRef.runPretrain()"
           @runPaperStep="paperPanelRef.runPaperStep()"
-          @runBacktest="backtestPanelRef.runBacktest()"
+          @createPaperRun="paperPanelRef.createRun()"
+          @runBacktest="handleRunBacktest()"
           @refresh="analyze(false, false, true)"
             @toggle="handleManualClose"
             @refreshPretrained="fetchIntradayPretrainedModels"
@@ -171,11 +174,13 @@
             v-model:strategyForm="strategyForm"
             v-model:strategyChanConfig="strategyChanConfig"
             v-model:paperConfig="paperConfig"
+            v-model:backtestSimId="backtestSimId"
             v-model:paperParams="paperParams"
+            v-model:paperRunForm="paperRunForm"
             v-model:pretrainConfig="pretrainConfig"
             :activeTab="activeTab"
             :loading="loading"
-            :backtestLoading="backtestPanelRef?.wolfpackLoading?.value || false"
+            :backtestLoading="backtestLoading"
             :dataLengthMin="dataLengthMin"
             :dataLengthMax="dataLengthMax"
             :dataLengthStep="dataLengthStep"
@@ -187,7 +192,8 @@
             @runStrategy="strategyPanelRef.runStrategy()"
             @runPretrain="pretrainPanelRef.runPretrain()"
             @runPaperStep="paperPanelRef.runPaperStep(); mobileSidebarCollapsed = true"
-            @runBacktest="backtestPanelRef.runBacktest(); mobileSidebarCollapsed = true"
+            @createPaperRun="paperPanelRef.createRun(); mobileSidebarCollapsed = true"
+            @runBacktest="handleRunBacktest({ collapseMobile: true })"
             @refresh="analyze(false, false, true); mobileSidebarCollapsed = true"
             @toggle="mobileSidebarCollapsed = !mobileSidebarCollapsed"
             @refreshPretrained="fetchIntradayPretrainedModels"
@@ -355,7 +361,9 @@
                  ref="backtestPanelRef"
                  fixed-mode="backtest"
                  :paperConfig="paperConfig"
+                 :backtestSimId="backtestSimId"
                  :paperParams="paperParams"
+                 :paperRunForm="paperRunForm"
                  @selectSimId="handleSelectSimId"
                  @applyRunParams="handleApplyRunParams"
                  @openPaper="handleOpenPaper"
@@ -371,6 +379,7 @@
                  fixed-mode="paper"
                  :paperConfig="paperConfig"
                  :paperParams="paperParams"
+                 :paperRunForm="paperRunForm"
                  @selectSimId="handleSelectSimId"
                  @applyRunParams="handleApplyRunParams"
                />
@@ -517,6 +526,11 @@ const historyPanelRef = ref(null)
 const portfoliosPanelRef = ref(null)
 const backtestPanelRef = ref(null)
 const paperPanelRef = ref(null)
+const sidebarBacktestLoading = ref(false)
+const backtestLoading = computed(() => {
+  const live = backtestPanelRef.value?.wolfpackLoading?.value
+  return !!(sidebarBacktestLoading.value || live)
+})
 const paperConfig = ref({
   sim_id: 'default',
   pool_id: 'index:IDX399673',
@@ -525,6 +539,7 @@ const paperConfig = ref({
   frequency: '30m',
   initial_capital: 100000
 })
+const backtestSimId = ref('default')
 const paperParams = ref({
   lookback_days: 365 * 5,
   top_n: 2,
@@ -559,8 +574,50 @@ const paperParams = ref({
   risk_data_fail_mode: 'reduce',
   risk_intraday_data_fail_mode: 'reduce'
 })
+
+const paperRunForm = ref({
+  name: '',
+  offset_seconds: 5,
+  auto_resume: true,
+  notify_enabled: false,
+  notify_mode: 'dingtalk',
+  dingtalk_webhook: '',
+  dingtalk_secret: '',
+  sms_phone: '',
+  sms_token: '',
+  start: true
+})
+
+const handleRunBacktest = async ({ collapseMobile } = {}) => {
+  if (backtestLoading.value) {
+    toast.add({ title: t('portfolio.backtestRunningTitle'), color: 'blue' })
+    if (collapseMobile) mobileSidebarCollapsed.value = true
+    return
+  }
+
+  const inst = backtestPanelRef.value
+  if (!inst || typeof inst.runBacktest !== 'function') {
+    toast.add({ title: t('portfolio.backtestFailed'), color: 'red' })
+    if (collapseMobile) mobileSidebarCollapsed.value = true
+    return
+  }
+
+  sidebarBacktestLoading.value = true
+  toast.add({ title: t('portfolio.backtestRunningTitle'), description: t('portfolio.backtestRunningDesc'), color: 'blue' })
+  try {
+    await inst.runBacktest()
+  } finally {
+    sidebarBacktestLoading.value = false
+    if (collapseMobile) mobileSidebarCollapsed.value = true
+  }
+}
 const handleSelectSimId = (simId) => {
   const sid = String(simId || '').trim() || 'default'
+  try {
+    if (typeof window !== 'undefined' && sid && sid !== 'default') {
+      localStorage.setItem('paperSim.lastSimId', sid)
+    }
+  } catch (e) {}
   paperConfig.value = { ...(paperConfig.value || {}), sim_id: sid }
 }
 
@@ -886,7 +943,21 @@ onMounted(() => {
     } catch (e) { /* ignore */ }
   }
 
-  const initialSimId = String(paperConfig.value?.sim_id || '').trim() || 'default'
+  const rawInitial = String(paperConfig.value?.sim_id || '').trim() || 'default'
+  let initialSimId = rawInitial
+  if (initialSimId === 'default') {
+    try {
+      const last = typeof window !== 'undefined' ? String(localStorage.getItem('paperSim.lastSimId') || '').trim() : ''
+      if (last && last !== 'default') initialSimId = last
+    } catch (e) {}
+  }
+
+  try {
+    if (typeof window !== 'undefined' && initialSimId && initialSimId !== 'default') {
+      localStorage.setItem('paperSim.lastSimId', initialSimId)
+    }
+  } catch (e) {}
+
   paperConfig.value = { ...(paperConfig.value || {}), sim_id: initialSimId }
   loadPaperSimFromStorage(initialSimId)
 
@@ -960,6 +1031,11 @@ watch(model, (newVal) => {
   if (!isInitialized.value) return
   if (newVal) {
     localStorage.setItem('lastModel', newVal)
+  }
+  const mk = String(newVal || '').trim().toLowerCase()
+  if (['logistic_regression', 'logreg', 'lr'].includes(mk)) {
+    rankTransformEnabled.value = true
+    onlyFeatures.value = 'volatility_250,bsp3_zs_height'
   }
 })
 
@@ -1070,6 +1146,12 @@ watch(
   (sid) => {
     if (!isInitialized.value) return
     if (paperSimLoading.value) return
+    try {
+      const s = String(sid || '').trim() || 'default'
+      if (typeof window !== 'undefined' && s && s !== 'default') {
+        localStorage.setItem('paperSim.lastSimId', s)
+      }
+    } catch (e) {}
     loadPaperSimFromStorage(sid)
   }
 )
@@ -1200,6 +1282,9 @@ const getPretrainedAvailability = ({ isIntraday }) => {
 
       const shouldForceRefresh = !!forceRefresh || !!strategyForm.value.force_refresh
       const onlyFeaturesRaw = String(onlyFeatures.value ?? '').trim()
+      const modelKey = String(model.value || '').trim().toLowerCase()
+      const useWolfpackLR = ['logistic_regression', 'logreg', 'lr'].includes(modelKey)
+      const wolfpackOnlyFeatures = ['volatility_250', 'bsp3_zs_height']
 
       const params = {
         code: code.value,
@@ -1209,13 +1294,14 @@ const getPretrainedAvailability = ({ isIntraday }) => {
         trigger_step: triggerStep.value,
         bi_strict: biStrict.value,
         enable_rolling_lookback: enableRollingLookback.value,
-        rank_transform_enabled: rankTransformEnabled.value,
-        only_features: onlyFeaturesRaw ? onlyFeaturesRaw : null,
+        rank_transform_enabled: useWolfpackLR ? true : rankTransformEnabled.value,
+        only_features: useWolfpackLR ? wolfpackOnlyFeatures : (onlyFeaturesRaw ? onlyFeaturesRaw : null),
         start_date: startDate,
         end_date: endDate,
         profit_threshold: profitThreshold,
         auto_profit_quantile: autoQ,
         profit_lookahead: lookahead,
+        backtest_mode: useWolfpackLR ? 'walk_forward' : undefined,
         data_src: dataSrc.value,
         model: model.value,
         force_refresh: shouldForceRefresh,
@@ -1300,6 +1386,9 @@ const getPretrainedAvailability = ({ isIntraday }) => {
    if (separatePrediction) {
        try {
            const onlyFeaturesRaw = String(onlyFeatures.value ?? '').trim()
+           const modelKey = String(model.value || '').trim().toLowerCase()
+           const useWolfpackLR = ['logistic_regression', 'logreg', 'lr'].includes(modelKey)
+           const wolfpackOnlyFeatures = ['volatility_250', 'bsp3_zs_height']
            const params = {
                code: code.value,
                frequency: '1d',
@@ -1308,8 +1397,9 @@ const getPretrainedAvailability = ({ isIntraday }) => {
                trigger_step: triggerStep.value,
                bi_strict: biStrict.value,
                enable_rolling_lookback: enableRollingLookback.value,
-               rank_transform_enabled: rankTransformEnabled.value,
-               only_features: onlyFeaturesRaw ? onlyFeaturesRaw : null,
+               rank_transform_enabled: useWolfpackLR ? true : rankTransformEnabled.value,
+               only_features: useWolfpackLR ? wolfpackOnlyFeatures : (onlyFeaturesRaw ? onlyFeaturesRaw : null),
+               backtest_mode: useWolfpackLR ? 'walk_forward' : undefined,
                profit_threshold: strategyForm.value.profit_threshold,
                auto_profit_quantile: strategyForm.value.auto_profit_quantile,
                profit_lookahead: strategyForm.value.profit_lookahead,

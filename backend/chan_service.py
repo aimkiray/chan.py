@@ -2742,7 +2742,14 @@ def _prune_correlated_features(X, feature_names, importance_map, corr_threshold:
     std[std < 1e-12] = 1.0
     z = (arr - mean) / std
     try:
-        corr = np.corrcoef(z, rowvar=False)
+        cov = np.cov(z, rowvar=False)
+        std2 = np.sqrt(np.diag(cov))
+        denom = np.outer(std2, std2)
+        denom = np.nan_to_num(denom, nan=1.0, posinf=1.0, neginf=1.0)
+        denom[denom < 1e-12] = 1.0
+        corr = cov / denom
+        corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+        np.fill_diagonal(corr, 1.0)
     except Exception:
         return list(feature_names)
 
