@@ -116,7 +116,14 @@
 
         <div>
             <div class="flex items-center justify-between gap-2 mb-4">
-              <div class="text-xs text-gray-500">{{ t('strategy.autoRun') }} · sim={{ activeSimId }}</div>
+              <div class="text-xs text-gray-500 flex items-center gap-1 min-w-0">
+                <span>{{ t('strategy.autoRun') }}</span>
+                <span class="text-gray-400">·</span>
+                <span class="font-mono truncate">{{ t('portfolio.simSession') }}: {{ activeSimId }}</span>
+                <UTooltip :text="t('portfolio.simSessionHint')" :popper="{ placement: 'top' }">
+                  <UIcon name="i-heroicons-exclamation-circle" class="w-4 h-4 text-gray-400 hover:text-gray-600 cursor-help shrink-0" />
+                </UTooltip>
+              </div>
               <UButton size="xs" color="gray" variant="soft" :loading="runsLoading" @click="loadRuns">{{ t('strategy.refresh') }}</UButton>
             </div>
             <div v-if="runsError" class="mb-2 text-xs text-red-500 break-all">{{ runsError }}</div>
@@ -131,7 +138,9 @@
                 </div>
                 <div class="flex items-center gap-1 shrink-0">
                   <UButton size="xs" color="gray" variant="soft" @click="selectRunSim(r)">{{ t('strategy.view') }}</UButton>
-                  <UButton size="xs" color="gray" variant="soft" @click="applyRunParams(r)">{{ t('strategy.apply') }}</UButton>
+                  <UButton size="xs" color="gray" variant="soft" @click="openRunParams(r)">{{ t('strategy.viewParams') }}</UButton>
+                  <UButton size="xs" color="gray" variant="soft" @click="goBacktestWithParams(r)">{{ t('strategy.goBacktestFill') }}</UButton>
+                  <UButton size="xs" color="emerald" variant="soft" :loading="runningOnceRunId === String(r.run_id||'')" @click="runOnce(r)">{{ t('strategy.runOnce') }}</UButton>
                   <UButton v-if="String(r.status||'') !== 'running'" size="xs" color="primary" variant="soft" @click="startRun(r.run_id)">{{ t('strategy.startRun') }}</UButton>
                   <UButton v-else size="xs" color="orange" variant="soft" @click="stopRun(r.run_id)">{{ t('strategy.stopRun') }}</UButton>
                   <UButton size="xs" color="red" variant="soft" @click="deleteRun(r.run_id)">{{ t('strategy.delete') }}</UButton>
@@ -188,6 +197,54 @@
                 <span v-if="stepResult.market_open === false" class="text-gray-500"> · {{ t('strategy.waitingBuy') }}</span>
               </div>
               <div v-if="!(stepResult.buy || []).length" class="text-gray-400">-</div>
+            </div>
+          </UCard>
+        </div>
+
+        <div v-if="stepResult?.selection_debug" class="mt-4">
+          <div class="flex items-center justify-between gap-2 mb-2">
+            <div class="text-xs text-gray-500">选股调试</div>
+            <UButton size="xs" color="gray" variant="soft" @click="showSelectionDebug = !showSelectionDebug">
+              {{ showSelectionDebug ? '收起' : '展开' }}
+            </UButton>
+          </div>
+          <UCard v-if="showSelectionDebug">
+            <div class="text-xs text-gray-500 break-all">
+              day={{ selectionDebug?.signal_day || '-' }} · mode={{ selectionDebug?.signal_day_mode || '-' }} · minProb={{ selectionDebug?.min_prob ?? '-' }} · topN={{ selectionDebug?.top_n ?? '-' }} · effTopN={{ selectionDebug?.effective_top_n ?? '-' }} · scanned={{ selectionDebug?.counts?.scanned ?? '-' }} · today={{ selectionDebug?.counts?.todays_raw ?? '-' }} · pass={{ selectionDebug?.counts?.todays_pass_min_prob ?? '-' }}
+              <span v-if="selectionDebug?.decision_delayed"> · delayed={{ selectionDebug?.decision_time || '-' }}</span>
+            </div>
+
+            <div class="mt-3 grid grid-cols-2 gap-4">
+              <div>
+                <div class="text-xs text-gray-500 mb-1">Top候选</div>
+                <div v-for="c in selectionDebugCandidatesTop" :key="c.code" class="text-xs font-mono">
+                  {{ c.rank }}. {{ c.code }} · {{ Number(c.prob).toFixed(4) }} · {{ c.pass_min_prob ? 'pass' : 'fail' }}
+                  <span v-if="c.selected" class="text-green-600"> · selected</span>
+                  <span v-if="c.action" class="text-gray-500"> · {{ c.action }}</span>
+                </div>
+                <div v-if="!selectionDebugCandidatesTop.length" class="text-xs text-gray-400">-</div>
+              </div>
+              <div>
+                <div class="text-xs text-gray-500 mb-1">低于minProb(最高若干)</div>
+                <div v-for="c in selectionDebugCandidatesBelow" :key="c.code" class="text-xs font-mono">
+                  {{ c.rank }}. {{ c.code }} · {{ Number(c.prob).toFixed(4) }}
+                </div>
+                <div v-if="!selectionDebugCandidatesBelow.length" class="text-xs text-gray-400">-</div>
+              </div>
+            </div>
+
+            <div v-if="selectionDebugSellReasonItems.length" class="mt-3">
+              <div class="text-xs text-gray-500 mb-1">计划卖出原因</div>
+              <div v-for="[k, v] in selectionDebugSellReasonItems" :key="k" class="text-xs font-mono">
+                {{ k }} · {{ v }}
+              </div>
+            </div>
+
+            <div v-if="selectionDebugBuyReasonItems.length" class="mt-3">
+              <div class="text-xs text-gray-500 mb-1">计划买入原因</div>
+              <div v-for="[k, v] in selectionDebugBuyReasonItems" :key="k" class="text-xs font-mono">
+                {{ k }} · {{ v }}
+              </div>
             </div>
           </UCard>
         </div>
@@ -317,12 +374,34 @@
            <div class="h-[300px]" style="width: 100%; min-width: 0;" ref="chartContainer"></div>
         </UCard>
 
-        <UCard>
-          <template #header>{{ t('strategy.tradeHistory') }}</template>
-          <div class="max-h-[420px] overflow-auto">
-            <UTable :rows="backtestTradeRows" :columns="backtestTradeColumns" class="w-full" :ui="{ th: { base: 'sticky top-0 bg-gray-50 dark:bg-gray-900 z-10' } }" />
-          </div>
-        </UCard>
+        <div class="flex flex-col gap-4">
+          <UCard v-for="tb in backtestTradeTables" :key="tb.key">
+            <template #header>
+              <div class="flex items-center justify-between gap-2">
+                <div class="min-w-0 truncate">{{ tb.title }}</div>
+                <UButton
+                  v-if="tb.snapshot_date"
+                  size="xs"
+                  color="gray"
+                  variant="soft"
+                  @click.stop="toggleBacktestMembers(tb)"
+                >
+                  {{ backtestMembersButtonText(tb) }}
+                </UButton>
+              </div>
+              <div v-if="isBacktestMembersOpen(tb)" class="mt-2">
+                <div class="max-h-40 overflow-auto">
+                  <div class="text-xs text-gray-500 break-all font-mono">
+                    {{ (backtestMembersCodes(tb) || []).join(' ') }}
+                  </div>
+                </div>
+              </div>
+            </template>
+            <div class="max-h-[420px] overflow-auto">
+              <UTable :rows="tb.rows" :columns="backtestTradeColumns" class="w-full" :ui="{ th: { base: 'sticky top-0 bg-gray-50 dark:bg-gray-900 z-10' } }" />
+            </div>
+          </UCard>
+        </div>
 
         <div class="flex flex-col gap-2">
           <UCheckbox v-model="backtestConfirmed" :label="t('portfolio.confirmBacktest')" />
@@ -377,6 +456,22 @@
         </template>
       </UCard>
     </UModal>
+
+    <UModal v-model="showRunParamsModal">
+      <UCard>
+        <template #header>{{ t('strategy.viewParams') }}</template>
+        <div v-if="runParamsError" class="mb-2 text-xs text-red-500 break-all">{{ runParamsError }}</div>
+        <div class="max-h-[70vh] overflow-auto">
+          <div v-if="runParamsLoading" class="text-xs text-gray-400">{{ t('strategy.running') }}</div>
+          <pre v-else class="text-xs font-mono whitespace-pre break-all">{{ runParamsText }}</pre>
+        </div>
+        <template #footer>
+          <div class="flex justify-end gap-2">
+            <UButton color="gray" variant="ghost" @click="showRunParamsModal = false">{{ t('portfolio.close') }}</UButton>
+          </div>
+        </template>
+      </UCard>
+    </UModal>
   </div>
 </template>
 
@@ -416,7 +511,7 @@ const props = defineProps({
   paperParams: { type: Object, default: () => ({}) },
   paperRunForm: { type: Object, default: () => ({}) }
 })
-const emit = defineEmits(['selectSimId', 'applyRunParams', 'openPaper'])
+const emit = defineEmits(['selectSimId', 'applyRunParams', 'openPaper', 'openBacktestFill'])
 
 const fixedMode = computed(() => String(props.fixedMode || '').trim())
 const mode = ref(String((fixedMode.value || props.initialMode || 'portfolio')).trim() || 'portfolio')
@@ -454,6 +549,20 @@ const newPortfolio = ref({ name: '', description: '' })
 
 const showAddPosModal = ref(false)
 const newPosition = ref({ code: '', name: '', volume: 0, price: 0 })
+
+const showRunParamsModal = ref(false)
+const runParamsLoading = ref(false)
+const runParamsError = ref('')
+const runParamsItem = ref(null)
+const runParamsText = computed(() => {
+  const it = runParamsItem.value
+  if (!it) return '-'
+  try {
+    return JSON.stringify(it, null, 2)
+  } catch (e) {
+    return String(it)
+  }
+})
 
 // Backtest
 const backtestKind = ref('wolfpack')
@@ -532,8 +641,7 @@ const wolfpackFrequencyOptions = computed(() => ([
 ]))
 const wolfpackDataSrcOptions = computed(() => ([
   { label: t('app.dataSrcOptions.clickhouse'), value: 'clickhouse' },
-  { label: t('app.dataSrcOptions.baostock'), value: 'baostock' },
-  { label: t('app.dataSrcOptions.akshare'), value: 'akshare' }
+  { label: t('app.dataSrcOptions.baostock'), value: 'baostock' }
 ]))
 const wolfpackAutypeOptions = computed(() => ([
   { label: t('sidebar.autypeQfq'), value: 'qfq' },
@@ -714,11 +822,54 @@ const paperInitialized = ref(false)
 const stepLoading = ref(false)
 const stepError = ref('')
 const stepResult = ref(null)
+const showSelectionDebug = ref(false)
+
+watch(stepResult, () => {
+  showSelectionDebug.value = false
+})
+
+const selectionDebug = computed(() => {
+  const sr = stepResult.value
+  if (!sr || typeof sr !== 'object') return null
+  const sd = sr.selection_debug
+  return sd && typeof sd === 'object' ? sd : null
+})
+
+const selectionDebugCandidatesTop = computed(() => {
+  const arr = selectionDebug.value?.candidates_top
+  return Array.isArray(arr) ? arr : []
+})
+
+const selectionDebugCandidatesBelow = computed(() => {
+  const arr = selectionDebug.value?.candidates_below_min_prob
+  return Array.isArray(arr) ? arr : []
+})
+
+const selectionDebugSellReasonItems = computed(() => {
+  const obj = selectionDebug.value?.sell_reason_by_code
+  if (!obj || typeof obj !== 'object') return []
+  try {
+    return Object.entries(obj).sort((a, b) => String(a[0]).localeCompare(String(b[0])))
+  } catch (e) {
+    return Object.entries(obj)
+  }
+})
+
+const selectionDebugBuyReasonItems = computed(() => {
+  const obj = selectionDebug.value?.buy_reason_by_code
+  if (!obj || typeof obj !== 'object') return []
+  try {
+    return Object.entries(obj).sort((a, b) => String(a[0]).localeCompare(String(b[0])))
+  } catch (e) {
+    return Object.entries(obj)
+  }
+})
 
 const runsLoading = ref(false)
 const runsError = ref('')
 const liveRuns = ref([])
 const selectedRunId = ref('')
+const runningOnceRunId = ref('')
 
 const stepsLoading = ref(false)
 const stepsError = ref('')
@@ -843,43 +994,182 @@ const tradeColumns = computed(() => ([
   { key: 'price_text', label: t('strategy.price') }
 ]))
 
+const formatBacktestTradeRow = (x, idx) => {
+  const side = String(x?.side || '').toLowerCase()
+  const timeText = String(x?.time || '').trim()
+  const useClose = !!x?.use_close
+  const code = String(x?.code || x?.stock_code || '').trim()
+  const px = Number(x?.price)
+  const sh = Number(x?.shares)
+  const pnlPct = x?.pnl_pct === null || x?.pnl_pct === undefined ? null : Number(x?.pnl_pct)
+  const reason = String(x?.reason || '').trim()
+  const tradeTs = Number(x?.trade_ts || 0)
+  const timeByTs = Number.isFinite(tradeTs) && tradeTs > 0 ? formatTs(tradeTs) : ''
+  const timeBase = timeText || timeByTs || formatDay(x?.day)
+  let suffix = ''
+  const m = typeof timeBase === 'string' ? timeBase.match(/(\d{2}:\d{2})$/) : null
+  const hhmm = m?.[1] || ''
+  if (hhmm) {
+    if (hhmm === '09:30') suffix = '(开盘)'
+    else if (hhmm === '15:00') suffix = '(收盘)'
+  } else {
+    suffix = useClose ? '(收盘)' : '(开盘)'
+  }
+  const timeLabel = timeBase === '-' ? '-' : (suffix ? `${timeBase} ${suffix}` : timeBase)
+  return {
+    id: idx + 1,
+    day_text: timeLabel,
+    side_text: formatSide(side),
+    stock_code: code || '-',
+    price_text: Number.isFinite(px) ? px.toFixed(4) : '-',
+    shares_text: Number.isFinite(sh) ? sh.toFixed(4) : '-',
+    pnl_pct_text: pnlPct !== null && Number.isFinite(pnlPct) ? formatPct(pnlPct) : '-',
+    reason_text: reason || '-'
+  }
+}
+
 const backtestTradeRows = computed(() => {
   const logs = currentBacktestResult.value?.trade_logs
   const items = Array.isArray(logs) ? logs : []
-  return items.map((x, idx) => {
-    const side = String(x?.side || '').toLowerCase()
-    const timeText = String(x?.time || '').trim()
-    const useClose = !!x?.use_close
-    const code = String(x?.code || x?.stock_code || '').trim()
-    const px = Number(x?.price)
-    const sh = Number(x?.shares)
-    const pnlPct = x?.pnl_pct === null || x?.pnl_pct === undefined ? null : Number(x?.pnl_pct)
-    const reason = String(x?.reason || '').trim()
-    const tradeTs = Number(x?.trade_ts || 0)
-    const timeByTs = Number.isFinite(tradeTs) && tradeTs > 0 ? formatTs(tradeTs) : ''
-    const timeBase = timeText || timeByTs || formatDay(x?.day)
-    let suffix = ''
-    const m = typeof timeBase === 'string' ? timeBase.match(/(\d{2}:\d{2})$/) : null
-    const hhmm = m?.[1] || ''
-    if (hhmm) {
-      if (hhmm === '09:30') suffix = '(开盘)'
-      else if (hhmm === '15:00') suffix = '(收盘)'
-    } else {
-      suffix = useClose ? '(收盘)' : '(开盘)'
-    }
-    const timeLabel = timeBase === '-' ? '-' : (suffix ? `${timeBase} ${suffix}` : timeBase)
-    return {
-      id: idx + 1,
-      day_text: timeLabel,
-      side_text: formatSide(side),
-      stock_code: code || '-',
-      price_text: Number.isFinite(px) ? px.toFixed(4) : '-',
-      shares_text: Number.isFinite(sh) ? sh.toFixed(4) : '-',
-      pnl_pct_text: pnlPct !== null && Number.isFinite(pnlPct) ? formatPct(pnlPct) : '-',
-      reason_text: reason || '-'
-    }
-  })
+  return items.map((x, idx) => formatBacktestTradeRow(x, idx))
 })
+
+const resolveSnapshotIndexForDay = (snapDays, dayKey) => {
+  const dk = Number(dayKey || 0)
+  if (!Number.isFinite(dk) || dk <= 0) return -1
+  const days = Array.isArray(snapDays) ? snapDays : []
+  if (!days.length) return -1
+  let lo = 0
+  let hi = days.length
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (Number(days[mid]) <= dk) lo = mid + 1
+    else hi = mid
+  }
+  return lo - 1
+}
+
+const backtestTradeTables = computed(() => {
+  const logs = currentBacktestResult.value?.trade_logs
+  const items = Array.isArray(logs) ? logs : []
+  const prm = currentBacktestResult.value?.params || {}
+  const pit = !!prm.pool_point_in_time
+  const rawSnaps = Array.isArray(prm.pool_snapshots) ? prm.pool_snapshots : []
+  const snaps = rawSnaps
+    .map(s => ({
+      day: Number(s?.day || 0),
+      snapshot_date: String(s?.snapshot_date || '').trim() || formatDay(s?.day),
+      stock_count: Number(s?.stock_count || 0)
+    }))
+    .filter(s => Number.isFinite(s.day) && s.day > 0)
+    .sort((a, b) => a.day - b.day)
+
+  if (!pit || snaps.length <= 1) {
+    return [{
+      key: 'all',
+      title: t('strategy.tradeHistory'),
+      snapshot_date: null,
+      rows: items.map((x, idx) => formatBacktestTradeRow(x, idx))
+    }]
+  }
+
+  const snapDays = snaps.map(s => s.day)
+  const grouped = new Map()
+  for (const x of items) {
+    const dk = Number(x?.day || 0)
+    const idx = resolveSnapshotIndexForDay(snapDays, dk)
+    const key = idx >= 0 ? String(snapDays[idx]) : 'unknown'
+    if (!grouped.has(key)) grouped.set(key, [])
+    grouped.get(key).push(x)
+  }
+
+  const out = []
+  for (let i = 0; i < snaps.length; i++) {
+    const snap = snaps[i]
+    const key = String(snap.day)
+    const rowsRaw = grouped.get(key) || []
+    if (!rowsRaw.length) continue
+    const next = snaps[i + 1]
+    const title = next?.snapshot_date
+      ? `${snap.snapshot_date} (${snap.stock_count || 0}) ~ ${next.snapshot_date} 前`
+      : `${snap.snapshot_date} (${snap.stock_count || 0})`
+    out.push({
+      key,
+      title,
+      snapshot_date: snap.snapshot_date,
+      rows: rowsRaw.map((x, idx) => formatBacktestTradeRow(x, idx))
+    })
+  }
+
+  const unknownRows = grouped.get('unknown') || []
+  if (unknownRows.length) {
+    out.push({
+      key: 'unknown',
+      title: t('strategy.tradeHistory'),
+      snapshot_date: null,
+      rows: unknownRows.map((x, idx) => formatBacktestTradeRow(x, idx))
+    })
+  }
+
+  return out.length ? out : [{
+    key: 'all',
+    title: t('strategy.tradeHistory'),
+    snapshot_date: null,
+    rows: items.map((x, idx) => formatBacktestTradeRow(x, idx))
+  }]
+})
+
+const backtestMembersOpen = ref({})
+
+watch(currentBacktestResult, () => {
+  backtestMembersOpen.value = {}
+}, { deep: false })
+
+const backtestSnapshotMembersByDate = computed(() => {
+  const prm = currentBacktestResult.value?.params || {}
+  const raw = prm?.pool_snapshot_members
+  const arr = Array.isArray(raw) ? raw : []
+  const out = {}
+  for (const it of arr) {
+    const day = Number(it?.day || 0)
+    const d0 = String(it?.snapshot_date || '').trim()
+    const snapDate = d0 || (Number.isFinite(day) && day > 0 ? formatDay(day) : '')
+    if (!snapDate) continue
+    const rawCodes = it?.codes
+    const codes = Array.isArray(rawCodes)
+      ? rawCodes.map(x => String(x || '').trim()).filter(Boolean)
+      : []
+    out[snapDate] = codes
+  }
+  return out
+})
+
+const isBacktestMembersOpen = (tb) => {
+  const k = String(tb?.key || '').trim()
+  if (!k) return false
+  return !!backtestMembersOpen.value[k]
+}
+
+const backtestMembersCodes = (tb) => {
+  const snapDate = String(tb?.snapshot_date || '').trim()
+  if (!snapDate) return []
+  const m = backtestSnapshotMembersByDate.value || {}
+  const codes = m[snapDate]
+  return Array.isArray(codes) ? codes : []
+}
+
+const toggleBacktestMembers = (tb) => {
+  const k = String(tb?.key || '').trim()
+  if (!k) return
+  const open = isBacktestMembersOpen(tb)
+  backtestMembersOpen.value = { ...(backtestMembersOpen.value || {}), [k]: !open }
+}
+
+const backtestMembersButtonText = (tb) => {
+  const codes = backtestMembersCodes(tb)
+  if (codes.length) return `成分股(${codes.length})`
+  return isBacktestMembersOpen(tb) ? '收起成分股' : '成分股(0)'
+}
 
 const backtestTradeColumns = computed(() => ([
   { key: 'day_text', label: t('strategy.timeHuman') },
@@ -1056,14 +1346,25 @@ const getColor = (val) => {
   return val > 0 ? 'text-red-500' : (val < 0 ? 'text-green-500' : '')
 }
 
+const stripParallelParams = (obj) => {
+  const out = { ...(obj && typeof obj === 'object' ? obj : {}) }
+  delete out.max_workers
+  delete out.maxWorkers
+  return out
+}
+
 const buildWolfpackBacktestPayload = (paperCfg, paperPrm) => {
   const cfg = paperCfg && typeof paperCfg === 'object' ? paperCfg : {}
   const prm = paperPrm && typeof paperPrm === 'object' ? paperPrm : {}
 
-  const idxCode = String(prm.risk_index_code || '').trim()
-  const idxMa = Number(prm.risk_trend_ma_window)
+  const idxCode = String(prm.index_code || cfg.index_code || '').trim()
+  const riskIdxCode = String(prm.risk_index_code || '').trim()
+  const idxMa = Number(prm.index_ma_window ?? cfg.index_ma_window)
+  const startDate = String(cfg.start_date || '').trim()
+  const endDate = String(cfg.end_date || '').trim()
   const payload = {
     pool_id: cfg.pool_id,
+    point_in_time_pool: prm.point_in_time_pool !== false,
     frequency: cfg.frequency,
     data_src: cfg.data_src,
     autype: cfg.autype,
@@ -1081,6 +1382,7 @@ const buildWolfpackBacktestPayload = (paperCfg, paperPrm) => {
     t1_gap_weak_threshold: prm.t1_gap_weak_threshold,
     t1_gap_very_strong_threshold: prm.t1_gap_very_strong_threshold,
     risk_filter_enabled: prm.risk_filter_enabled,
+    risk_index_code: riskIdxCode,
     risk_mode: prm.risk_mode,
     risk_drop_threshold: prm.risk_drop_threshold,
     risk_flat_drop_threshold: prm.risk_flat_drop_threshold,
@@ -1094,8 +1396,18 @@ const buildWolfpackBacktestPayload = (paperCfg, paperPrm) => {
     risk_trend_ma_window: prm.risk_trend_ma_window,
     risk_data_fail_mode: prm.risk_data_fail_mode,
     risk_intraday_data_fail_mode: prm.risk_intraday_data_fail_mode,
+    stop_loss: prm.stop_loss,
+    index_filter_enabled: prm.index_filter_enabled,
+    enforce_t1: prm.enforce_t1,
+    model: prm.model,
+    pretrained_model_key: prm.pretrained_model_key,
+    rank_mode: prm.rank_mode,
+    lookback_days: prm.lookback_days,
+    only_features: prm.only_features,
   }
 
+  if (startDate) payload.start_date = startDate
+  if (endDate) payload.end_date = endDate
   if (idxCode) payload.index_code = idxCode
   if (Number.isFinite(idxMa) && idxMa > 0) payload.index_ma_window = Math.trunc(idxMa)
 
@@ -1106,6 +1418,10 @@ const runWolfpackBacktest = async () => {
   wolfpackLoading.value = true
   try {
     const cfg = buildWolfpackBacktestPayload(props.paperConfig, props.paperParams)
+    if (cfg.start_date && cfg.end_date && String(cfg.start_date) > String(cfg.end_date)) {
+      alert(t('portfolio.dateRangeInvalid'))
+      return
+    }
     const res = await axios.post('/api/backtest/wolfpack', cfg)
     const data = res.data || {}
     if (String(data.status || '') !== 'success') {
@@ -1121,6 +1437,7 @@ const runWolfpackBacktest = async () => {
     const lastEquity = curve.length ? Number(curve[curve.length - 1]?.equity) : 1
     const tradeLogs = Array.isArray(pf.trade_logs) ? pf.trade_logs : []
     wolfpackBacktestResult.value = {
+      params: data.params || {},
       metrics: {
         total_return: Number(pf.total_return ?? (lastEquity - 1)),
         sharpe_ratio: Number(pf.sharpe ?? 0),
@@ -1151,17 +1468,16 @@ const resolveRunSimId = (baseSimId) => {
 }
 
 const buildLiveParams = (paperCfg, paperPrm, sid) => {
-  const cfg = paperCfg && typeof paperCfg === 'object' ? paperCfg : {}
-  const prm = paperPrm && typeof paperPrm === 'object' ? paperPrm : {}
-  const nextPrm = { ...prm }
-  delete nextPrm.max_workers
-  return {
-    ...cfg,
-    ...nextPrm,
+  const cfg = stripParallelParams(paperCfg && typeof paperCfg === 'object' ? paperCfg : {})
+  const prm = stripParallelParams(paperPrm && typeof paperPrm === 'object' ? paperPrm : {})
+  const nextPrm = stripParallelParams({ ...prm })
+  return stripParallelParams({
+    ...stripParallelParams(cfg),
+    ...stripParallelParams(nextPrm),
     sim_id: sid,
     portfolio_id: activePortfolioId.value,
     enable_rolling_lookback: true
-  }
+  })
 }
 
 const runPaperFromBacktest = async () => {
@@ -1174,15 +1490,25 @@ const runPaperFromBacktest = async () => {
 
     const sid = resolveRunSimId(props.backtestSimId)
     const params = buildLiveParams(snapCfg, snapPrm, sid)
+    const notifyEnabled = !!props.paperRunForm?.notify_enabled
+    const notifyMode = String(props.paperRunForm?.notify_mode || 'dingtalk')
+    const enableDingtalk = notifyEnabled && (notifyMode === 'dingtalk' || notifyMode === 'both')
+    const enableSms = notifyEnabled && (notifyMode === 'sms' || notifyMode === 'both')
     const payload = {
-      name: '',
+      name: String(props.paperRunForm?.name || '').trim(),
       sim_id: sid,
       portfolio_id: activePortfolioId.value,
       params,
-      offset_seconds: 5,
-      auto_resume: true,
-      notify_enabled: false,
-      start: true
+      offset_seconds: Number(props.paperRunForm?.offset_seconds || 0),
+      auto_resume: !!props.paperRunForm?.auto_resume,
+      notify_enabled: notifyEnabled,
+      notify_kind: enableDingtalk ? 'dingtalk' : '',
+      notify_webhook: enableDingtalk ? String(props.paperRunForm?.dingtalk_webhook || '').trim() : '',
+      notify_secret: enableDingtalk ? String(props.paperRunForm?.dingtalk_secret || '').trim() : '',
+      sms_enabled: enableSms,
+      sms_phone: enableSms ? String(props.paperRunForm?.sms_phone || '').trim() : '',
+      sms_token: enableSms ? String(props.paperRunForm?.sms_token || '').trim() : '',
+      start: !!props.paperRunForm?.start
     }
     const res = await axios.post('/api/live/runs', payload)
     emit('selectSimId', sid)
@@ -1291,15 +1617,14 @@ const runPaperStep = async () => {
   stepResult.value = null
   stepLoading.value = true
   try {
-    const paperParams = { ...(props.paperParams || {}) }
-    delete paperParams.max_workers
-    const payload = {
-      ...(props.paperConfig || {}),
-      ...paperParams,
+    const paperParams = stripParallelParams({ ...(props.paperParams || {}) })
+    const payload = stripParallelParams({
+      ...stripParallelParams(props.paperConfig || {}),
+      ...stripParallelParams(paperParams),
       sim_id: activeSimId.value,
       portfolio_id: activePortfolioId.value,
       enable_rolling_lookback: true
-    }
+    })
     const res = await axios.post('/api/live/paper_trade_step', payload)
     stepResult.value = res.data || null
     if (Array.isArray(stepResult.value?.pending_orders)) {
@@ -1386,15 +1711,14 @@ const createRun = async () => {
     const sid = baseSid === 'default'
       ? `sim_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
       : baseSid
-    const paperParams = { ...(props.paperParams || {}) }
-    delete paperParams.max_workers
-    const params = {
-      ...(props.paperConfig || {}),
-      ...paperParams,
+    const paperParams = stripParallelParams({ ...(props.paperParams || {}) })
+    const params = stripParallelParams({
+      ...stripParallelParams(props.paperConfig || {}),
+      ...stripParallelParams(paperParams),
       sim_id: sid,
       portfolio_id: activePortfolioId.value,
       enable_rolling_lookback: true
-    }
+    })
     const notifyEnabled = !!props.paperRunForm?.notify_enabled
     const notifyMode = String(props.paperRunForm?.notify_mode || 'dingtalk')
     const enableDingtalk = notifyEnabled && (notifyMode === 'dingtalk' || notifyMode === 'both')
@@ -1459,6 +1783,38 @@ const stopRun = async (runId) => {
   }
 }
 
+const runOnce = async (run) => {
+  const rid = String(run?.run_id || '').trim()
+  if (!rid) return
+  stepError.value = ''
+  runsError.value = ''
+  runningOnceRunId.value = rid
+  try {
+    const sid = String(run?.sim_id || '').trim()
+    if (sid) {
+      localSimId.value = sid
+      emit('selectSimId', sid)
+    }
+    selectedRunId.value = rid
+    stepLogPage.value = 1
+    tradePage.value = 1
+
+    const res = await axios.post(`/api/live/runs/${rid}/step_once`)
+    stepResult.value = res.data?.result || null
+
+    await loadRuns()
+    await loadPositions()
+    await loadStepLogs()
+    await loadEquity()
+  } catch (e) {
+    const msg = String(e?.response?.data?.detail || e?.message || e)
+    stepError.value = msg
+    runsError.value = msg
+  } finally {
+    runningOnceRunId.value = ''
+  }
+}
+
 const deleteRun = async (runId) => {
   const rid = String(runId || '').trim()
   if (!rid) return
@@ -1503,32 +1859,44 @@ const deleteRun = async (runId) => {
   }
 }
 
-const selectRunSim = (run) => {
+const selectRunSim = async (run) => {
   const sid = String(run?.sim_id || '').trim()
-  if (!sid) return
+  const rid = String(run?.run_id || '').trim()
+  if (!sid && !rid) return
   localSimId.value = sid
   emit('selectSimId', sid)
+  selectedRunId.value = rid
+  stepLogPage.value = 1
+  tradePage.value = 1
+  await loadPositions()
+  await loadStepLogs()
+  await loadEquity()
 }
 
-const applyRunParams = async (run) => {
+const openRunParams = async (run) => {
+  const runId = String(run?.run_id || '').trim()
+  if (!runId) return
+  showRunParamsModal.value = true
+  runParamsError.value = ''
+  runParamsLoading.value = true
+  runParamsItem.value = null
+  try {
+    const res = await axios.get(`/api/live/runs/${runId}`)
+    runParamsItem.value = res.data?.item || null
+  } catch (e) {
+    runParamsError.value = String(e?.response?.data?.detail || e?.message || e)
+  } finally {
+    runParamsLoading.value = false
+  }
+}
+
+const goBacktestWithParams = async (run) => {
   const runId = String(run?.run_id || '').trim()
   if (!runId) return
   try {
     const res = await axios.get(`/api/live/runs/${runId}`)
     const params = res.data?.item?.params || null
-    if (params && typeof params === 'object') emit('applyRunParams', params)
-    const sid = String(res.data?.item?.sim_id || '').trim()
-    if (sid) {
-      preserveSelectedRunIdOnce = true
-      localSimId.value = sid
-      emit('selectSimId', sid)
-    }
-    selectedRunId.value = runId
-    stepLogPage.value = 1
-    tradePage.value = 1
-    await loadPositions()
-    await loadStepLogs()
-    await loadEquity()
+    if (params && typeof params === 'object') emit('openBacktestFill', params)
   } catch (e) {
     runsError.value = String(e?.response?.data?.detail || e?.message || e)
   }

@@ -23,7 +23,9 @@ def parse_data_src(s: str) -> DATA_SRC:
     if raw == "baostock":
         return DATA_SRC.BAO_STOCK
     if raw == "akshare":
-        return DATA_SRC.AK_SHARE
+        raise ValueError("akshare data_src is disabled")
+    if raw in ["tdx", "tongdaxin"]:
+        return DATA_SRC.TDX
     if raw == "csv":
         return DATA_SRC.CSV
     if raw == "ccxt":

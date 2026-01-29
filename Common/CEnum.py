@@ -7,6 +7,7 @@ class DATA_SRC(Enum):
     CCXT = auto()
     CSV = auto()
     AK_SHARE = auto()
+    TDX = auto()
     CLICK_HOUSE = auto()
 
 

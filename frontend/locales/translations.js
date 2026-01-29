@@ -31,6 +31,7 @@ export const translations = {
             dataSrcOptions: {
                 baostock: "BaoStock",
                 akshare: "AkShare",
+                tdx: "通达信 (TDX)",
                 clickhouse: "ClickHouse"
             },
             modelOptions: {
@@ -187,6 +188,9 @@ export const translations = {
         strategy: {
             title: "策略选股",
             scope: "选股范围",
+            manualCodes: "手动输入代码",
+            manualCodesPlaceholder: "如：600000, 000001.SZ, sz.300059（逗号/空格/换行分隔）",
+            manualCodesHint: "填写后将优先使用此列表，忽略股票池选择",
             model: "模型",
             minAccuracy: "最低准确率",
             minRecentAccuracy: "最近准确率下限",
@@ -223,6 +227,9 @@ export const translations = {
             back: "返回",
             refreshList: "刷新",
             viewDetail: "查看",
+            viewParams: "查看参数",
+            goBacktestFill: "去回测填参",
+            runOnce: "运行一次",
             status: "状态",
             params: "参数",
             updatedAt: "时间",
@@ -277,6 +284,7 @@ export const translations = {
             t1GapStrongThreshold: "缺口阈值（强）",
             t1GapVeryStrongThreshold: "缺口阈值（极强）",
             t1GapThresholdInvalid: "缺口阈值需满足：极强 ≥ 强",
+            pointInTimePool: "Point-in-time 股票池（随日期变化）",
             useLatestAvailableDay: "无数据时使用最近交易日",
             maxWorkers: "并行数",
             walkForwardMaxFolds: "Walk-forward 折数",
@@ -383,7 +391,9 @@ export const translations = {
             totalMarketValue: "当前市值",
             totalCost: "持仓成本",
             pretrainedModelKey: "预训练模型Key（可选）",
-            pretrainedModelKeyPlaceholder: "留空则自动选择最新的横截面Rank逻辑回归模型"
+            pretrainedModelKeyPlaceholder: "留空则自动选择最新的横截面Rank逻辑回归模型",
+            rankMode: "Rank模式",
+            onlyFeatures: "仅使用特征"
         },
         portfolio: {
             title: "模拟交易/回测",
@@ -405,6 +415,7 @@ export const translations = {
             wolfpackBacktest: "狼群回测（T+1+风控）",
             startDate: "开始日期",
             endDate: "结束日期",
+            dateRangeInvalid: "开始日期不能晚于结束日期",
             runBacktest: "运行回测",
             backtestRunningTitle: "回测正在运行中",
             backtestRunningDesc: "已开始执行回测，请稍候…",
@@ -433,6 +444,8 @@ export const translations = {
             paperRunCreateHint: "建议到“策略回测”页面创建新任务（可复用回测参数）",
             noPaperRunsHint: "暂无运行记录，请到“策略回测”页面添加并运行",
             equityCurve: "资金曲线",
+            simSession: "会话ID",
+            simSessionHint: "模拟盘以会话ID隔离运行任务/持仓/挂单/日志；切换会话ID即可切换到另一套模拟盘数据。",
             deleteConfirm: "确定要删除吗？",
             addSuccess: "添加成功",
             addFailed: "添加失败",
@@ -845,6 +858,7 @@ export const translations = {
             dataSrcOptions: {
                 baostock: "BaoStock",
                 akshare: "AkShare",
+                tdx: "Tongdaxin (TDX)",
                 clickhouse: "ClickHouse (Local)"
             },
             modelOptions: {
@@ -1000,6 +1014,9 @@ export const translations = {
         strategy: {
             title: "Strategy",
             scope: "Scope",
+            manualCodes: "Manual Codes",
+            manualCodesPlaceholder: "e.g. 600000, 000001.SZ, sz.300059 (comma/space/newline separated)",
+            manualCodesHint: "If filled, it overrides the selected pool",
             model: "Model",
             minAccuracy: "Min Accuracy",
             minRecentAccuracy: "Min Recent Accuracy",
@@ -1033,6 +1050,8 @@ export const translations = {
             back: "Back",
             refreshList: "Refresh",
             viewDetail: "View",
+            viewParams: "View Params",
+            goBacktestFill: "Backtest Fill",
             status: "Status",
             params: "Params",
             updatedAt: "Time",
@@ -1087,6 +1106,7 @@ export const translations = {
             t1GapStrongThreshold: "Gap Threshold (Strong)",
             t1GapVeryStrongThreshold: "Gap Threshold (Very Strong)",
             t1GapThresholdInvalid: "Gap thresholds must satisfy: Very Strong ≥ Strong",
+            pointInTimePool: "Point-in-time pool (varies by date)",
             useLatestAvailableDay: "Use latest trading day if today's data missing",
             maxWorkers: "Max Workers",
             walkForwardMaxFolds: "Walk-forward Max Folds",
@@ -1189,7 +1209,9 @@ export const translations = {
             totalMarketValue: "Market Value",
             totalCost: "Cost",
             pretrainedModelKey: "Pretrained Model Key (Optional)",
-            pretrainedModelKeyPlaceholder: "Leave empty to auto pick latest cross-sectional rank LR model"
+            pretrainedModelKeyPlaceholder: "Leave empty to auto pick latest cross-sectional rank LR model",
+            rankMode: "Rank Mode",
+            onlyFeatures: "Only Features (comma sep)"
         },
         portfolio: {
             title: "Simulation/Backtest",
@@ -1211,6 +1233,7 @@ export const translations = {
             wolfpackBacktest: "Wolfpack Backtest (T+1+Risk)",
             startDate: "Start Date",
             endDate: "End Date",
+            dateRangeInvalid: "Start date must be <= end date",
             runBacktest: "Run Backtest",
             backtestRunningTitle: "Backtest running",
             backtestRunningDesc: "Backtest started. Please wait…",
@@ -1239,6 +1262,8 @@ export const translations = {
             paperRunCreateHint: "Tip: Create new runs in Backtest tab (reuses params).",
             noPaperRunsHint: "No runs yet. Go to Backtest tab to add and run one.",
             equityCurve: "Equity Curve",
+            simSession: "Session ID",
+            simSessionHint: "Paper trade data is isolated by Session ID (runs/positions/orders/logs). Switching Session ID switches datasets.",
             deleteConfirm: "Are you sure?",
             addSuccess: "Added successfully",
             addFailed: "Failed to add",

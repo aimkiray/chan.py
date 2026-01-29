@@ -242,6 +242,9 @@ class CChan:
         elif self.data_src == DATA_SRC.AK_SHARE:
             from DataAPI.AkShareAPI import CAkShare
             _dict[DATA_SRC.AK_SHARE] = CAkShare
+        elif self.data_src == DATA_SRC.TDX:
+            from DataAPI.TdxAPI import CTdxStockApi
+            _dict[DATA_SRC.TDX] = CTdxStockApi
         elif self.data_src == DATA_SRC.CLICK_HOUSE:
             from DataAPI.ClickHouseAPI import CClickHouseAPI
             _dict[DATA_SRC.CLICK_HOUSE] = CClickHouseAPI

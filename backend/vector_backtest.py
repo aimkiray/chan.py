@@ -3,6 +3,7 @@ import numpy as np
 import datetime
 import concurrent.futures
 import traceback
+from bisect import bisect_right
 from typing import List, Dict, Optional, Tuple, Any
 from sqlalchemy.orm import Session
 
@@ -206,6 +207,9 @@ class VectorBacktester:
         if not pool_codes:
             return {"error": "No pool codes."}
 
+        pool_id = str(kwargs.get("pool_id") or "").strip() or None
+        pool_point_in_time = bool(kwargs.get("pool_point_in_time", kwargs.get("point_in_time_pool", False)))
+
         freq = str(kwargs.get("frequency", "1d") or "1d").strip().lower()
         freq_map = {
             "1d": KL_TYPE.K_DAY,
@@ -220,11 +224,14 @@ class VectorBacktester:
         kl_type = freq_map.get(freq, KL_TYPE.K_DAY)
 
         data_src_raw = str(kwargs.get("data_src", "clickhouse") or "clickhouse").strip().lower()
+        if data_src_raw == "akshare":
+            return {"error": "akshare data_src is disabled"}
         src_map = {
             "baostock": DATA_SRC.BAO_STOCK,
-            "akshare": DATA_SRC.AK_SHARE,
             "ccxt": DATA_SRC.CCXT,
             "csv": DATA_SRC.CSV,
+            "tdx": DATA_SRC.TDX,
+            "tongdaxin": DATA_SRC.TDX,
             "clickhouse": DATA_SRC.CLICK_HOUSE,
         }
         data_src = src_map.get(data_src_raw, DATA_SRC.CLICK_HOUSE)
@@ -339,6 +346,50 @@ class VectorBacktester:
                 return int(dt.year) * 10000 + int(dt.month) * 100 + int(dt.day)
             except Exception:
                 return None
+
+        universe_allow_by_day = None
+        pool_snapshot_count = 0
+        first_pool_snapshot_day = None
+        if pool_point_in_time and pool_id and (":" in pool_id):
+            try:
+                from DataAPI.ClickHouseAPI import CClickHouseAPI
+
+                snap = CClickHouseAPI.get_pool_snapshot_members(pool_id, str(start_date), str(end_date), table="stock_constituent")
+                if snap:
+                    snap_items = []
+                    for k, codes in (snap or {}).items():
+                        try:
+                            d = datetime.datetime.strptime(str(k), "%Y-%m-%d").date()
+                        except Exception:
+                            continue
+                        dk = int(d.year) * 10000 + int(d.month) * 100 + int(d.day)
+                        cc = [normalize_code(str(c)) for c in (codes or []) if str(c or "").strip()]
+                        cc = list(dict.fromkeys([c for c in cc if c]))
+                        if dk > 0 and cc:
+                            snap_items.append((dk, cc))
+                    snap_items.sort(key=lambda x: x[0])
+                    if snap_items:
+                        pool_snapshot_count = int(len(snap_items))
+                        snap_days = [x[0] for x in snap_items]
+                        snap_codes = [x[1] for x in snap_items]
+                        first_pool_snapshot_day = int(snap_days[0]) if snap_days else None
+                        universe_allow_by_day = {}
+                        uniq_days = []
+                        seen_days = set()
+                        for t in score_df.index:
+                            dk = _day_key(t)
+                            if dk is None or dk in seen_days:
+                                continue
+                            seen_days.add(dk)
+                            uniq_days.append(dk)
+                        uniq_days.sort()
+                        for dk in uniq_days:
+                            idx = bisect_right(snap_days, dk) - 1
+                            if idx >= 0:
+                                universe_allow_by_day[int(dk)] = set(snap_codes[idx])
+            except Exception:
+                universe_allow_by_day = None
+                pool_snapshot_count = 0
         
         # State
         positions = {} # code -> {entry_price, entry_time_idx, shares}
@@ -384,10 +435,19 @@ class VectorBacktester:
             # Available slots
             open_slots = TOP_N - len(positions)
             
-            if open_slots > 0:
+            can_buy = True
+            if first_pool_snapshot_day is not None and cur_day is not None and int(cur_day) < int(first_pool_snapshot_day):
+                can_buy = False
+
+            if open_slots > 0 and bool(can_buy):
                 # Get candidates
                 scores = score_df.iloc[t_idx]
-                candidates = scores[scores > SCORE_THR].sort_values(ascending=False)
+                candidates = scores[scores > SCORE_THR]
+                if universe_allow_by_day is not None and cur_day is not None:
+                    allow = universe_allow_by_day.get(int(cur_day))
+                    if allow is not None:
+                        candidates = candidates[candidates.index.isin(allow)]
+                candidates = candidates.sort_values(ascending=False)
                 
                 # Filter out already held
                 candidates = candidates[~candidates.index.isin(positions.keys())]

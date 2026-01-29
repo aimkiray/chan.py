@@ -382,6 +382,7 @@
                  :paperRunForm="paperRunForm"
                  @selectSimId="handleSelectSimId"
                  @applyRunParams="handleApplyRunParams"
+                 @openBacktestFill="handleOpenBacktestFill"
                />
              </div>
           </div>
@@ -513,6 +514,26 @@ const dataSrc = ref('clickhouse')
 const dataLengthYears = ref(0.5)
 const model = ref('xgboost')
 
+const formatIsoDate = (d) => {
+  try {
+    const dt = d instanceof Date ? d : new Date(d)
+    if (!Number.isFinite(dt.getTime())) return ''
+    const y = dt.getFullYear()
+    const m = String(dt.getMonth() + 1).padStart(2, '0')
+    const day = String(dt.getDate()).padStart(2, '0')
+    return `${y}-${m}-${day}`
+  } catch (e) {
+    return ''
+  }
+}
+
+const defaultEndDate = formatIsoDate(new Date())
+const defaultStartDate = (() => {
+  const d = new Date()
+  d.setFullYear(d.getFullYear() - 3)
+  return formatIsoDate(d)
+})()
+
 const signal = ref(null)
 const accuracy = ref(null)
 const latestClose = ref('--')
@@ -534,9 +555,11 @@ const backtestLoading = computed(() => {
 const paperConfig = ref({
   sim_id: 'default',
   pool_id: 'index:IDX399673',
-  data_src: 'akshare',
+  data_src: 'clickhouse',
   autype: 'qfq',
   frequency: '30m',
+  start_date: defaultStartDate,
+  end_date: defaultEndDate,
   initial_capital: 100000
 })
 const backtestSimId = ref('default')
@@ -553,12 +576,13 @@ const paperParams = ref({
   t1_gap_weak_threshold: -0.02,
   t1_gap_very_strong_threshold: 0.05,
   limit: 0,
+  point_in_time_pool: true,
   use_latest_available_day: true,
   pretrained_model_key: '',
   rank_mode: 'cross_section',
   rolling_sample_mode: 'every_bar',
   rolling_stride: 1,
-  risk_filter_enabled: true,
+  risk_filter_enabled: false,
   risk_mode: 'both',
   risk_index_code: '399006',
   risk_drop_threshold: -0.03,
@@ -572,7 +596,14 @@ const paperParams = ref({
   risk_intraday_bull_threshold: -0.03,
   risk_trend_ma_window: 20,
   risk_data_fail_mode: 'reduce',
-  risk_intraday_data_fail_mode: 'reduce'
+  risk_intraday_data_fail_mode: 'reduce',
+  stop_loss: -0.03,
+  enforce_t1: true,
+  index_filter_enabled: true,
+  index_code: '399006',
+  index_ma_window: 20,
+  model: 'xgboost',
+  only_features: ''
 })
 
 const paperRunForm = ref({
@@ -642,6 +673,11 @@ const handleApplyRunParams = (params) => {
   paperParams.value = nextPrm
 }
 
+const handleOpenBacktestFill = (params) => {
+  handleApplyRunParams(params)
+  activeTab.value = 'backtest'
+}
+
 const handleOpenPaper = async (payload) => {
   const p = payload && typeof payload === 'object' ? payload : {}
   const sid = String(p.sim_id || '').trim()
@@ -656,6 +692,7 @@ const handleOpenPaper = async (payload) => {
 const strategyForm = ref({
   strategy_name: `Strategy-${new Date().getTime()}`,
   pool_id: '',
+  manual_codes: '',
   model: 'xgboost',
   min_accuracy: 0.8,
   min_recent_accuracy: null,
@@ -733,6 +770,14 @@ const paperSimId = computed(() => {
   return sid || 'default'
 })
 
+const ensurePaperConfigDateRange = () => {
+  if (!paperConfig.value || typeof paperConfig.value !== 'object') return
+  const s = String(paperConfig.value.start_date || '').trim()
+  const e = String(paperConfig.value.end_date || '').trim()
+  if (!s) paperConfig.value.start_date = defaultStartDate
+  if (!e) paperConfig.value.end_date = defaultEndDate
+}
+
 const loadPaperSimFromStorage = (sid) => {
   const simId = String(sid || '').trim() || 'default'
   const cfgKey = `paperSim.config.${simId}`
@@ -761,6 +806,10 @@ const loadPaperSimFromStorage = (sid) => {
     }
 
     paperConfig.value = { ...(paperConfig.value || {}), sim_id: simId }
+    if (String(paperConfig.value?.data_src || '').toLowerCase() === 'akshare') {
+      paperConfig.value.data_src = 'clickhouse'
+    }
+    ensurePaperConfigDateRange()
   } finally {
     paperSimLoading.value = false
   }
@@ -870,7 +919,8 @@ onMounted(() => {
 
   const savedDataSrc = localStorage.getItem('lastDataSrc')
   if (savedDataSrc) {
-    dataSrc.value = savedDataSrc
+    const raw = String(savedDataSrc).trim().toLowerCase()
+    dataSrc.value = raw === 'akshare' ? 'clickhouse' : savedDataSrc
   }
 
   const savedTriggerStep = localStorage.getItem('lastTriggerStep')
@@ -934,6 +984,9 @@ onMounted(() => {
     try {
       Object.assign(paperConfig.value, JSON.parse(savedPaperConfig))
     } catch (e) { /* ignore */ }
+  }
+  if (String(paperConfig.value?.data_src || '').toLowerCase() === 'akshare') {
+    paperConfig.value.data_src = 'clickhouse'
   }
 
   const savedPaperParams = localStorage.getItem('paperParams')

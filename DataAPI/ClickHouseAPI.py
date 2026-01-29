@@ -2,7 +2,7 @@ import os
 import datetime
 import threading
 from bisect import bisect_left, bisect_right
-from typing import Iterable, Optional, List
+from typing import Iterable, Optional, List, Dict
 from dotenv import load_dotenv
 from clickhouse_driver import Client
 
@@ -297,7 +297,14 @@ class CClickHouseAPI(CCommonStockApi):
         return items
 
     @classmethod
-    def get_pool_members(cls, pool_id: str, table: str = "stock_constituent", limit: int = 5000):
+    def get_pool_members(
+        cls,
+        pool_id: str,
+        table: str = "stock_constituent",
+        limit: int = 5000,
+        as_of_date: Optional[str] = None,
+        snapshot_date: Optional[str] = None,
+    ):
         client = cls.get_client()
         if not client:
             return []
@@ -333,9 +340,22 @@ class CClickHouseAPI(CCommonStockApi):
                 where = where + f" AND {group_type_col} = %(group_type)s"
                 params["group_type"] = group_type
 
+            dt = None
+            if snapshot_date is not None and str(snapshot_date).strip():
+                dt = str(snapshot_date).strip()
+                params["target_dt"] = dt
+                dt_expr = "%(target_dt)s"
+            else:
+                aod = str(as_of_date).strip() if as_of_date is not None else ""
+                if aod:
+                    params["as_of_dt"] = aod
+                    dt_expr = f"maxIf({snapshot_date_col}, {snapshot_date_col} <= %(as_of_dt)s)"
+                else:
+                    dt_expr = f"max({snapshot_date_col})"
+
             query = f"""
                 WITH (
-                    SELECT max({snapshot_date_col})
+                    SELECT {dt_expr}
                     FROM {table}
                     WHERE {where}
                 ) AS latest_dt
@@ -371,9 +391,22 @@ class CClickHouseAPI(CCommonStockApi):
         date_col = pick_first(["trade_date", "date", "dt", "as_of", "update_date", "effective_date"])
 
         if date_col:
+            dt = None
+            params = {"pool_id": pool_id, "limit": int(limit)}
+            if snapshot_date is not None and str(snapshot_date).strip():
+                dt = str(snapshot_date).strip()
+                params["target_dt"] = dt
+                dt_expr = "%(target_dt)s"
+            else:
+                aod = str(as_of_date).strip() if as_of_date is not None else ""
+                if aod:
+                    params["as_of_dt"] = aod
+                    dt_expr = f"maxIf({date_col}, {date_col} <= %(as_of_dt)s)"
+                else:
+                    dt_expr = f"max({date_col})"
             query = f"""
                 WITH (
-                    SELECT max({date_col})
+                    SELECT {dt_expr}
                     FROM {table}
                     WHERE {pool_id_col} = %(pool_id)s
                 ) AS latest_dt
@@ -394,12 +427,142 @@ class CClickHouseAPI(CCommonStockApi):
             """
 
         try:
-            rows = client.execute(query, {"pool_id": pool_id, "limit": int(limit)})
+            if date_col:
+                rows = client.execute(query, params)
+            else:
+                rows = client.execute(query, {"pool_id": pool_id, "limit": int(limit)})
         except Exception as e:
             print(f"ClickHouse get pool members failed: {e}")
             return []
 
         return [str(r[0]) for r in rows]
+
+    @classmethod
+    def get_pool_snapshot_members(
+        cls,
+        pool_id: str,
+        start_date: str,
+        end_date: str,
+        table: str = "stock_constituent",
+        limit: int = 200000,
+    ) -> Dict[str, List[str]]:
+        client = cls.get_client()
+        if not client:
+            return {}
+        cols = cls._get_table_columns(table)
+        if not cols:
+            return {}
+
+        col_set = set([c.lower() for c in cols])
+        orig_by_lower = {c.lower(): c for c in cols}
+
+        def has(name: str) -> bool:
+            return name.lower() in col_set
+
+        def col(name: str) -> Optional[str]:
+            return orig_by_lower.get(name.lower())
+
+        group_type = None
+        group_code = pool_id
+        if ":" in pool_id:
+            parts = pool_id.split(":", 1)
+            group_type = parts[0]
+            group_code = parts[1]
+
+        if has("group_code") and has("snapshot_date") and has("stock_code"):
+            group_code_col = col("group_code")
+            snapshot_date_col = col("snapshot_date")
+            stock_code_col = col("stock_code")
+            group_type_col = col("group_type") if has("group_type") else None
+
+            where = f"{group_code_col} = %(group_code)s"
+            params = {"group_code": group_code, "start": str(start_date), "end": str(end_date), "limit": int(limit)}
+            if group_type_col and group_type is not None:
+                where = where + f" AND {group_type_col} = %(group_type)s"
+                params["group_type"] = group_type
+
+            query = f"""
+                WITH (
+                    SELECT maxIf({snapshot_date_col}, {snapshot_date_col} <= %(start)s)
+                    FROM {table}
+                    WHERE {where}
+                ) AS base_dt
+                SELECT
+                    {snapshot_date_col} AS snapshot_date,
+                    {stock_code_col} AS code
+                FROM {table}
+                WHERE {where}
+                  AND {snapshot_date_col} >= coalesce(base_dt, toDate('1970-01-01'))
+                  AND {snapshot_date_col} <= %(end)s
+                LIMIT %(limit)s
+            """
+            try:
+                rows = client.execute(query, params)
+            except Exception:
+                return {}
+
+            by_dt: Dict[str, List[str]] = {}
+            for dt_value, code_value in rows:
+                dt = cls._parse_ymd(dt_value)
+                if dt is None:
+                    continue
+                code = str(code_value) if code_value is not None else ""
+                code = code.strip()
+                if not code:
+                    continue
+                k = dt.strftime("%Y-%m-%d")
+                by_dt.setdefault(k, []).append(code)
+            for k, v in list(by_dt.items()):
+                by_dt[k] = list(dict.fromkeys([str(x) for x in v if str(x).strip()]))
+            return by_dt
+
+        def pick_first(candidates):
+            for c in candidates:
+                if c in col_set:
+                    return orig_by_lower[c]
+            return None
+
+        code_col = pick_first(["code", "stock_code", "symbol", "sec_code", "ts_code"])
+        pool_id_col = pick_first(["index_code", "pool_code", "sector_code", "concept_code", "board_code", "pool", "pool_id", "index", "index_id", "category", "group", "name"])
+        date_col = pick_first(["trade_date", "date", "dt", "as_of", "update_date", "effective_date"])
+        if not (code_col and pool_id_col and date_col):
+            return {}
+
+        params = {"pool_id": str(pool_id), "start": str(start_date), "end": str(end_date), "limit": int(limit)}
+        query = f"""
+            WITH (
+                SELECT maxIf({date_col}, {date_col} <= %(start)s)
+                FROM {table}
+                WHERE {pool_id_col} = %(pool_id)s
+            ) AS base_dt
+            SELECT
+                {date_col} AS snapshot_date,
+                {code_col} AS code
+            FROM {table}
+            WHERE {pool_id_col} = %(pool_id)s
+              AND {date_col} >= coalesce(base_dt, toDate('1970-01-01'))
+              AND {date_col} <= %(end)s
+            LIMIT %(limit)s
+        """
+        try:
+            rows = client.execute(query, params)
+        except Exception:
+            return {}
+
+        by_dt: Dict[str, List[str]] = {}
+        for dt_value, code_value in rows:
+            dt = cls._parse_ymd(dt_value)
+            if dt is None:
+                continue
+            code = str(code_value) if code_value is not None else ""
+            code = code.strip()
+            if not code:
+                continue
+            k = dt.strftime("%Y-%m-%d")
+            by_dt.setdefault(k, []).append(code)
+        for k, v in list(by_dt.items()):
+            by_dt[k] = list(dict.fromkeys([str(x) for x in v if str(x).strip()]))
+        return by_dt
 
     def _ensure_connection(self):
         client = self.get_client()

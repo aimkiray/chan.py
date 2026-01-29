@@ -226,6 +226,8 @@ def build_chan_state_feature(kl_data, last_klu, last_bsp: Optional[CBS_Point] = 
 
 def normalize_code(code):
     code = code.strip().lower()
+    if (code.startswith("sh.") or code.startswith("sz.") or code.startswith("bj.")) and (code.endswith(".sh") or code.endswith(".sz") or code.endswith(".bj")):
+        code = code[:-3]
     if code.endswith(".sh"):
         return f"sh.{code[:-3]}"
     if code.endswith(".sz"):
@@ -808,7 +810,7 @@ def _parse_time_bound_ts(raw: Optional[str], is_end: bool) -> Optional[int]:
     except Exception:
         return None
 
-def fetch_stock_data(code, level, begin_time, end_time, data_src_type, autype=AUTYPE.QFQ, use_online_latest: bool = False, asset_type: str = "STOCK"):
+def fetch_stock_data(code, level, begin_time, end_time, data_src_type, autype=AUTYPE.QFQ, use_online_latest: bool = False, asset_type: str = "STOCK", allow_tdx_fill: bool = True):
     """
     Helper to fetch raw K-line data without calculating Chan elements.
     Useful for checking data freshness for caching.
@@ -897,6 +899,92 @@ def fetch_stock_data(code, level, begin_time, end_time, data_src_type, autype=AU
                 if raw_tail:
                     tail = _adjust_tail_by_clickhouse_factors(code=code, tail_list=raw_tail, autype=autype)
                     data_list = _merge_klines_tail(data_list, tail)
+        if (
+            allow_tdx_fill
+            and data_src_type == DATA_SRC.CLICK_HOUSE
+            and data_list
+        ):
+            try:
+                try:
+                    now_cn = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
+                except Exception:
+                    now_cn = datetime.datetime.now()
+
+                def _prev_weekday(d: datetime.date) -> datetime.date:
+                    dd = d
+                    while dd.weekday() >= 5:
+                        dd = dd - datetime.timedelta(days=1)
+                    return dd
+
+                def _expected_end_date() -> datetime.date:
+                    if end_time:
+                        ts = _parse_time_bound_ts(end_time, is_end=True)
+                        if ts is not None:
+                            try:
+                                return datetime.datetime.fromtimestamp(int(ts)).date()
+                            except Exception:
+                                pass
+                    d = now_cn.date()
+                    intraday = level in (KL_TYPE.K_1M, KL_TYPE.K_5M, KL_TYPE.K_15M, KL_TYPE.K_30M, KL_TYPE.K_60M)
+                    if level == KL_TYPE.K_DAY:
+                        if d.weekday() >= 5:
+                            return _prev_weekday(d)
+                        if now_cn.hour < 16:
+                            return _prev_weekday(d - datetime.timedelta(days=1))
+                        return d
+                    if level == KL_TYPE.K_WEEK:
+                        def _last_week_friday(dd: datetime.date) -> datetime.date:
+                            wd = dd.weekday()
+                            if wd <= 4:
+                                off = wd + 3
+                            else:
+                                off = wd - 4
+                            return dd - datetime.timedelta(days=off)
+
+                        if d.weekday() == 4 and now_cn.hour < 16:
+                            return _last_week_friday(d - datetime.timedelta(days=7))
+                        return _last_week_friday(d)
+                    if intraday:
+                        if d.weekday() >= 5:
+                            return _prev_weekday(d)
+                        return d
+                    if d.weekday() >= 5:
+                        return _prev_weekday(d)
+                    return d
+
+                t = data_list[-1].time
+                last_date = datetime.date(int(t.year), int(t.month), int(t.day))
+                expect_end = _expected_end_date()
+                lag_days = int((expect_end - last_date).days)
+                intraday = level in (KL_TYPE.K_1M, KL_TYPE.K_5M, KL_TYPE.K_15M, KL_TYPE.K_30M, KL_TYPE.K_60M)
+                if level == KL_TYPE.K_DAY:
+                    need_fill = lag_days >= 1
+                elif intraday:
+                    need_fill = lag_days >= 1
+                elif level == KL_TYPE.K_WEEK:
+                    need_fill = lag_days >= 3
+                else:
+                    need_fill = False
+
+                if need_fill:
+                    fill_begin = last_date.strftime("%Y-%m-%d")
+                    tdx_tail = fetch_stock_data(
+                        code,
+                        level,
+                        fill_begin,
+                        end_time,
+                        DATA_SRC.TDX,
+                        autype=AUTYPE.NONE,
+                        use_online_latest=False,
+                        asset_type=asset_type,
+                        allow_tdx_fill=False,
+                    )
+                    if tdx_tail:
+                        if autype != AUTYPE.NONE:
+                            tdx_tail = _adjust_tail_by_clickhouse_factors(code=code, tail_list=tdx_tail, autype=autype)
+                        data_list = _merge_klines_tail(data_list, tdx_tail)
+            except Exception:
+                pass
         begin_ts = _parse_time_bound_ts(begin_time, is_end=False)
         end_ts = _parse_time_bound_ts(end_time, is_end=True)
         if begin_ts is not None or end_ts is not None:
@@ -925,7 +1013,7 @@ def fetch_stock_data(code, level, begin_time, end_time, data_src_type, autype=AU
             dedup.append(k)
             last_ts = ts
 
-        if autype != AUTYPE.NONE and data_src_type in (DATA_SRC.BAO_STOCK, DATA_SRC.AK_SHARE):
+        if autype != AUTYPE.NONE and data_src_type in (DATA_SRC.BAO_STOCK,):
             try:
                 raw_api = StockAPI(code=code, k_type=level, begin_date=begin_time, end_date=end_time, autype=AUTYPE.NONE)
                 raw_list = list(raw_api.get_kl_data())

@@ -10,7 +10,11 @@ from backend.chan_service import (
     fetch_stock_data,
     get_chan_data,
     train_time_split_backtest,
+    load_pretrained_model_bundle_by_key,
     normalize_code,
+    predict_proba_1,
+    _profit_for_info,
+    _min_profit_for_info,
 )
 from backend.live.common import (
     cn_day_key_from_ts as _cn_day_key_from_ts,
@@ -193,6 +197,8 @@ def _load_index_filter_day_set(
     autype: AUTYPE,
     ma_window: int = 20,
 ) -> Optional[Dict[int, bool]]:
+    if data_src == DATA_SRC.AK_SHARE:
+        data_src = DATA_SRC.BAO_STOCK
     try:
         mw = int(ma_window)
     except Exception:
@@ -204,12 +210,7 @@ def _load_index_filter_day_set(
         code = "sz.399006"
     kl_list = fetch_stock_data(code, KL_TYPE.K_DAY, start_date, end_date, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE), asset_type="INDEX")
     if (not kl_list) or len(kl_list) < mw + 5:
-        alt_src = None
-        if data_src in (DATA_SRC.AK_SHARE, DATA_SRC.BAO_STOCK):
-            if data_src == DATA_SRC.AK_SHARE:
-                alt_src = DATA_SRC.BAO_STOCK
-            else:
-                alt_src = DATA_SRC.AK_SHARE
+        alt_src = DATA_SRC.BAO_STOCK if data_src != DATA_SRC.BAO_STOCK else None
         if alt_src is not None:
             try:
                 kl_list = fetch_stock_data(code, KL_TYPE.K_DAY, start_date, end_date, alt_src, autype=autype, use_online_latest=True, asset_type="INDEX")
@@ -496,6 +497,8 @@ def _simulate_universe_daily_topn(
     end_date: str,
     trade_cost: float = 0.0,
     top_n: int = 3,
+    universe_allow_by_day: Optional[Dict[int, Dict[str, bool]]] = None,
+    force_sell_out_of_pool: bool = True,
     index_allow_by_day: Optional[Dict[int, bool]] = None,
     risk_by_day: Optional[Dict[int, str]] = None,
     intraday_cfg: Optional[dict] = None,
@@ -521,6 +524,10 @@ def _simulate_universe_daily_topn(
     sell_mode = str(sell_mode or "baseline").strip().lower() or "baseline"
     decision_min = _parse_hhmm_to_minutes(t1_decision_time, default_min=10 * 60)
     try:
+        strong_th = float(t1_gap_strong_threshold)
+    except Exception:
+        strong_th = 0.03
+    try:
         weak_th = float(t1_gap_weak_threshold)
     except Exception:
         weak_th = -0.02
@@ -534,6 +541,8 @@ def _simulate_universe_daily_topn(
         sl = -0.03
 
     by_day: Dict[int, List[dict]] = {}
+    raw_candidate_count_by_day: Dict[int, int] = {}
+    pool_filtered_count_by_day: Dict[int, int] = {}
     for r in (candidates or []):
         if not isinstance(r, dict):
             continue
@@ -543,6 +552,14 @@ def _simulate_universe_daily_topn(
             dk = 0
         if dk <= 0:
             continue
+        raw_candidate_count_by_day[int(dk)] = int(raw_candidate_count_by_day.get(int(dk), 0)) + 1
+        if universe_allow_by_day is not None:
+            allow = universe_allow_by_day.get(int(dk))
+            if allow is not None:
+                code = str(r.get("code") or "").strip()
+                if not code or (not bool(allow.get(code, False))):
+                    pool_filtered_count_by_day[int(dk)] = int(pool_filtered_count_by_day.get(int(dk), 0)) + 1
+                    continue
         by_day.setdefault(int(dk), []).append(r)
 
     daily_oc_by_code = daily_oc_by_code or {}
@@ -628,9 +645,7 @@ def _simulate_universe_daily_topn(
             px = o if (o is not None and o > 0.0) else c
         return px
 
-    def _trading_day_ok(dk: int) -> bool:
-        if index_allow_by_day is not None:
-            return bool(index_allow_by_day.get(int(dk), False))
+    def _market_data_ok(dk: int) -> bool:
         for code, m in daily_oc_by_code.items():
             dd = (m or {}).get(int(dk))
             if dd and float(dd.get("close") or 0.0) > 0.0:
@@ -647,6 +662,7 @@ def _simulate_universe_daily_topn(
     cash = 1.0
     positions: Dict[str, dict] = {}
     trade_logs: List[dict] = []
+    daily_stats: List[dict] = []
 
     def _equity_at_px(dk: int, use_close: bool) -> float:
         tot = float(cash)
@@ -663,8 +679,9 @@ def _simulate_universe_daily_topn(
             tot += float(sh) * float(px)
         return float(tot)
 
-    def _sell_at_px(codes: List[str], dk: int, use_close: bool, reason_by_code: Optional[Dict[str, str]] = None, trade_min: Optional[int] = None):
+    def _sell_at_px(codes: List[str], dk: int, use_close: bool, reason_by_code: Optional[Dict[str, str]] = None, trade_min: Optional[int] = None) -> int:
         nonlocal cash
+        sold = 0
         for code in (codes or []):
             p = positions.get(str(code))
             if not p:
@@ -734,14 +751,17 @@ def _simulate_universe_daily_topn(
                 }
             )
             positions.pop(str(code), None)
+            sold += 1
+        return int(sold)
 
-    def _buy_at_px(rows: List[dict], dk: int, use_close: bool, target_slots: int, trade_min: Optional[int] = None):
+    def _buy_at_px(rows: List[dict], dk: int, use_close: bool, target_slots: int, trade_min: Optional[int] = None) -> int:
         nonlocal cash
         if target_slots <= 0:
-            return
+            return 0
         tot_eq = _equity_at_px(dk, use_close=use_close)
         target_value = float(tot_eq) / float(max(1, int(target_slots)))
         remaining = int(target_slots)
+        bought = 0
         for r in (rows or []):
             if remaining <= 0:
                 break
@@ -803,12 +823,47 @@ def _simulate_universe_daily_topn(
                 }
             )
             remaining -= 1
+            bought += 1
+        return int(bought)
 
     for dk in day_list:
-        if not _trading_day_ok(int(dk)):
-            rets.append(0.0)
-            eq = float(eq) * 1.0
-            curve.append({"day": int(dk), "equity": float(eq), "r": 0.0, "codes": list(positions.keys()), "probs": [positions[c].get("prob") for c in positions.keys()]})
+        market_ok = bool(_market_data_ok(int(dk)))
+        index_allowed = True
+        if index_allow_by_day is not None:
+            index_allowed = bool(index_allow_by_day.get(int(dk), False))
+
+        if not market_ok:
+            eq = _equity_at_px(int(dk), use_close=True)
+            rr = float(eq / prev_eq - 1.0) if prev_eq > 0 else 0.0
+            rets.append(float(rr))
+            curve.append({"day": int(dk), "equity": float(eq), "r": float(rr), "codes": list(positions.keys()), "probs": [positions[c].get("prob") for c in positions.keys()]})
+            daily_stats.append(
+                {
+                    "day": int(dk),
+                    "market_data_ok": bool(market_ok),
+                    "index_allowed": bool(index_allowed),
+                    "risk_state": "na",
+                    "day_top_n": 0,
+                    "raw_candidates": int(raw_candidate_count_by_day.get(int(dk), 0)),
+                    "pool_filtered": int(pool_filtered_count_by_day.get(int(dk), 0)),
+                    "candidates_after_pool": int(len(by_day.get(int(dk)) or [])),
+                    "candidates_before_intraday": 0,
+                    "candidates_after_intraday": 0,
+                    "selected": 0,
+                    "has_targets": False,
+                    "fallback_hold": False,
+                    "positions_before": int(len(positions)),
+                    "sell_stop_loss": 0,
+                    "sell_out_of_pool": 0,
+                    "sell_rebalance": 0,
+                    "sell_planned": 0,
+                    "sell_executed": 0,
+                    "buy_executed": 0,
+                    "positions_after": int(len(positions)),
+                    "pool_allow_size": None,
+                    "pool_allow_missing": None,
+                }
+            )
             prev_eq = float(eq)
             continue
 
@@ -825,6 +880,7 @@ def _simulate_universe_daily_topn(
             risk_flat = False
 
         rows = by_day.get(int(dk)) or []
+        intraday_before = int(len(rows))
         if intraday_cfg and bool(intraday_cfg.get("enabled")) and rows:
             try:
                 bear_th = float(intraday_cfg.get("bear_threshold"))
@@ -885,9 +941,12 @@ def _simulate_universe_daily_topn(
                     continue
                 next_rows.append(r)
             rows = next_rows
+        intraday_after = int(len(rows))
 
-        rows.sort(key=lambda x: float(x.get("prob", float("-inf"))), reverse=True)
-        sel = rows[: int(day_tn)] if int(day_tn) > 0 else []
+        sel = []
+        if bool(index_allowed) and int(day_tn) > 0:
+            rows.sort(key=lambda x: float(x.get("prob", float("-inf"))), reverse=True)
+            sel = rows[: int(day_tn)]
 
         target_rows = sel
         target_codes = [str(r.get("code") or "").strip() for r in (target_rows or []) if str(r.get("code") or "").strip()]
@@ -909,6 +968,14 @@ def _simulate_universe_daily_topn(
                 if float(ret) <= float(sl):
                     forced_sell.append(str(code))
 
+        out_of_pool_sell = []
+        if bool(force_sell_out_of_pool) and (universe_allow_by_day is not None):
+            allow = universe_allow_by_day.get(int(dk))
+            if isinstance(allow, dict):
+                for code in list((positions or {}).keys()):
+                    if code and (not bool(allow.get(str(code), False))):
+                        out_of_pool_sell.append(str(code))
+
         if (not has_targets) and (not risk_flat):
             target_codes = list(positions.keys())
 
@@ -917,7 +984,8 @@ def _simulate_universe_daily_topn(
 
         current_codes = list(positions.keys())
         rebalance_out = [c for c in current_codes if c and c not in target_codes]
-        sell_codes = list(dict.fromkeys([c for c in (forced_sell + rebalance_out) if c]))
+        sell_codes = list(dict.fromkeys([c for c in (forced_sell + out_of_pool_sell + rebalance_out) if c]))
+        sell_codes_later = []
         reason_by_code = {}
         if risk_flat:
             for c in current_codes:
@@ -927,6 +995,9 @@ def _simulate_universe_daily_topn(
             for c in forced_sell:
                 if c:
                     reason_by_code[str(c)] = "stop_loss"
+            for c in out_of_pool_sell:
+                if c and str(c) not in reason_by_code:
+                    reason_by_code[str(c)] = "out_of_pool"
             for c in rebalance_out:
                 if c and str(c) not in reason_by_code:
                     reason_by_code[str(c)] = "rebalance"
@@ -936,6 +1007,7 @@ def _simulate_universe_daily_topn(
             rebalance_set = set(rebalance_out or [])
             forced_set = set(forced_sell or [])
             filtered_sell = []
+            filtered_sell_later = []
             for c in sell_codes:
                 if c in forced_set:
                     filtered_sell.append(c)
@@ -964,10 +1036,14 @@ def _simulate_universe_daily_topn(
                 if op is not None and float(op) < float(weak_th):
                     filtered_sell.append(c)
                     continue
+                if op is not None and float(op) >= float(strong_th):
+                    filtered_sell_later.append(c)
+                    continue
                 if int(decision_min) <= 10 * 60:
                     continue
                 filtered_sell.append(c)
             sell_codes = filtered_sell
+            sell_codes_later = filtered_sell_later
 
         if bool(enforce_t1) and sell_codes:
             sell_ok = []
@@ -984,15 +1060,79 @@ def _simulate_universe_daily_topn(
                     continue
                 sell_ok.append(c)
             sell_codes = sell_ok
+        if bool(enforce_t1) and sell_codes_later:
+            sell_ok = []
+            for c in sell_codes_later:
+                p = positions.get(str(c))
+                if not p:
+                    sell_ok.append(c)
+                    continue
+                try:
+                    ed = int(p.get("entry_day") or 0)
+                except Exception:
+                    ed = 0
+                if ed and int(ed) >= int(dk):
+                    continue
+                sell_ok.append(c)
+            sell_codes_later = sell_ok
 
         do_delayed_rebalance = sell_mode in ("delayed", "delay", "scheme1", "t1_delay")
         trade_min = int(decision_min) if bool(do_delayed_rebalance) and bool(decision_px_enabled) else None
 
-        _sell_at_px(sell_codes, int(dk), use_close=False, reason_by_code=reason_by_code, trade_min=trade_min)
+        positions_before = int(len(positions))
+        sell_executed = 0
+        if trade_min is not None:
+            sell_executed = _sell_at_px(sell_codes, int(dk), use_close=False, reason_by_code=reason_by_code, trade_min=trade_min)
+        else:
+            sell_executed += _sell_at_px(sell_codes, int(dk), use_close=False, reason_by_code=reason_by_code, trade_min=None)
+            if sell_codes_later:
+                sell_executed += _sell_at_px(sell_codes_later, int(dk), use_close=False, reason_by_code=reason_by_code, trade_min=int(decision_min))
+        buy_executed = 0
         if has_targets and int(day_tn) > 0:
             open_slots = max(0, int(day_tn) - int(len(positions)))
             buy_rows = [r for r in (target_rows or []) if str(r.get("code") or "").strip() not in positions]
-            _buy_at_px(buy_rows, int(dk), use_close=False, target_slots=int(open_slots), trade_min=trade_min)
+            buy_executed = _buy_at_px(buy_rows, int(dk), use_close=False, target_slots=int(open_slots), trade_min=trade_min)
+
+        allow_size = None
+        allow_missing = None
+        if universe_allow_by_day is not None:
+            allow = universe_allow_by_day.get(int(dk))
+            allow_missing = allow is None
+            allow_size = int(len(allow)) if isinstance(allow, dict) else None
+
+        risk_state = "normal"
+        if bool(risk_flat):
+            risk_state = "flat"
+        elif int(day_tn) < int(tn):
+            risk_state = "reduce"
+
+        daily_stats.append(
+            {
+                "day": int(dk),
+                "market_data_ok": bool(market_ok),
+                "index_allowed": bool(index_allowed),
+                "risk_state": str(risk_state),
+                "day_top_n": int(day_tn),
+                "raw_candidates": int(raw_candidate_count_by_day.get(int(dk), 0)),
+                "pool_filtered": int(pool_filtered_count_by_day.get(int(dk), 0)),
+                "candidates_after_pool": int(len(by_day.get(int(dk)) or [])),
+                "candidates_before_intraday": int(intraday_before),
+                "candidates_after_intraday": int(intraday_after),
+                "selected": int(len(sel)),
+                "has_targets": bool(has_targets),
+                "fallback_hold": bool((not has_targets) and (not risk_flat)),
+                "positions_before": int(positions_before),
+                "sell_stop_loss": int(len(forced_sell)),
+                "sell_out_of_pool": int(len(out_of_pool_sell)),
+                "sell_rebalance": int(len(rebalance_out)),
+                "sell_planned": int(len(sell_codes) + len(sell_codes_later)),
+                "sell_executed": int(sell_executed),
+                "buy_executed": int(buy_executed),
+                "positions_after": int(len(positions)),
+                "pool_allow_size": allow_size,
+                "pool_allow_missing": allow_missing,
+            }
+        )
 
         eq = _equity_at_px(int(dk), use_close=True)
         rr = float(eq / prev_eq - 1.0) if prev_eq > 0 else 0.0
@@ -1052,6 +1192,7 @@ def _simulate_universe_daily_topn(
         "max_drawdown": float(mdd),
         "equity_curve": curve,
         "trade_logs": trade_logs,
+        "daily_stats": daily_stats,
     }
 
 
@@ -1070,6 +1211,10 @@ def _calc_code_candidates(
     holding_period: int,
     trade_cost: float,
     walk_forward_max_folds: int,
+    model_type: Optional[str] = None,
+    pretrained_model_key: Optional[str] = None,
+    rank_transform_enabled: Optional[bool] = True,
+    only_features: Optional[Any] = None,
     decision_min: Optional[int] = None,
     stop_loss: float = -0.03,
     enforce_t1: bool = True,
@@ -1111,22 +1256,102 @@ def _calc_code_candidates(
         except Exception:
             fixed_ts = None
 
-    _, _, acc = train_time_split_backtest(
-        bsp_dict,
-        model_type="lr",
-        backtest_mode="walk_forward",
-        only_features=["volatility_250", "bsp3_zs_height"],
-        rank_transform_enabled=True,
-        walk_forward_max_folds=int(walk_forward_max_folds),
-        profit_threshold=profit_threshold,
-        profit_lookahead=int(holding_period),
-        trade_cost=float(trade_cost or 0.0),
-        enforce_t1=bool(enforce_t1),
-        fixed_test_start_ts=fixed_ts,
-    )
+    used_model_type = str(model_type or "").strip().lower() or "lr"
+    if used_model_type in ["logistic_regression", "logreg"]:
+        used_model_type = "lr"
+
     preds = []
-    if isinstance(acc, dict):
-        preds = list(acc.get("predictions") or [])
+    bundle = None
+    if str(pretrained_model_key or "").strip():
+        try:
+            bundle = load_pretrained_model_bundle_by_key(str(pretrained_model_key).strip())
+        except Exception:
+            bundle = None
+    if isinstance(bundle, dict) and (bundle.get("model") is not None) and isinstance(bundle.get("feature_meta"), list) and bundle.get("feature_meta"):
+        model = bundle.get("model")
+        feature_meta = list(bundle.get("feature_meta") or [])
+        infos_all = list((bsp_dict or {}).values())
+        try:
+            infos_all.sort(key=lambda i: getattr(i.get("open_time"), "ts", 0))
+        except Exception:
+            pass
+        if fixed_ts:
+            filtered_infos = []
+            for info in infos_all:
+                try:
+                    ts = int(getattr((info or {}).get("open_time"), "ts", 0) or 0)
+                except Exception:
+                    ts = 0
+                if ts and int(ts) >= int(fixed_ts):
+                    filtered_infos.append(info)
+            infos_all = filtered_infos
+
+        feats = []
+        info_ts = []
+        for info in (infos_all or []):
+            feat = None
+            try:
+                feat = (info or {}).get("feature")
+            except Exception:
+                feat = None
+            feat_dict = {}
+            if feat is None:
+                feat_dict = {}
+            elif isinstance(feat, dict):
+                feat_dict = dict(feat)
+            elif hasattr(feat, "items"):
+                try:
+                    feat_dict = dict(feat.items())
+                except Exception:
+                    feat_dict = {}
+            feats.append([feat_dict.get(k, -9999999) for k in feature_meta])
+            try:
+                info_ts.append(int(getattr((info or {}).get("open_time"), "ts", 0) or 0))
+            except Exception:
+                info_ts.append(0)
+
+        probs = []
+        try:
+            probs = list(predict_proba_1(model, feats) or [])
+        except Exception:
+            probs = []
+
+        n = min(len(probs), len(infos_all), len(info_ts))
+        for i in range(n):
+            info = infos_all[i]
+            ts = int(info_ts[i] or 0)
+            if ts <= 0:
+                continue
+            try:
+                p = float(probs[i])
+            except Exception:
+                continue
+            preds.append(
+                {
+                    "ts": int(ts),
+                    "prob": float(p),
+                    "label": 0,
+                    "is_buy": bool((info or {}).get("is_buy")),
+                    "profit": float(_profit_for_info(info, lookahead=int(holding_period), enforce_t1=bool(enforce_t1))),
+                    "min_profit": float(_min_profit_for_info(info, lookahead=int(holding_period), enforce_t1=bool(enforce_t1))),
+                }
+            )
+    else:
+        _, _, acc = train_time_split_backtest(
+            bsp_dict,
+            model_type=used_model_type,
+            backtest_mode="walk_forward",
+            only_features=only_features,
+            rank_transform_enabled=rank_transform_enabled,
+            walk_forward_max_folds=int(walk_forward_max_folds),
+            profit_threshold=profit_threshold,
+            profit_lookahead=int(holding_period),
+            trade_cost=float(trade_cost or 0.0),
+            enforce_t1=bool(enforce_t1),
+            fixed_test_start_ts=fixed_ts,
+        )
+        if isinstance(acc, dict):
+            preds = list(acc.get("predictions") or [])
 
     kl_idx_map = {}
     for i, k in enumerate(kl_list or []):
@@ -1250,6 +1475,7 @@ class WolfpackBacktester:
         t1_gap_weak_threshold: float = -0.02,
         t1_gap_very_strong_threshold: float = 0.05,
         risk_filter_enabled: bool = False,
+        risk_index_code: Optional[str] = None,
         risk_mode: str = "both",
         risk_drop_threshold: float = -0.03,
         risk_flat_drop_threshold: float = -0.05,
@@ -1263,9 +1489,116 @@ class WolfpackBacktester:
         risk_trend_ma_window: int = 20,
         risk_data_fail_mode: str = "reduce",
         risk_intraday_data_fail_mode: str = "reduce",
+        pool_id: Optional[str] = None,
+        pool_point_in_time: bool = False,
+        model: Optional[str] = None,
+        pretrained_model_key: Optional[str] = None,
+        rank_mode: Optional[str] = None,
+        lookback_days: Optional[int] = None,
+        only_features: Optional[str] = None,
     ) -> Dict[str, Any]:
+        pool_id = str(pool_id or "").strip() or None
+        pool_point_in_time = bool(pool_point_in_time)
+
         pool_codes = [normalize_code(str(c)) for c in (pool_codes or []) if str(c or "").strip()]
         pool_codes = list(dict.fromkeys(pool_codes))
+
+        universe_allow_by_day = None
+        pool_snapshot_count = 0
+        first_pool_snapshot_day = None
+        pool_snapshots: List[dict] = []
+        pool_snapshot_members: List[dict] = []
+        if pool_point_in_time and pool_id and (":" in pool_id):
+            try:
+                from DataAPI.ClickHouseAPI import CClickHouseAPI
+
+                snap = CClickHouseAPI.get_pool_snapshot_members(pool_id, start_date, end_date, table="stock_constituent")
+                if snap:
+                    def _normalize_member_code(v) -> Optional[str]:
+                        s = str(v or "").strip()
+                        if not s:
+                            return None
+                        try:
+                            c = normalize_code(s)
+                        except Exception:
+                            c = s.strip().lower()
+                        c = str(c or "").strip().lower()
+                        if c.count(".") >= 2:
+                            parts = [p for p in c.split(".") if p]
+                            prefix = None
+                            digits = None
+                            for p in parts:
+                                if p in ("sh", "sz", "bj"):
+                                    prefix = p
+                                    break
+                            for p in reversed(parts):
+                                if p.isdigit() and len(p) == 6:
+                                    digits = p
+                                    break
+                            if prefix and digits:
+                                c = f"{prefix}.{digits}"
+                            elif prefix and len(parts) >= 2:
+                                c = f"{prefix}.{parts[1]}"
+                        c = str(c or "").strip()
+                        if not c:
+                            return None
+                        return c
+
+                    parsed = []
+                    for k, codes in (snap or {}).items():
+                        try:
+                            d = datetime.datetime.strptime(str(k), "%Y-%m-%d").date()
+                        except Exception:
+                            continue
+                        dk = int(d.year) * 10000 + int(d.month) * 100 + int(d.day)
+                        cc = []
+                        for c in (codes or []):
+                            nc = _normalize_member_code(c)
+                            if nc:
+                                cc.append(nc)
+                        cc = list(dict.fromkeys(cc))
+                        if dk > 0 and cc:
+                            parsed.append((dk, cc))
+                    parsed.sort(key=lambda x: int(x[0]))
+                    if parsed:
+                        pool_snapshot_count = int(len(parsed))
+                        pool_snapshots = [
+                            {
+                                "day": int(dk),
+                                "snapshot_date": f"{str(int(dk))[0:4]}-{str(int(dk))[4:6]}-{str(int(dk))[6:8]}",
+                                "stock_count": int(len(cc)),
+                            }
+                            for dk, cc in parsed
+                        ]
+                        pool_snapshot_members = [
+                            {
+                                "day": int(dk),
+                                "snapshot_date": f"{str(int(dk))[0:4]}-{str(int(dk))[4:6]}-{str(int(dk))[6:8]}",
+                                "codes": list(cc),
+                            }
+                            for dk, cc in parsed
+                        ]
+                        snap_days = [int(x[0]) for x in parsed]
+                        snap_sets = [set(x[1]) for x in parsed]
+                        first_pool_snapshot_day = int(snap_days[0]) if snap_days else None
+                        all_codes = []
+                        for ss in snap_sets:
+                            all_codes.extend(list(ss))
+                        all_codes = list(dict.fromkeys([c for c in all_codes if c]))
+                        if all_codes:
+                            pool_codes = all_codes
+                            day_list = _date_range_days(start_date, end_date)
+                            allow_map: Dict[int, Dict[str, bool]] = {}
+                            for dk in (day_list or []):
+                                idx = bisect_right(snap_days, int(dk)) - 1
+                                if idx < 0:
+                                    continue
+                                allow_set = snap_sets[int(idx)]
+                                allow_map[int(dk)] = {c: True for c in allow_set}
+                            universe_allow_by_day = allow_map
+            except Exception:
+                universe_allow_by_day = None
+
         if not pool_codes:
             return {"status": "error", "detail": "no_pool_codes"}
 
@@ -1274,7 +1607,9 @@ class WolfpackBacktester:
         level = freq_map.get(freq, KL_TYPE.K_30M)
 
         src_raw = str(data_src or "clickhouse").strip().lower()
-        src_map = {"baostock": DATA_SRC.BAO_STOCK, "akshare": DATA_SRC.AK_SHARE, "ccxt": DATA_SRC.CCXT, "csv": DATA_SRC.CSV, "clickhouse": DATA_SRC.CLICK_HOUSE}
+        if src_raw == "akshare":
+            return {"status": "error", "detail": "akshare data_src is disabled"}
+        src_map = {"baostock": DATA_SRC.BAO_STOCK, "ccxt": DATA_SRC.CCXT, "csv": DATA_SRC.CSV, "tdx": DATA_SRC.TDX, "tongdaxin": DATA_SRC.TDX, "clickhouse": DATA_SRC.CLICK_HOUSE}
         src = src_map.get(src_raw, DATA_SRC.CLICK_HOUSE)
 
         raw_autype = str(autype or "qfq").strip().lower()
@@ -1302,10 +1637,23 @@ class WolfpackBacktester:
         allow_by_day = None
         if bool(index_filter_enabled):
             allow_by_day = _load_index_filter_day_set(index_code, start_date, end_date, src, au, ma_window=int(index_ma_window))
+        if first_pool_snapshot_day is not None and int(first_pool_snapshot_day) > 0:
+            day_list = _date_range_days(start_date, end_date)
+            trade_allow_by_day: Dict[int, bool] = {}
+            for dk in (day_list or []):
+                if int(dk) < int(first_pool_snapshot_day):
+                    trade_allow_by_day[int(dk)] = False
+                    continue
+                if bool(index_filter_enabled) and allow_by_day is not None:
+                    trade_allow_by_day[int(dk)] = bool(allow_by_day.get(int(dk), False))
+                else:
+                    trade_allow_by_day[int(dk)] = True
+            allow_by_day = trade_allow_by_day
         risk_by_day = None
         if bool(risk_filter_enabled):
+            risk_idx = str(risk_index_code or index_code or "399006")
             risk_by_day = _load_index_risk_day_map(
-                index_code,
+                risk_idx,
                 start_date,
                 end_date,
                 src,
@@ -1389,11 +1737,31 @@ class WolfpackBacktester:
                     "daily_low_by_day": {},
                     "get_index_close_at_ts": None,
                 }
+
+        used_rank_mode = str(rank_mode or "").strip().lower() or None
+        if used_rank_mode in ("raw", "none", "off", "disabled"):
+            used_rank_transform_enabled = False
+        else:
+            used_rank_transform_enabled = True
+
+        used_model_type = str(model or "").strip().lower() or "lr"
+        if used_model_type in ["logistic_regression", "logreg"]:
+            used_model_type = "lr"
+
+        used_lookback_days = None
         try:
-            train_years = _env_float("MLCHAN_DESIRED_TRAIN_YEARS", 1.0)
-            lookback_days = int((train_years + 3.0) * 365)
+            used_lookback_days = int(lookback_days) if lookback_days is not None else None
+        except Exception:
+            used_lookback_days = None
+        if used_lookback_days is None or used_lookback_days <= 0:
+            try:
+                train_years = _env_float("MLCHAN_DESIRED_TRAIN_YEARS", 1.0)
+                used_lookback_days = int((train_years + 3.0) * 365)
+            except Exception:
+                used_lookback_days = 0
+        try:
             s_dt = datetime.datetime.strptime(str(start_date), "%Y-%m-%d")
-            ext_s_dt = s_dt - datetime.timedelta(days=lookback_days)
+            ext_s_dt = s_dt - datetime.timedelta(days=int(used_lookback_days or 0))
             extended_start_date = ext_s_dt.strftime("%Y-%m-%d")
         except Exception:
             extended_start_date = str(start_date)
@@ -1416,6 +1784,10 @@ class WolfpackBacktester:
                     int(holding_period),
                     float(trade_cost or 0.0),
                     int(walk_forward_max_folds),
+                    used_model_type,
+                    str(pretrained_model_key or "").strip() or None,
+                    bool(used_rank_transform_enabled),
+                    only_features,
                     decision_min_for_oc,
                     float(stop_loss),
                     bool(enforce_t1),
@@ -1446,6 +1818,7 @@ class WolfpackBacktester:
             end_date,
             trade_cost=float(trade_cost or 0.0),
             top_n=int(portfolio_top_n),
+            universe_allow_by_day=universe_allow_by_day,
             index_allow_by_day=allow_by_day,
             risk_by_day=risk_by_day,
             intraday_cfg=intraday_cfg,
@@ -1468,6 +1841,11 @@ class WolfpackBacktester:
                 "autype": raw_autype,
                 "start_date": str(start_date),
                 "end_date": str(end_date),
+                "pool_id": str(pool_id) if pool_id else None,
+                "pool_point_in_time": bool(pool_point_in_time),
+                "pool_snapshot_count": int(pool_snapshot_count),
+                "pool_snapshots": pool_snapshots,
+                "pool_snapshot_members": pool_snapshot_members,
                 "rolling_sample_mode": str(rolling_sample_mode or "").strip().lower() or "every_bar",
                 "rolling_stride": int(rolling_stride) if rolling_stride is not None else 1,
                 "min_prob": float(mp),
@@ -1500,9 +1878,12 @@ class WolfpackBacktester:
                 "risk_trend_ma_window": int(risk_trend_ma_window),
                 "risk_data_fail_mode": str(risk_data_fail_mode or "reduce"),
                 "risk_intraday_data_fail_mode": str(risk_intraday_data_fail_mode or "reduce"),
-                "rank_transform_enabled": True,
-                "only_features": ["volatility_250", "bsp3_zs_height"],
-                "model": "lr",
+                "model": str(used_model_type),
+                "pretrained_model_key": str(pretrained_model_key) if str(pretrained_model_key or "").strip() else None,
+                "rank_mode": str(used_rank_mode) if used_rank_mode else None,
+                "rank_transform_enabled": bool(used_rank_transform_enabled),
+                "lookback_days": int(used_lookback_days or 0),
+                "only_features": only_features,
             },
             "portfolio": portfolio,
             "per_code": per_code,

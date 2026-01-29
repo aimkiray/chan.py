@@ -14,3 +14,4 @@ xgboost>=1.6.0
 scikit-learn>=1.0.0
 lightgbm>=3.3.0
 akshare>=1.17.98
+pytdx>=1.72

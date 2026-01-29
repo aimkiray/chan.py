@@ -19,7 +19,8 @@ from backend.chan_service import (
     predict_proba_1,
     stragety_feature,
     extract_state_features_from_cur_lv,
-    get_stock_name
+    get_stock_name,
+    normalize_code
 )
 from backend.storage import StorageManager, StrategyRun
 from backend.vector_backtest import VectorBacktester
@@ -674,10 +675,54 @@ class StrategyRunner:
             
             # 1. Get Stocks
             stocks = []
+            raw_codes = params.get("codes")
+            manual_codes = params.get("manual_codes")
+            if raw_codes and isinstance(raw_codes, (list, tuple)):
+                for c in raw_codes:
+                    cc = str(c or "").strip()
+                    if not cc:
+                        continue
+                    try:
+                        stocks.append(normalize_code(cc))
+                    except Exception:
+                        stocks.append(cc)
+            elif manual_codes:
+                text = str(manual_codes or "")
+                parts = []
+                cur = ""
+                for ch in text:
+                    if ch.isalnum() or ch in [".", "_"]:
+                        cur += ch
+                        continue
+                    if cur:
+                        parts.append(cur)
+                        cur = ""
+                if cur:
+                    parts.append(cur)
+                for c in parts:
+                    cc = str(c or "").strip()
+                    if not cc:
+                        continue
+                    try:
+                        stocks.append(normalize_code(cc))
+                    except Exception:
+                        stocks.append(cc)
+
+            seen = set()
+            uniq = []
+            for c in stocks:
+                cc = str(c or "").strip()
+                if not cc or cc in seen:
+                    continue
+                seen.add(cc)
+                uniq.append(cc)
+            stocks = uniq
+
             if pool_id:
                 print(f"Fetching stocks for pool_id: {pool_id}")
-                stocks = CClickHouseAPI.get_pool_members(pool_id)
-                print(f"Got {len(stocks)} stocks from pool {pool_id}")
+                if not stocks:
+                    stocks = CClickHouseAPI.get_pool_members(pool_id)
+                    print(f"Got {len(stocks)} stocks from pool {pool_id}")
             
             if not stocks:
                 if scope == 'hs300':

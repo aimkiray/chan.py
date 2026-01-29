@@ -451,8 +451,7 @@ const frequencyOptions = computed(() => ([
 
 const dataSrcOptions = computed(() => ([
   { label: t('app.dataSrcOptions.clickhouse'), value: 'clickhouse' },
-  { label: t('app.dataSrcOptions.baostock'), value: 'baostock' },
-  { label: t('app.dataSrcOptions.akshare'), value: 'akshare' }
+  { label: t('app.dataSrcOptions.baostock'), value: 'baostock' }
 ]))
 
 const autypeOptions = computed(() => ([
@@ -496,16 +495,23 @@ const openLiveTools = async () => {
   await loadPositions()
 }
 
+const stripParallelParams = (obj) => {
+  const out = { ...(obj && typeof obj === 'object' ? obj : {}) }
+  delete out.max_workers
+  delete out.maxWorkers
+  return out
+}
+
 const runLiveScan = async () => {
   scanError.value = ''
   scanMeta.value = null
   scanLoading.value = true
   try {
-    const payload = {
-      ...liveConfig.value,
-      ...liveScan.value,
+    const payload = stripParallelParams({
+      ...stripParallelParams(liveConfig.value),
+      ...stripParallelParams(liveScan.value),
       enable_rolling_lookback: props?.form?.enable_rolling_lookback !== false
-    }
+    })
     const res = await axios.post('/api/live/scan_features', payload)
     const data = res.data || {}
     scanItems.value = Array.isArray(data.items) ? data.items : []
@@ -546,14 +552,14 @@ const runPaperStep = async () => {
   stepLoading.value = true
   stepError.value = ''
   try {
-    const payload = {
-      ...liveConfig.value,
-      ...livePaper.value,
+    const payload = stripParallelParams({
+      ...stripParallelParams(liveConfig.value),
+      ...stripParallelParams(livePaper.value),
       enable_rolling_lookback: props?.form?.enable_rolling_lookback !== false,
       rank_mode: 'cross_section',
       rolling_sample_mode: 'every_bar',
       rolling_stride: 1
-    }
+    })
     const res = await axios.post('/api/live/paper_trade_step', payload)
     stepResult.value = res.data
     positions.value = Array.isArray(res.data?.positions) ? res.data.positions : positions.value
@@ -571,8 +577,9 @@ const runStrategy = async () => {
     const userName = String(props.form.strategy_name || '').trim()
     const isDefaultName = /^Strategy-\d+$/.test(userName)
 
+    const manualCodes = String(props.form.manual_codes || '').trim()
     const pid = String(props.form.pool_id || '').trim() || String(props.form.scope || '').trim() || 'HS300'
-    const poolLabel = poolMap.value[pid] || pid
+    const poolLabel = manualCodes ? `手动(${manualCodes.split(/[\s,;]+/).filter(Boolean).length})` : (poolMap.value[pid] || pid)
     const freqRaw = String(props.form.frequency || '').trim() || '1d'
     const freqLabel = ({ '1d': '日线', '1w': '周线', '1mo': '月线', '60m': '60分钟', '30m': '30分钟', '15m': '15分钟', '5m': '5分钟', '1m': '1分钟' }[freqRaw] || freqRaw)
 
@@ -629,6 +636,7 @@ const runStrategy = async () => {
       strategy_name: strategyName,
       scope: f.scope,
       pool_id: f.pool_id,
+      manual_codes: f.manual_codes,
       model: f.model,
       autype: f.autype,
       min_accuracy: f.min_accuracy,
@@ -671,8 +679,10 @@ defineExpose({ runStrategy })
 
 const formatParams = (params) => {
   if (!params) return ''
+  const manual = String(params.manual_codes || '').trim()
+  const manualCount = manual ? manual.split(/[\s,;，；、]+/).filter(Boolean).length : 0
   const parts = [
-    `Pool: ${params.pool_id || 'HS300'}`,
+    `Pool: ${manual ? `manual(${manualCount})` : (params.pool_id || 'HS300')}`,
     `Model: ${params.model}`,
     `MinAcc: ${params.min_accuracy}`,
   ]

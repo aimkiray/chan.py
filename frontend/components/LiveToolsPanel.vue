@@ -21,7 +21,7 @@
         <div class="mt-3 grid grid-cols-2 gap-3">
           <div>
             <div class="text-xs text-gray-500 mb-1">{{ t('strategy.poolId') }}</div>
-            <USelectMenu v-model="liveConfig.pool_id" :options="poolOptionsForLive" value-attribute="value" option-attribute="label" />
+            <USelectMenu v-model="liveConfig.pool_id" :searchable="searchStockPools" :searchable-placeholder="t('common.typeToSearch')" :loading="searchingStockPools" :options="poolOptionsForLive" value-attribute="value" option-attribute="label" />
           </div>
           <div>
             <div class="text-xs text-gray-500 mb-1">{{ t('sidebar.dataSrc') }}</div>
@@ -89,6 +89,8 @@ const props = defineProps({
 
 const poolMap = ref({})
 
+const searchingStockPools = ref(false)
+
 const scanLoading = ref(false)
 const scanError = ref('')
 const scanMeta = ref(null)
@@ -119,6 +121,32 @@ const poolOptionsForLive = computed(() => {
   return items
 })
 
+const searchStockPools = async (query) => {
+  const q = String(query || '').trim()
+  if (!q) return poolOptionsForLive.value
+  searchingStockPools.value = true
+  try {
+    const res = await axios.get('/api/stock_pools', { params: { limit: 100, keyword: q } })
+    const items = (res.data?.items || []).map(p => ({
+      value: p.pool_id,
+      label: `${p.pool_name} (${p.stock_count})`
+    }))
+    const next = { ...(poolMap.value || {}) }
+    for (const it of items) {
+      const v = String(it?.value || '').trim()
+      const l = String(it?.label || '').trim()
+      if (!v || !l) continue
+      next[v] = l
+    }
+    poolMap.value = next
+    return items
+  } catch (e) {
+    return []
+  } finally {
+    searchingStockPools.value = false
+  }
+}
+
 const frequencyOptions = computed(() => ([
   { label: t('periods.30m'), value: '30m' },
   { label: t('periods.60m'), value: '60m' },
@@ -129,8 +157,7 @@ const frequencyOptions = computed(() => ([
 
 const dataSrcOptions = computed(() => ([
   { label: t('app.dataSrcOptions.clickhouse'), value: 'clickhouse' },
-  { label: t('app.dataSrcOptions.baostock'), value: 'baostock' },
-  { label: t('app.dataSrcOptions.akshare'), value: 'akshare' }
+  { label: t('app.dataSrcOptions.baostock'), value: 'baostock' }
 ]))
 
 const autypeOptions = computed(() => ([
@@ -154,16 +181,23 @@ const scanColumns = computed(() => ([
   { key: 'ok', label: t('strategy.status') }
 ]))
 
+const stripParallelParams = (obj) => {
+  const out = { ...(obj && typeof obj === 'object' ? obj : {}) }
+  delete out.max_workers
+  delete out.maxWorkers
+  return out
+}
+
 const runLiveScan = async () => {
   scanError.value = ''
   scanMeta.value = null
   scanLoading.value = true
   try {
-    const payload = {
-      ...liveConfig.value,
-      ...liveScan.value,
+    const payload = stripParallelParams({
+      ...stripParallelParams(liveConfig.value),
+      ...stripParallelParams(liveScan.value),
       enable_rolling_lookback: props.enableRollingLookback !== false
-    }
+    })
     const res = await axios.post('/api/live/scan_features', payload)
     const data = res.data || {}
     scanItems.value = Array.isArray(data.items) ? data.items : []

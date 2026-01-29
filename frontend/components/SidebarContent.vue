@@ -70,7 +70,7 @@
                       size="2xs"
                       :color="proxyIntradayFreq === period ? 'primary' : 'gray'"
                       :variant="proxyIntradayFreq === period ? 'solid' : 'ghost'"
-                      :disabled="period === '1m' && ['baostock', 'akshare'].includes(proxyDataSrc)"
+                      :disabled="period === '1m' && ['baostock'].includes(proxyDataSrc)"
                       class="justify-center px-0"
                       @click="proxyIntradayFreq = period"
                     />
@@ -343,6 +343,9 @@
               <div class="flex items-center gap-2">
                   <USelectMenu
                       v-model="proxyPretrainConfig.selectedPoolId"
+                      :searchable="searchStockPools"
+                      :searchable-placeholder="t('common.typeToSearch')"
+                      :loading="searchingStockPools"
                       :options="poolOptions"
                       value-attribute="value"
                       option-attribute="label"
@@ -459,19 +462,15 @@
       </div>
 
       <div v-if="activeTab === 'backtest' && (!collapsed || mode === 'desktop')" class="space-y-3">
-        <div>
-          <div class="flex items-center justify-between gap-2 mb-2">
-            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.simId') }}</label>
-            <UButton size="2xs" color="gray" variant="ghost" icon="i-heroicons-plus" @click="generateSimId">{{ t('strategy.newSim') }}</UButton>
-          </div>
-          <UInput v-model="proxyBacktestSimId" :placeholder="t('strategy.simIdPlaceholder')" class="w-full" />
-        </div>
-
-        <div>
-          <div class="flex items-center gap-1 mb-2">
-            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.poolId') }}</label>
-          </div>
-          <USelectMenu v-model="proxyPaperConfig.pool_id" :options="poolOptions" value-attribute="value" option-attribute="label" class="w-full" />
+        <!-- Backtest Config Management -->
+        <div class="flex items-center gap-2">
+           <div class="text-xs font-medium text-gray-700 dark:text-gray-300 shrink-0">{{ t('portfolio.backtestConfigManage') }}</div>
+           <div class="flex items-center gap-1 flex-1 overflow-x-auto">
+             <UButton size="2xs" color="gray" variant="soft" @click="openBacktestSave" class="px-1">{{ t('portfolio.saveConfig') }}</UButton>
+             <UButton size="2xs" color="gray" variant="soft" @click="openBacktestLoad" class="px-1">{{ t('portfolio.loadConfig') }}</UButton>
+             <UButton size="2xs" color="gray" variant="soft" @click="openBacktestExport" class="px-1">{{ t('portfolio.exportConfig') }}</UButton>
+             <UButton size="2xs" color="gray" variant="soft" @click="openBacktestImport" class="px-1">{{ t('portfolio.importConfig') }}</UButton>
+           </div>
         </div>
 
         <div>
@@ -495,6 +494,24 @@
           <USelectMenu v-model="proxyPaperConfig.frequency" :options="paperFrequencyOptions" value-attribute="value" option-attribute="label" class="w-full" />
         </div>
 
+        <div class="grid grid-cols-1 gap-2">
+          <div>
+            <div class="flex items-center gap-1 mb-2">
+              <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('portfolio.startDate') }}</label>
+            </div>
+            <UInput type="date" v-model="proxyPaperConfig.start_date" class="w-full" />
+          </div>
+          <div>
+            <div class="flex items-center gap-1 mb-2">
+              <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('portfolio.endDate') }}</label>
+            </div>
+            <UInput type="date" v-model="proxyPaperConfig.end_date" class="w-full" />
+          </div>
+        </div>
+        <div v-if="backtestDateRangeError" class="text-xs text-red-500">
+          {{ backtestDateRangeError }}
+        </div>
+
         <div>
           <div class="flex items-center gap-1 mb-2">
             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.initialCapital') }}</label>
@@ -516,48 +533,96 @@
         </div>
 
         <div v-if="showAdvancedPaper" class="space-y-3 pt-2 border-t border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-800/50 p-2 rounded">
+          <div>
+            <div class="flex items-center justify-between gap-2 mb-2">
+              <label class="text-xs text-gray-500">{{ t('strategy.simId') }}</label>
+              <UTooltip :text="t('strategy.simIdPlaceholder')">
+                <UIcon name="i-heroicons-exclamation-circle" class="w-4 h-4 text-gray-400 hover:text-gray-600 cursor-help shrink-0" />
+              </UTooltip>
+              <UButton size="2xs" color="gray" variant="ghost" icon="i-heroicons-plus" @click="generateSimId" class="ml-auto">{{ t('strategy.newSim') }}</UButton>
+            </div>
+            <UInput v-model="proxyBacktestSimId" class="w-full" />
+          </div>
+
+          <div>
+            <div class="flex items-center gap-1 mb-2">
+              <label class="text-xs text-gray-500">{{ t('strategy.poolId') }}</label>
+            </div>
+            <USelectMenu v-model="proxyPaperConfig.pool_id" :searchable="searchStockPools" :searchable-placeholder="t('common.typeToSearch')" :loading="searchingStockPools" :options="poolOptions" value-attribute="value" option-attribute="label" class="w-full" />
+          </div>
+
           <div class="space-y-2">
             <div>
-              <label class="text-xs text-gray-500">{{ t('strategy.topN') }}</label>
+              <div class="flex items-center gap-1 mb-2">
+                <label class="text-xs text-gray-500">{{ t('strategy.topN') }}</label>
+              </div>
               <UInput v-model="proxyPaperParams.top_n" type="number" class="w-full" />
             </div>
             <div>
-              <label class="text-xs text-gray-500">{{ t('strategy.minProb') }}</label>
+              <div class="flex items-center gap-1 mb-2">
+                <label class="text-xs text-gray-500">{{ t('strategy.minProb') }}</label>
+              </div>
               <UInput v-model="proxyPaperParams.min_prob" type="number" class="w-full" />
             </div>
             <div>
-              <label class="text-xs text-gray-500">{{ t('strategy.holdingBars') }}</label>
+              <div class="flex items-center gap-1 mb-2">
+                <label class="text-xs text-gray-500">{{ t('strategy.holdingBars') }}</label>
+              </div>
               <UInput v-model="proxyPaperParams.holding_period" type="number" class="w-full" />
             </div>
             <div>
-              <label class="text-xs text-gray-500">{{ t('strategy.tradeCost') }}</label>
+              <div class="flex items-center gap-1 mb-2">
+                <label class="text-xs text-gray-500">{{ t('strategy.tradeCost') }}</label>
+              </div>
               <UInput v-model="proxyPaperParams.trade_cost" type="number" class="w-full" />
             </div>
             <div>
-              <label class="text-xs text-gray-500">{{ t('strategy.lookbackDays') }}</label>
+              <div class="flex items-center gap-1 mb-2">
+                <label class="text-xs text-gray-500">{{ t('strategy.lookbackDays') }}</label>
+              </div>
               <UInput v-model="proxyPaperParams.lookback_days" type="number" class="w-full" />
             </div>
             <div>
-              <label class="text-xs text-gray-500">{{ t('strategy.limit') }}</label>
+              <div class="flex items-center gap-1 mb-2">
+                <label class="text-xs text-gray-500">{{ t('strategy.limit') }}</label>
+              </div>
               <UInput v-model="proxyPaperParams.limit" type="number" class="w-full" />
+            </div>
+            <div>
+              <div class="flex items-center gap-1 mb-2">
+                <label class="text-xs text-gray-500">{{ t('strategy.stopLoss') }}</label>
+              </div>
+              <UInput v-model="proxyPaperParams.stop_loss" type="number" step="0.01" class="w-full" />
+            </div>
+            <div class="flex items-center justify-between gap-2 py-1">
+              <UCheckbox v-model="proxyPaperParams.enforce_t1" :label="t('strategy.enforceT1')" />
             </div>
           </div>
 
           <div class="pt-2 border-t border-gray-100 dark:border-gray-700 space-y-2">
-            <div class="flex items-center justify-between gap-2">
+            <div class="flex items-center justify-between gap-2 py-1">
+              <UCheckbox v-model="proxyPaperParams.point_in_time_pool" :label="t('strategy.pointInTimePool')" />
+            </div>
+            <div class="flex items-center justify-between gap-2 py-1">
               <UCheckbox v-model="proxyPaperParams.use_latest_available_day" :label="t('strategy.useLatestAvailableDay')" />
             </div>
             <div class="space-y-2">
               <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.walkForwardMaxFolds') }}</label>
+                <div class="flex items-center gap-1 mb-2">
+                  <label class="text-xs text-gray-500">{{ t('strategy.walkForwardMaxFolds') }}</label>
+                </div>
                 <UInput v-model="proxyPaperParams.walk_forward_max_folds" type="number" class="w-full" />
               </div>
               <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.rollingSampleMode') }}</label>
+                <div class="flex items-center gap-1 mb-2">
+                  <label class="text-xs text-gray-500">{{ t('strategy.rollingSampleMode') }}</label>
+                </div>
                 <USelectMenu v-model="proxyPaperParams.rolling_sample_mode" :options="paperRollingSampleModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
               </div>
               <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.rollingStride') }}</label>
+                <div class="flex items-center gap-1 mb-2">
+                  <label class="text-xs text-gray-500">{{ t('strategy.rollingStride') }}</label>
+                </div>
                 <UInput v-model="proxyPaperParams.rolling_stride" type="number" class="w-full" />
               </div>
             </div>
@@ -565,103 +630,177 @@
 
           <div class="pt-2 border-t border-gray-100 dark:border-gray-700 space-y-2">
             <div>
-              <label class="text-xs text-gray-500">{{ t('strategy.sellMode') }}</label>
+              <div class="flex items-center gap-1 mb-2">
+                <label class="text-xs text-gray-500">{{ t('strategy.sellMode') }}</label>
+              </div>
               <USelectMenu v-model="proxyPaperParams.sell_mode" :options="sellModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
               <div class="mt-1 text-xs text-gray-500">{{ paperSellModeHint }}</div>
             </div>
             <div v-if="paperDecisionTimeVisible">
-              <label class="text-xs text-gray-500">{{ t('strategy.t1DecisionTime') }}</label>
-              <UInput v-model="proxyPaperParams.t1_decision_time" :placeholder="t('strategy.t1DecisionTimePlaceholder')" class="w-full" />
+              <div class="flex items-center gap-1">
+                <label class="text-xs text-gray-500">{{ t('strategy.t1DecisionTime') }}</label>
+                <UTooltip :text="t('strategy.t1DecisionTimePlaceholder')">
+                  <UIcon name="i-heroicons-exclamation-circle" class="w-4 h-4 text-gray-400 hover:text-gray-600 cursor-help shrink-0" />
+                </UTooltip>
+              </div>
+              <UInput v-model="proxyPaperParams.t1_decision_time" class="w-full" />
               <div v-if="t1DecisionTimeError" class="mt-1 text-xs text-red-500">{{ t1DecisionTimeError }}</div>
             </div>
             <div v-if="paperGapRollVisible" class="space-y-2 pl-2 border-l-2 border-gray-200 dark:border-gray-700">
               <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.t1GapWeakThreshold') }}</label>
+                <div class="flex items-center gap-1 mb-2">
+                  <label class="text-xs text-gray-500">{{ t('strategy.t1GapWeakThreshold') }}</label>
+                </div>
                 <UInput v-model="proxyPaperParams.t1_gap_weak_threshold" type="number" step="0.001" class="w-full" />
               </div>
               <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.t1GapStrongThreshold') }}</label>
+                <div class="flex items-center gap-1 mb-2">
+                  <label class="text-xs text-gray-500">{{ t('strategy.t1GapStrongThreshold') }}</label>
+                </div>
                 <UInput v-model="proxyPaperParams.t1_gap_strong_threshold" type="number" step="0.001" class="w-full" />
               </div>
               <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.t1GapVeryStrongThreshold') }}</label>
+                <div class="flex items-center gap-1 mb-2">
+                  <label class="text-xs text-gray-500">{{ t('strategy.t1GapVeryStrongThreshold') }}</label>
+                </div>
                 <UInput v-model="proxyPaperParams.t1_gap_very_strong_threshold" type="number" step="0.001" class="w-full" />
               </div>
               <div v-if="t1GapThresholdError" class="text-xs text-red-500">{{ t1GapThresholdError }}</div>
             </div>
           </div>
 
-          <div>
-            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('strategy.pretrainedModelKey') }}</label>
-            <UInput v-model="proxyPaperParams.pretrained_model_key" :placeholder="t('strategy.pretrainedModelKeyPlaceholder')" class="w-full" />
+          <div class="pt-2 border-t border-gray-100 dark:border-gray-700 space-y-2">
+             <div>
+                <div class="flex items-center gap-1 mb-2">
+                  <label class="text-xs text-gray-500">{{ t('strategy.model') }}</label>
+                </div>
+                <USelectMenu v-model="proxyPaperParams.model" :options="['xgboost', 'lightgbm', 'mlp', 'logistic_regression']" class="w-full" />
+             </div>
+             <div>
+                <div class="flex items-center gap-1 mb-2">
+                  <label class="text-xs text-gray-500">{{ t('strategy.pretrainedModelKey') }}</label>
+                  <UTooltip :text="t('strategy.pretrainedModelKeyPlaceholder')">
+                    <UIcon name="i-heroicons-exclamation-circle" class="w-4 h-4 text-gray-400 hover:text-gray-600 cursor-help shrink-0" />
+                  </UTooltip>
+                </div>
+                <UInput v-model="proxyPaperParams.pretrained_model_key" class="w-full" />
+             </div>
+             <div>
+                <div class="flex items-center gap-1 mb-2">
+                  <label class="text-xs text-gray-500">{{ t('strategy.rankMode') }}</label>
+                </div>
+                <USelectMenu v-model="proxyPaperParams.rank_mode" :options="rankModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
+             </div>
+             <div>
+                <div class="flex items-center gap-1 mb-2">
+                  <label class="text-xs text-gray-500">{{ t('strategy.onlyFeatures') }}</label>
+                  <UTooltip :text="t('sidebar.onlyFeaturesHint')">
+                    <UIcon name="i-heroicons-exclamation-circle" class="w-4 h-4 text-gray-400 hover:text-gray-600 cursor-help shrink-0" />
+                  </UTooltip>
+                </div>
+                <UInput v-model="proxyPaperParams.only_features" class="w-full" />
+             </div>
           </div>
 
           <div class="pt-2 border-t border-gray-100 dark:border-gray-700 space-y-2">
             <div class="flex items-center justify-between gap-2">
               <UCheckbox v-model="proxyPaperParams.risk_filter_enabled" :label="t('strategy.riskEnabled')" />
             </div>
-            <div class="space-y-2">
+            <div v-if="proxyPaperParams.risk_filter_enabled" class="space-y-2">
               <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.riskMode') }}</label>
+                <div class="flex items-center gap-1 mb-2">
+                  <label class="text-xs text-gray-500">{{ t('strategy.riskMode') }}</label>
+                </div>
                 <USelectMenu v-model="proxyPaperParams.risk_mode" :options="riskModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
               </div>
               <div>
-                 <label class="text-xs text-gray-500">{{ t('strategy.riskIndexCode') }}</label>
+                 <div class="flex items-center gap-1 mb-2">
+                   <label class="text-xs text-gray-500">{{ t('strategy.riskIndexCode') }}</label>
+                 </div>
                  <USelectMenu v-model="proxyPaperParams.risk_index_code" :searchable="searchIndices" :searchable-placeholder="t('common.typeToSearch')" :loading="searchingIndices" :options="indexOptions" value-attribute="value" option-attribute="label" class="w-full" />
               </div>
               <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.riskGapDownThreshold') }}</label>
+                <div class="flex items-center gap-1 mb-2">
+                  <label class="text-xs text-gray-500">{{ t('strategy.riskGapDownThreshold') }}</label>
+                </div>
                 <UInput v-model="proxyPaperParams.risk_gap_down_threshold" type="number" class="w-full" />
               </div>
               <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.riskDropThreshold') }}</label>
+                <div class="flex items-center gap-1 mb-2">
+                  <label class="text-xs text-gray-500">{{ t('strategy.riskDropThreshold') }}</label>
+                </div>
                 <UInput v-model="proxyPaperParams.risk_drop_threshold" type="number" class="w-full" />
               </div>
               <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.riskFlatDropThreshold') }}</label>
+                <div class="flex items-center gap-1 mb-2">
+                  <label class="text-xs text-gray-500">{{ t('strategy.riskFlatDropThreshold') }}</label>
+                </div>
                 <UInput v-model="proxyPaperParams.risk_flat_drop_threshold" type="number" class="w-full" />
               </div>
               <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.riskDataFailMode') }}</label>
+                <div class="flex items-center gap-1 mb-2">
+                  <label class="text-xs text-gray-500">{{ t('strategy.riskDataFailMode') }}</label>
+                </div>
                 <USelectMenu v-model="proxyPaperParams.risk_data_fail_mode" :options="riskFailModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
               </div>
-            </div>
-            <div class="pt-2 border-t border-gray-100 dark:border-gray-700">
-              <UCheckbox v-model="proxyPaperParams.risk_intraday_enabled" :label="t('strategy.riskIntradayEnabled')" />
-            </div>
-            <div class="space-y-2">
-              <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.riskTrendMaWindow') }}</label>
-                <UInput v-model="proxyPaperParams.risk_trend_ma_window" type="number" class="w-full" />
+              <div class="pt-2 border-t border-gray-100 dark:border-gray-700">
+                <div class="flex items-center justify-between gap-2 py-1">
+                  <UCheckbox v-model="proxyPaperParams.risk_intraday_enabled" :label="t('strategy.riskIntradayEnabled')" />
+                </div>
               </div>
-              <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.riskIntradayBearThreshold') }}</label>
-                <UInput v-model="proxyPaperParams.risk_intraday_bear_threshold" type="number" class="w-full" />
-              </div>
-              <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.riskIntradayBullThreshold') }}</label>
-                <UInput v-model="proxyPaperParams.risk_intraday_bull_threshold" type="number" class="w-full" />
-              </div>
-              <div>
-                <label class="text-xs text-gray-500">{{ t('strategy.riskIntradayDataFailMode') }}</label>
-                <USelectMenu v-model="proxyPaperParams.risk_intraday_data_fail_mode" :options="riskFailModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
+
+              <div v-if="proxyPaperParams.risk_intraday_enabled" class="space-y-2">
+                <div>
+                  <div class="flex items-center gap-1 mb-2">
+                    <label class="text-xs text-gray-500">{{ t('strategy.riskTrendMaWindow') }}</label>
+                  </div>
+                  <UInput v-model="proxyPaperParams.risk_trend_ma_window" type="number" class="w-full" />
+                </div>
+                <div>
+                  <div class="flex items-center gap-1 mb-2">
+                    <label class="text-xs text-gray-500">{{ t('strategy.riskIntradayBearThreshold') }}</label>
+                  </div>
+                  <UInput v-model="proxyPaperParams.risk_intraday_bear_threshold" type="number" class="w-full" />
+                </div>
+                <div>
+                  <div class="flex items-center gap-1 mb-2">
+                    <label class="text-xs text-gray-500">{{ t('strategy.riskIntradayBullThreshold') }}</label>
+                  </div>
+                  <UInput v-model="proxyPaperParams.risk_intraday_bull_threshold" type="number" class="w-full" />
+                </div>
+                <div>
+                  <div class="flex items-center gap-1 mb-2">
+                    <label class="text-xs text-gray-500">{{ t('strategy.riskIntradayDataFailMode') }}</label>
+                  </div>
+                  <USelectMenu v-model="proxyPaperParams.risk_intraday_data_fail_mode" :options="riskFailModeOptions" value-attribute="value" option-attribute="label" class="w-full" />
+                </div>
               </div>
             </div>
           </div>
-        </div>
 
-        <div class="pt-2 border-t border-gray-100 dark:border-gray-800 space-y-2">
-          <div class="text-xs text-gray-500">{{ t('portfolio.backtestConfigManage') }}</div>
-          <div class="grid grid-cols-2 gap-2">
-            <UButton size="xs" color="gray" variant="soft" @click="openBacktestSave">{{ t('portfolio.saveConfig') }}</UButton>
-            <UButton size="xs" color="gray" variant="soft" @click="openBacktestLoad">{{ t('portfolio.loadConfig') }}</UButton>
-            <UButton size="xs" color="gray" variant="soft" @click="openBacktestExport">{{ t('portfolio.exportConfig') }}</UButton>
-            <UButton size="xs" color="gray" variant="soft" @click="openBacktestImport">{{ t('portfolio.importConfig') }}</UButton>
+          <div class="space-y-2 pb-2 border-b border-gray-100 dark:border-gray-700">
+             <div class="flex items-center justify-between gap-2 py-1">
+                <UCheckbox v-model="proxyPaperParams.index_filter_enabled" :label="t('strategy.indexFilterEnabled')" />
+             </div>
+             <div v-if="proxyPaperParams.index_filter_enabled" class="space-y-2">
+                 <div>
+                    <div class="flex items-center gap-1 mb-2">
+                      <label class="text-xs text-gray-500">{{ t('strategy.indexCode') }}</label>
+                    </div>
+                    <USelectMenu v-model="computedPaperIndexCode" :searchable="searchIndices" :searchable-placeholder="t('common.typeToSearch')" :loading="searchingIndices" :options="indexOptions" value-attribute="value" option-attribute="label" class="w-full" />
+                 </div>
+                 <div>
+                    <div class="flex items-center gap-1 mb-2">
+                      <label class="text-xs text-gray-500">{{ t('strategy.indexMaWindow') }}</label>
+                    </div>
+                    <UInput v-model="proxyPaperParams.index_ma_window" type="number" class="w-full" />
+                 </div>
+             </div>
           </div>
         </div>
 
         <div class="pt-4 border-t border-gray-100 dark:border-gray-800 space-y-2 pb-4">
-          <UButton block color="primary" :disabled="loading || backtestLoading" :loading="backtestLoading" @click="$emit('runBacktest')">{{ t('portfolio.runBacktest') }}</UButton>
+          <UButton block color="primary" :disabled="loading || backtestLoading || backtestRunDisabled" :loading="backtestLoading" @click="$emit('runBacktest')">{{ t('portfolio.runBacktest') }}</UButton>
           <UButton block color="gray" variant="soft" :disabled="paperRunDisabled" @click="$emit('runPaperStep')">{{ t('portfolio.runPaperDirect') }}</UButton>
         </div>
       </div>
@@ -743,7 +882,16 @@
             <div class="flex items-center gap-1 mb-2">
               <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.scope') }}</label>
             </div>
-            <USelectMenu v-model="proxyStrategyForm.pool_id" :options="poolOptions" value-attribute="value" option-attribute="label" class="w-full" />
+            <USelectMenu v-model="proxyStrategyForm.pool_id" :searchable="searchStockPools" :searchable-placeholder="t('common.typeToSearch')" :loading="searchingStockPools" :options="poolOptions" value-attribute="value" option-attribute="label" class="w-full" />
+          </div>
+
+          <!-- Manual Codes -->
+          <div>
+            <div class="flex items-center gap-1 mb-2">
+              <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.manualCodes') }}</label>
+            </div>
+            <textarea v-model="proxyStrategyForm.manual_codes" :placeholder="t('strategy.manualCodesPlaceholder')" class="w-full h-24 p-2 text-xs font-mono border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900"></textarea>
+            <div class="text-xs text-gray-500 mt-1">{{ t('strategy.manualCodesHint') }}</div>
           </div>
 
           <!-- Index Code -->
@@ -1246,6 +1394,18 @@ const t1GapThresholdError = computed(() => {
   return veryStrong < strong ? t('strategy.t1GapThresholdInvalid') : ''
 })
 
+const backtestDateRangeError = computed(() => {
+  const s = String(proxyPaperConfig.value?.start_date || '').trim()
+  const e = String(proxyPaperConfig.value?.end_date || '').trim()
+  if (s && e && s > e) return t('portfolio.dateRangeInvalid')
+  return ''
+})
+
+const backtestRunDisabled = computed(() => {
+  if (props.activeTab !== 'backtest') return false
+  return !!backtestDateRangeError.value
+})
+
 const paperRunDisabled = computed(() => {
   if (props.activeTab !== 'backtest') return false
   return !!t1DecisionTimeError.value || !!t1GapThresholdError.value
@@ -1524,6 +1684,88 @@ const poolOptions = ref([{label: 'HS300', value: 'hs300'}])
 const poolMembersLoading = ref(false)
 const poolMetaLabel = ref('')
 
+const searchingStockPools = ref(false)
+const STOCK_POOLS_CACHE_KEY = 'mlchan_stock_pools_cache_v1'
+const STOCK_POOLS_CACHE_MAX = 200
+
+const loadStockPoolsCache = () => {
+  try {
+    if (typeof window === 'undefined') return []
+    const raw = localStorage.getItem(STOCK_POOLS_CACHE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    const cleaned = parsed
+      .map(x => ({
+        value: String(x?.value || x?.pool_id || '').trim(),
+        label: String(x?.label || '').trim(),
+        name: String(x?.name || '').trim()
+      }))
+      .filter(x => x.value)
+      .map(x => ({
+        value: x.value,
+        name: x.name || x.value,
+        label: x.label || `${x.name || x.value} (${x.value})`
+      }))
+    return cleaned.slice(0, STOCK_POOLS_CACHE_MAX)
+  } catch (e) {
+    return []
+  }
+}
+
+const persistStockPoolsCache = (items) => {
+  try {
+    if (typeof window === 'undefined') return
+    const arr = (items || [])
+      .map(x => ({
+        value: String(x?.value || '').trim(),
+        label: String(x?.label || '').trim(),
+        name: String(x?.name || '').trim()
+      }))
+      .filter(x => x.value)
+    localStorage.setItem(STOCK_POOLS_CACHE_KEY, JSON.stringify(arr.slice(0, STOCK_POOLS_CACHE_MAX)))
+  } catch (e) {
+  }
+}
+
+const ensureStockPoolOption = (poolId) => {
+  const cur = String(poolId || '').trim()
+  if (!cur) return
+  if ((poolOptions.value || []).find(x => x.value === cur)) return
+  poolOptions.value = [{ label: `${cur} (${cur})`, value: cur, name: cur }, ...(poolOptions.value || [])].slice(0, STOCK_POOLS_CACHE_MAX)
+  persistStockPoolsCache(poolOptions.value)
+}
+
+const searchStockPools = async (query) => {
+  const q = String(query || '').trim()
+  if (!q) return poolOptions.value
+  searchingStockPools.value = true
+  try {
+    const res = await axios.get('/api/stock_pools', { params: { limit: 100, keyword: q } })
+    const items = (res.data?.items || []).map(p => ({
+      label: `${p.pool_name} (${p.stock_count})`,
+      value: p.pool_id,
+      name: p.pool_name
+    }))
+    const merged = [...items, ...(poolOptions.value || [])]
+    const seen = new Set()
+    const uniq = []
+    for (const it of merged) {
+      const v = String(it?.value || '').trim()
+      if (!v || seen.has(v)) continue
+      seen.add(v)
+      uniq.push(it)
+    }
+    poolOptions.value = uniq.slice(0, STOCK_POOLS_CACHE_MAX)
+    persistStockPoolsCache(poolOptions.value)
+    return items
+  } catch (e) {
+    return []
+  } finally {
+    searchingStockPools.value = false
+  }
+}
+
 const indexOptions = ref([])
 const INDEX_OPTIONS_CACHE_KEY = 'mlchan_index_options_cache_v1'
 const INDEX_OPTIONS_CACHE_MAX = 200
@@ -1590,7 +1832,7 @@ const frequencyOptions = computed(() => [
 const dataSrcOptions = computed(() => [
   { label: t('app.dataSrcOptions.clickhouse'), value: 'clickhouse' },
   { label: t('app.dataSrcOptions.baostock'), value: 'baostock' },
-  { label: t('app.dataSrcOptions.akshare'), value: 'akshare' }
+  { label: t('app.dataSrcOptions.tdx'), value: 'tdx' }
 ])
 
 const modelOptions = computed(() => [
@@ -1644,7 +1886,18 @@ onMounted(async () => {
     // But for now let's keep it simple.
     // If StrategyPanel fetches it, maybe app.vue should fetch and pass down?
     // Let's self-fetch for independence
+    const cachedPools = loadStockPoolsCache()
+    if (cachedPools.length > 0) {
+      poolOptions.value = cachedPools
+      ensureStockPoolOption('index:IDX399673')
+      ensureStockPoolOption(proxyStrategyForm.value?.pool_id)
+      ensureStockPoolOption(proxyPaperConfig.value?.pool_id)
+      ensureStockPoolOption(proxyPretrainConfig.value?.selectedPoolId)
+    }
     try {
+        if (poolOptions.value.length === 0) {
+          searchingStockPools.value = true
+        }
         const res = await axios.get('/api/stock_pools')
         if (res.data && res.data.items) {
             poolOptions.value = res.data.items.map(p => ({
@@ -1655,6 +1908,7 @@ onMounted(async () => {
             if (!poolOptions.value.find(x => x.value === 'index:IDX399673')) {
               poolOptions.value.unshift({ label: '创业板50 (50)', value: 'index:IDX399673', name: '创业板50' })
             }
+            persistStockPoolsCache(poolOptions.value)
             // Default to first option if not set
             if (!proxyStrategyForm.value.pool_id && poolOptions.value.length > 0) {
                 proxyStrategyForm.value.pool_id = poolOptions.value[0].value
@@ -1665,6 +1919,8 @@ onMounted(async () => {
         }
     } catch (e) {
         // ignore
+    } finally {
+        searchingStockPools.value = false
     }
 
     // Load persisted index code
@@ -1731,6 +1987,14 @@ const computedIndexCode = computed({
     }
 })
 
+const computedPaperIndexCode = computed({
+    get: () => proxyPaperParams.value.index_code,
+    set: (val) => {
+        const newParams = { ...proxyPaperParams.value, index_code: val }
+        emit('update:paperParams', newParams)
+    }
+})
+
 const searchIndices = async (query) => {
     if (!query) return indexOptions.value
     searchingIndices.value = true
@@ -1769,6 +2033,10 @@ watch(() => proxyStrategyForm.value.index_code, (val) => {
 }, { deep: true })
 
 watch(() => proxyPaperParams.value?.risk_index_code, (val) => {
+    ensureIndexOption(val)
+}, { deep: true })
+
+watch(() => proxyPaperParams.value?.index_code, (val) => {
     ensureIndexOption(val)
 }, { deep: true })
 
