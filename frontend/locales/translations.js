@@ -392,6 +392,7 @@ export const translations = {
             totalCost: "持仓成本",
             pretrainedModelKey: "预训练模型Key（可选）",
             pretrainedModelKeyPlaceholder: "留空则自动选择最新的横截面Rank逻辑回归模型",
+            trainOnFly: "无预训练则在线训练",
             rankMode: "Rank模式",
             onlyFeatures: "仅使用特征"
         },
@@ -405,6 +406,7 @@ export const translations = {
             code: "代码",
             stockName: "名称",
             volume: "持仓量",
+            lots: "持仓手数",
             avgPrice: "成本均价",
             currentPrice: "现价",
             marketValue: "市值",
@@ -1210,6 +1212,7 @@ export const translations = {
             totalCost: "Cost",
             pretrainedModelKey: "Pretrained Model Key (Optional)",
             pretrainedModelKeyPlaceholder: "Leave empty to auto pick latest cross-sectional rank LR model",
+            trainOnFly: "Train on fly if no pretrained",
             rankMode: "Rank Mode",
             onlyFeatures: "Only Features (comma sep)"
         },
@@ -1223,6 +1226,7 @@ export const translations = {
             code: "Code",
             stockName: "Name",
             volume: "Volume",
+            lots: "Lots",
             avgPrice: "Avg Price",
             currentPrice: "Current",
             marketValue: "Value",

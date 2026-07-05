@@ -106,12 +106,75 @@
 
     <!-- Paper Trade Mode -->
     <div v-else-if="mode === 'paper'" class="flex-1 min-h-0 flex flex-col overflow-y-auto p-6">
+        <div v-if="lastBacktestToShow" class="mb-4">
+          <div class="flex items-center justify-between gap-2 mb-2">
+            <div class="text-xs text-gray-500">
+              上一次回测结果
+              <span v-if="lastBacktestToShow?.meta?.time" class="text-gray-400">· {{ lastBacktestToShow.meta.time }}</span>
+              <span v-if="lastBacktestToShow?.meta?.kind" class="text-gray-400">· {{ lastBacktestToShow.meta.kind }}</span>
+            </div>
+            <UButton size="xs" color="gray" variant="soft" @click="showLastBacktest = !showLastBacktest">
+              {{ showLastBacktest ? '收起' : '展开' }}
+            </UButton>
+          </div>
+          <div v-if="showLastBacktest">
+            <div class="grid grid-cols-4 gap-4">
+              <UCard>
+                <div class="text-xs text-gray-500">{{ t('portfolio.totalReturn') }}</div>
+                <div class="mt-1 font-mono text-sm" :class="getColor(lastBacktestToShow.metrics.total_return)">
+                  {{ (Number(lastBacktestToShow.metrics.total_return || 0) * 100).toFixed(2) }}%
+                </div>
+              </UCard>
+              <UCard>
+                <div class="text-xs text-gray-500">{{ t('portfolio.sharpe') }}</div>
+                <div class="mt-1 font-mono text-sm">{{ Number(lastBacktestToShow.metrics.sharpe_ratio || 0).toFixed(2) }}</div>
+              </UCard>
+              <UCard>
+                <div class="text-xs text-gray-500">{{ t('portfolio.maxDD') }}</div>
+                <div class="mt-1 font-mono text-sm text-red-500">{{ (Number(lastBacktestToShow.metrics.max_drawdown || 0) * 100).toFixed(2) }}%</div>
+              </UCard>
+              <UCard>
+                <div class="text-xs text-gray-500">{{ t('portfolio.finalEquity') }}</div>
+                <div class="mt-1 font-mono text-sm">{{ Number(lastBacktestToShow.metrics.final_equity || 1).toFixed(4) }}</div>
+              </UCard>
+            </div>
+
+            <div v-if="lastBacktestTradeRows.length" class="mt-3">
+              <UCard>
+                <template #header>
+                  <div class="text-xs text-gray-500">最近交易（回测）</div>
+                </template>
+                <UTable :rows="lastBacktestTradeRows" :columns="lastBacktestTradeColumns" class="w-full" :ui="{ th: { base: 'sticky top-0 bg-gray-50 dark:bg-gray-900 z-10' } }" />
+              </UCard>
+            </div>
+          </div>
+        </div>
+
         <div v-if="stepError" class="mb-2 text-xs text-red-500 break-all">{{ stepError }}</div>
         <div v-if="stepResult" class="mb-2 text-xs text-gray-500 break-all">
           {{ t('strategy.stepMeta', { day: stepResult.day, ts: stepResult.ts }) }} · {{ formatTs(stepResult.ts) }} · model={{ stepResult.model_key || '-' }} · rank={{ stepResult.rank_mode || '-' }} · {{ t('strategy.marketStatus') }}={{ stepResult.market_open ? t('strategy.marketOpen') : t('strategy.marketClosed') }}
         </div>
         <div v-if="stepResult?.risk" class="mb-4 text-xs text-gray-500 break-all">
-          {{ t('strategy.risk') }}={{ stepResult.risk.level || '-' }} · topN={{ stepResult.risk.effective_top_n ?? '-' }} · gap={{ stepResult.risk.gap_open_pct === null || stepResult.risk.gap_open_pct === undefined ? '-' : formatPct(stepResult.risk.gap_open_pct) }} · d1={{ stepResult.risk.ret1d === null || stepResult.risk.ret1d === undefined ? '-' : formatPct(stepResult.risk.ret1d) }} · atr={{ stepResult.risk.atr_pct === null || stepResult.risk.atr_pct === undefined ? '-' : formatPct(stepResult.risk.atr_pct) }} · in={{ stepResult.risk.intraday?.change === null || stepResult.risk.intraday?.change === undefined ? '-' : formatPct(stepResult.risk.intraday.change) }} · trend={{ stepResult.risk.intraday?.trend || '-' }}
+          {{ t('strategy.risk') }}={{ stepResult.risk.level || '-' }} · topN={{ stepResult.risk.effective_top_n ?? '-' }} · gap={{ stepResult.risk.gap_open_pct === null || stepResult.risk.gap_open_pct === undefined ? '-' : formatPct(stepResult.risk.gap_open_pct) }} · d1={{ stepResult.risk.ret1d === null || stepResult.risk.ret1d === undefined ? '-' : formatPct(stepResult.risk.ret1d) }} · atr={{ stepResult.risk.atr_pct === null || stepResult.risk.atr_pct === undefined ? '-' : formatPct(stepResult.risk.atr_pct) }} · in={{ stepResult.risk.intraday?.change === null || stepResult.risk.intraday?.change === undefined ? '-' : formatPct(stepResult.risk.intraday.change) }} · trend={{ stepResult.risk.intraday?.trend || '-' }}<span v-if="stepResult.risk.reason" class="text-gray-400"> · reason={{ stepResult.risk.reason }}</span>
+        </div>
+
+        <div v-if="shouldShowNoPickReason" class="mb-4">
+          <UCard>
+            <template #header>
+              <div class="text-xs text-gray-500">本次未选出符合条件的股票（原因）</div>
+            </template>
+            <div class="text-xs text-gray-600 dark:text-gray-300 space-y-1">
+              <div v-for="(line, idx) in noPickReasonLines" :key="idx" class="font-mono break-all">{{ line }}</div>
+              <div v-if="!noPickReasonLines.length" class="text-gray-400">-</div>
+            </div>
+            <div v-if="noPickTop10.length" class="mt-3">
+              <div class="text-xs text-gray-500 mb-1">Top10 候选</div>
+              <div v-for="c in noPickTop10" :key="c.code" class="text-xs font-mono">
+                {{ c.rank }}. {{ c.code }} · {{ Number(c.prob).toFixed(4) }} · {{ c.pass_min_prob ? 'pass' : 'fail' }}
+                <span v-if="c.action" class="text-gray-500"> · {{ c.action }}</span>
+              </div>
+            </div>
+          </UCard>
         </div>
 
         <div>
@@ -410,7 +473,7 @@
             color="primary"
             :disabled="!backtestConfirmed"
             :loading="paperRunFromBacktestLoading"
-            @click="runPaperFromBacktest"
+            @click="openRunPaperFromBacktest"
           >
             {{ t('portfolio.runPaperFromBacktest') }}
           </UButton>
@@ -452,6 +515,25 @@
           <div class="flex justify-end gap-2">
             <UButton color="gray" variant="ghost" @click="showAddPosModal = false">{{ t('portfolio.cancel') }}</UButton>
             <UButton color="primary" @click="addPosition">{{ t('portfolio.add') }}</UButton>
+          </div>
+        </template>
+      </UCard>
+    </UModal>
+
+    <UModal v-model="paperRunFromBacktestConfirmOpen">
+      <UCard :ui="{ body: { padding: 'p-4' } }">
+        <div class="text-sm font-medium text-gray-700 dark:text-gray-200 mb-3">{{ t('portfolio.runPaperFromBacktest') }}</div>
+        <div class="space-y-2">
+          <div class="flex items-center justify-between gap-2">
+            <UCheckbox v-model="paperRunFromBacktestTrainOnFly" :label="t('strategy.trainOnFly')" />
+          </div>
+        </div>
+        <template #footer>
+          <div class="flex justify-end gap-2">
+            <UButton color="gray" variant="ghost" @click="paperRunFromBacktestConfirmOpen = false">{{ t('app.cancel') }}</UButton>
+            <UButton color="primary" :disabled="!backtestConfirmed" :loading="paperRunFromBacktestLoading" @click="confirmRunPaperFromBacktest">
+              {{ t('portfolio.runPaperFromBacktest') }}
+            </UButton>
           </div>
         </template>
       </UCard>
@@ -578,6 +660,8 @@ const backtestConfirmed = ref(false)
 const lastBacktestPaperConfig = ref(null)
 const lastBacktestPaperParams = ref(null)
 const paperRunFromBacktestLoading = ref(false)
+const paperRunFromBacktestConfirmOpen = ref(false)
+const paperRunFromBacktestTrainOnFly = ref(false)
 
 const currentBacktestResult = computed(() => {
   return backtestKind.value === 'vector' ? vectorBacktestResult.value : wolfpackBacktestResult.value
@@ -825,7 +909,10 @@ const stepResult = ref(null)
 const showSelectionDebug = ref(false)
 
 watch(stepResult, () => {
-  showSelectionDebug.value = false
+  const sr = stepResult.value
+  const noTargets = !Array.isArray(sr?.targets) || sr.targets.length === 0
+  const noBuys = !Array.isArray(sr?.buy) || sr.buy.length === 0
+  showSelectionDebug.value = !!sr && noTargets && noBuys
 })
 
 const selectionDebug = computed(() => {
@@ -863,6 +950,95 @@ const selectionDebugBuyReasonItems = computed(() => {
   } catch (e) {
     return Object.entries(obj)
   }
+})
+
+const showLastBacktest = ref(false)
+const lastBacktestPersisted = ref(null)
+
+const lastBacktestToShow = computed(() => {
+  const cur = currentBacktestResult.value
+  if (cur && cur.metrics && cur.equity_curve) {
+    return {
+      meta: { time: formatIsoDate(new Date()), kind: backtestKind.value || '' },
+      metrics: cur.metrics,
+      trade_logs: cur.trade_logs || []
+    }
+  }
+  const p = lastBacktestPersisted.value
+  if (!p || typeof p !== 'object') return null
+  if (!p.metrics || typeof p.metrics !== 'object') return null
+  return p
+})
+
+const lastBacktestTradeRows = computed(() => {
+  const logs = lastBacktestToShow.value?.trade_logs
+  const arr = Array.isArray(logs) ? logs : []
+  const rows = []
+  const tail = arr.slice(Math.max(0, arr.length - 20))
+  for (const it of tail) {
+    if (!it || typeof it !== 'object') continue
+    rows.push({
+      time: String(it.time || it.day || ''),
+      side: String(it.side || ''),
+      code: String(it.code || ''),
+      price: it.price,
+      prob: it.prob,
+      pnl_pct: it.pnl_pct,
+      reason: it.reason
+    })
+  }
+  return rows
+})
+
+const lastBacktestTradeColumns = computed(() => ([
+  { key: 'time', label: t('strategy.timeHuman') },
+  { key: 'side', label: t('strategy.side') },
+  { key: 'code', label: t('sidebar.stockCode') },
+  { key: 'price', label: t('strategy.price') },
+  { key: 'prob', label: 'prob' },
+  { key: 'pnl_pct', label: t('strategy.positionReturn') },
+  { key: 'reason', label: t('strategy.reason') }
+]))
+
+const shouldShowNoPickReason = computed(() => {
+  const sr = stepResult.value
+  if (!sr || typeof sr !== 'object') return false
+  const noTargets = !Array.isArray(sr.targets) || sr.targets.length === 0
+  const noBuys = !Array.isArray(sr.buy) || sr.buy.length === 0
+  return noTargets && noBuys
+})
+
+const noPickReasonLines = computed(() => {
+  const sr = stepResult.value
+  const sd = selectionDebug.value
+  const out = []
+  if (!sr || !sd) return out
+
+  const minProb = sd.min_prob
+  const scanned = sd?.counts?.scanned
+  const todaysRaw = sd?.counts?.todays_raw
+  const pass = sd?.counts?.todays_pass_min_prob
+  const riskLevel = sd?.risk_level
+  const riskReason = sr?.risk?.reason
+
+  if (Number.isFinite(Number(scanned))) out.push(`scanned=${Number(scanned)}`)
+  if (Number.isFinite(Number(todaysRaw))) out.push(`todays_raw=${Number(todaysRaw)}`)
+  if (Number.isFinite(Number(pass))) out.push(`todays_pass_min_prob=${Number(pass)} (minProb=${minProb ?? '-'})`)
+  if (riskLevel) out.push(`risk_level=${riskLevel}`)
+  if (riskReason) out.push(`risk_reason=${riskReason}`)
+
+  if (Number(scanned) === 0) out.push('可能原因：股票池为空 / 数据源无数据 / 扫描阶段失败')
+  else if (Number(todaysRaw) === 0) out.push('可能原因：今日（或最近可用交易日）没有产生信号')
+  else if (Number(pass) === 0) out.push('可能原因：候选全部低于 minProb 门槛')
+  else if (String(riskLevel) === 'flat') out.push('可能原因：风控为 flat（清仓/不新开仓）')
+
+  return out
+})
+
+const noPickTop10 = computed(() => {
+  const arr = selectionDebug.value?.candidates_top
+  const all = Array.isArray(arr) ? arr : []
+  return all.slice(0, 10)
 })
 
 const runsLoading = ref(false)
@@ -969,10 +1145,13 @@ const tradeTotalPages = computed(() => {
 const positionColumns = computed(() => ([
   { key: 'stock_code', label: t('sidebar.stockCode') },
   { key: 'stock_name', label: t('portfolio.stockName') },
+  { key: 'volume', label: t('portfolio.volume') },
+  { key: 'lots_text', label: t('portfolio.lots') },
   { key: 'bars_held', label: t('strategy.barsHeld') },
   { key: 'entry_time_text', label: t('strategy.entryTime') },
   { key: 'entry_price_text', label: t('strategy.entryPrice') },
   { key: 'current_price_text', label: t('strategy.currentPrice') },
+  { key: 'market_value_text', label: t('portfolio.marketValue') },
   { key: 'pnl_pct_text', label: t('strategy.positionReturn') }
 ]))
 
@@ -1447,6 +1626,19 @@ const runWolfpackBacktest = async () => {
       equity_curve: curve,
       trade_logs: tradeLogs
     }
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        const snap = {
+          meta: { time: formatIsoDate(new Date()), kind: 'wolfpack' },
+          metrics: wolfpackBacktestResult.value.metrics,
+          trade_logs: (wolfpackBacktestResult.value.trade_logs || []).slice(Math.max(0, (wolfpackBacktestResult.value.trade_logs || []).length - 300))
+        }
+        window.localStorage.setItem('mlchan_last_backtest_snapshot', JSON.stringify(snap))
+        lastBacktestPersisted.value = snap
+        showLastBacktest.value = true
+      }
+    } catch (e) {
+    }
     lastBacktestPaperConfig.value = { ...(props.paperConfig || {}) }
     lastBacktestPaperParams.value = { ...(props.paperParams || {}) }
     backtestConfirmed.value = false
@@ -1480,7 +1672,18 @@ const buildLiveParams = (paperCfg, paperPrm, sid) => {
   })
 }
 
-const runPaperFromBacktest = async () => {
+const openRunPaperFromBacktest = () => {
+  const snapPrm = lastBacktestPaperParams.value || props.paperParams || {}
+  paperRunFromBacktestTrainOnFly.value = !!snapPrm?.train_on_fly
+  paperRunFromBacktestConfirmOpen.value = true
+}
+
+const confirmRunPaperFromBacktest = async () => {
+  paperRunFromBacktestConfirmOpen.value = false
+  await runPaperFromBacktest({ train_on_fly: paperRunFromBacktestTrainOnFly.value })
+}
+
+const runPaperFromBacktest = async ({ train_on_fly } = {}) => {
   if (!currentBacktestResult.value) return
   if (!backtestConfirmed.value) return
   paperRunFromBacktestLoading.value = true
@@ -1490,6 +1693,7 @@ const runPaperFromBacktest = async () => {
 
     const sid = resolveRunSimId(props.backtestSimId)
     const params = buildLiveParams(snapCfg, snapPrm, sid)
+    if (train_on_fly !== undefined) params.train_on_fly = !!train_on_fly
     const notifyEnabled = !!props.paperRunForm?.notify_enabled
     const notifyMode = String(props.paperRunForm?.notify_mode || 'dingtalk')
     const enableDingtalk = notifyEnabled && (notifyMode === 'dingtalk' || notifyMode === 'both')
@@ -1566,11 +1770,17 @@ const loadPositions = async () => {
       const entryPx = Number(p?.entry_price || 0)
       const curPx = Number(p?.current_price || 0)
       const pnlPct = Number(p?.pnl_pct || 0)
+      const mv = Number(p?.market_value || (curPx * Number(p?.volume || 0)))
+      const vol = Number(p?.volume || 0)
+      const lots = Number.isFinite(vol) ? (vol / 100) : 0
+      const lotsText = Number.isFinite(lots) ? (Number.isInteger(lots) ? String(lots) : lots.toFixed(2)) : '-'
       return {
         ...p,
         entry_time_text: formatTs(entry),
         entry_price_text: Number.isFinite(entryPx) ? entryPx.toFixed(4) : '-',
         current_price_text: Number.isFinite(curPx) ? curPx.toFixed(4) : '-',
+        market_value_text: Number.isFinite(mv) ? mv.toFixed(2) : '-',
+        lots_text: lotsText,
         pnl_pct_text: formatPct(pnlPct)
       }
     })
@@ -2086,6 +2296,16 @@ defineExpose({
 })
 
 onMounted(() => {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const raw = window.localStorage.getItem('mlchan_last_backtest_snapshot')
+      if (raw) {
+        const obj = JSON.parse(raw)
+        if (obj && typeof obj === 'object') lastBacktestPersisted.value = obj
+      }
+    }
+  } catch (e) {
+  }
   fetchPortfolios()
   // Fetch stock pool options
   axios.get('/api/stock_pools').then(res => {

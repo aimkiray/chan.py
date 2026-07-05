@@ -696,6 +696,27 @@ class StorageManager:
                 row.updated_at = now
                 session.commit()
 
+    def update_live_sim_initial_capital(self, sim_id: str, initial_capital: float, reset_balance: bool = True):
+        sid = _normalize_sim_id(sim_id)
+        now = datetime.datetime.utcnow()
+        try:
+            cap = float(initial_capital)
+        except Exception:
+            cap = None
+        if cap is None or cap <= 0:
+            return
+        with self.Session() as session:
+            row = session.query(LiveSim).filter(LiveSim.sim_id == sid).first()
+            if row is None:
+                row = LiveSim(sim_id=sid)
+                session.add(row)
+                row.created_at = now
+            row.initial_capital = float(cap)
+            if reset_balance:
+                row.balance = float(cap)
+            row.updated_at = now
+            session.commit()
+
 
     def increment_bars_held(self, inc: int = 1, sim_id: str = None, portfolio_id: int = None):
         now = datetime.datetime.utcnow().isoformat() + "Z"
@@ -1429,6 +1450,50 @@ class StorageManager:
                     "created_at": _dt_to_utc_iso(r.created_at),
                 })
             return {"items": items, "total": int(total), "page": int(p), "page_size": int(ps)}
+
+    def list_live_step_results(
+        self,
+        sim_id: str = None,
+        run_id: str = None,
+        portfolio_id: int = None,
+        limit: int = 2000,
+    ) -> list:
+        sid = _normalize_sim_id(sim_id) if sim_id is not None else None
+        rid = str(run_id or "").strip() if run_id is not None else None
+        pid = _normalize_portfolio_id(portfolio_id)
+        try:
+            lim = int(limit or 2000)
+        except Exception:
+            lim = 2000
+        lim = max(1, min(lim, 2000))
+        with self.Session() as session:
+            q = session.query(LiveStepRecord)
+            if pid is not None:
+                q = q.filter(LiveStepRecord.portfolio_id == pid)
+            if sid is not None:
+                q = q.filter(LiveStepRecord.sim_id == sid)
+            if rid:
+                q = q.filter(LiveStepRecord.run_id == rid)
+            q = q.order_by(LiveStepRecord.step_ts.desc(), LiveStepRecord.id.desc())
+            rows = q.limit(lim).all()
+            items = []
+            for r in rows or []:
+                result = None
+                if r.result_json:
+                    try:
+                        result = json.loads(r.result_json)
+                    except Exception:
+                        result = None
+                items.append({
+                    "id": int(r.id),
+                    "sim_id": str(r.sim_id or ""),
+                    "portfolio_id": int(r.portfolio_id or 0) or None,
+                    "run_id": str(r.run_id or ""),
+                    "step_ts": int(r.step_ts or 0),
+                    "day": int(r.day or 0),
+                    "result": result if isinstance(result, dict) else None,
+                })
+            return items
 
     def clear_live_steps(self, sim_id: str = None, portfolio_id: int = None):
         sid = _normalize_sim_id(sim_id) if sim_id is not None else None

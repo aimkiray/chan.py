@@ -685,6 +685,9 @@
                 </div>
                 <UInput v-model="proxyPaperParams.pretrained_model_key" class="w-full" />
              </div>
+             <div class="flex items-center justify-between gap-2 py-1">
+               <UCheckbox v-model="proxyPaperParams.train_on_fly" :label="t('strategy.trainOnFly')" />
+             </div>
              <div>
                 <div class="flex items-center gap-1 mb-2">
                   <label class="text-xs text-gray-500">{{ t('strategy.rankMode') }}</label>
@@ -801,7 +804,7 @@
 
         <div class="pt-4 border-t border-gray-100 dark:border-gray-800 space-y-2 pb-4">
           <UButton block color="primary" :disabled="loading || backtestLoading || backtestRunDisabled" :loading="backtestLoading" @click="$emit('runBacktest')">{{ t('portfolio.runBacktest') }}</UButton>
-          <UButton block color="gray" variant="soft" :disabled="paperRunDisabled" @click="$emit('runPaperStep')">{{ t('portfolio.runPaperDirect') }}</UButton>
+          <UButton block color="gray" variant="soft" :disabled="paperRunDisabled" @click="openPaperStepModal">{{ t('portfolio.runPaperDirect') }}</UButton>
         </div>
       </div>
 
@@ -1060,6 +1063,23 @@
             {{ t('portfolio.apply') }}
           </UButton>
         </div>
+      </UCard>
+    </UModal>
+
+    <UModal v-model="paperStepModalOpen">
+      <UCard :ui="{ body: { padding: 'p-4' } }">
+        <div class="text-sm font-medium text-gray-700 dark:text-gray-200 mb-3">{{ t('portfolio.runPaperDirect') }}</div>
+        <div class="space-y-2">
+          <div class="flex items-center justify-between gap-2">
+            <UCheckbox v-model="proxyPaperParams.train_on_fly" :label="t('strategy.trainOnFly')" />
+          </div>
+        </div>
+        <template #footer>
+          <div class="flex justify-end gap-2">
+            <UButton size="sm" color="gray" variant="ghost" @click="paperStepModalOpen = false">{{ t('app.cancel') }}</UButton>
+            <UButton size="sm" color="primary" :disabled="paperRunDisabled" @click="confirmPaperStep">{{ t('portfolio.runPaperDirect') }}</UButton>
+          </div>
+        </template>
       </UCard>
     </UModal>
   </div>
@@ -1424,6 +1444,15 @@ const backtestImportText = ref('')
 const backtestImportLoading = ref(false)
 const backtestPresetsLoading = ref(false)
 const backtestPresetItems = ref([])
+
+const paperStepModalOpen = ref(false)
+const openPaperStepModal = () => {
+  paperStepModalOpen.value = true
+}
+const confirmPaperStep = () => {
+  paperStepModalOpen.value = false
+  emit('runPaperStep')
+}
 
 const backtestPresetOptions = computed(() => {
   const items = Array.isArray(backtestPresetItems.value) ? backtestPresetItems.value : []

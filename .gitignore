@@ -30,6 +30,10 @@ frontend/dist/
 frontend/.nuxt/
 frontend/.cache/
 frontend/.output/
+
+# Others
 backend/model_cache/
 mlchan_deploy/
 mlchan_deploy_old/
+.trae/
+debug_*

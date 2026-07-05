@@ -579,6 +579,7 @@ const paperParams = ref({
   point_in_time_pool: true,
   use_latest_available_day: true,
   pretrained_model_key: '',
+  train_on_fly: false,
   rank_mode: 'cross_section',
   rolling_sample_mode: 'every_bar',
   rolling_stride: 1,
