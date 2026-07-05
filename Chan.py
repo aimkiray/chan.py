@@ -239,9 +239,10 @@ class CChan:
         elif self.data_src == DATA_SRC.CSV:
             from DataAPI.csvAPI import CSV_API
             _dict[DATA_SRC.CSV] = CSV_API
-        elif self.data_src == DATA_SRC.AK_SHARE:
+        elif self.data_src in (DATA_SRC.AK_SHARE, DATA_SRC.AKSHARE):
             from DataAPI.AkShareAPI import CAkShare
             _dict[DATA_SRC.AK_SHARE] = CAkShare
+            _dict[DATA_SRC.AKSHARE] = CAkShare
         elif self.data_src == DATA_SRC.TDX:
             from DataAPI.TdxAPI import CTdxStockApi
             _dict[DATA_SRC.TDX] = CTdxStockApi
