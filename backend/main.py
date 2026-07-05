@@ -40,6 +40,8 @@ from backend.chan_service import (
     list_pretrained_model_metas,
     get_pretrained_model_detail_by_key,
     delete_pretrained_model_bundle_by_key,
+    _add_sample_semantic_features,
+    _side_filter_allows,
 )
 from backend.portfolio_service import get_portfolio_service
 from backend.vector_backtest import VectorBacktester
@@ -58,6 +60,9 @@ _live_run_scheduler_started = False
 _live_run_scheduler_lock = threading.Lock()
 _live_run_running = set()
 _live_run_running_lock = threading.Lock()
+
+_live_train_cache_lock = threading.Lock()
+_live_train_cache = {}
 
 _pretrain_jobs_lock = threading.Lock()
 _pretrain_jobs = {}
@@ -902,6 +907,7 @@ class AnalyzeRequest(BaseModel):
     enable_rolling_lookback: bool = True # Enable/Disable long-term context features
     rank_transform_enabled: Optional[bool] = None
     only_features: Optional[Any] = None
+    side_filter: str = "buy"
     profit_threshold: Optional[float] = 0.01
     auto_profit_quantile: float = 0.7
     profit_lookahead: int = 5
@@ -936,6 +942,7 @@ class ValidateRequest(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     enable_rolling_lookback: bool = True
+    side_filter: str = "buy"
     profit_threshold: Optional[float] = 0.01
     auto_profit_quantile: float = 0.7
     profit_lookahead: int = 5
@@ -984,6 +991,7 @@ class PretrainRequest(BaseModel):
     rolling_sample_mode: Optional[str] = None
     rolling_stride: Optional[int] = None
     only_features: Optional[List[str]] = None
+    side_filter: str = "buy"
 
 def _default_profit_lookahead_for_frequency(freq: str) -> int:
     f = str(freq or "").strip().lower()
@@ -1017,6 +1025,9 @@ async def create_pretrain_job(req: PretrainRequest):
         "use_atr_label": bool(req.use_atr_label),
         "atr_period": int(req.atr_period),
         "atr_mult": float(req.atr_mult),
+        "trade_cost": float(req.trade_cost or 0.0),
+        "topk_frac": float(req.topk_frac or 0.2),
+        "side_filter": str(req.side_filter or "buy").strip().lower() or "buy",
     }
     # Removed database duplicate check to allow re-training with new unique keys
     # if not req.force_refresh and storage.is_duplicate_pretrain(req.model, req.frequency, req.data_src, params):
@@ -1135,10 +1146,13 @@ async def create_pretrain_job(req: PretrainRequest):
                 use_atr_label=bool(req.use_atr_label),
                 atr_period=int(req.atr_period),
                 atr_mult=float(req.atr_mult),
+                trade_cost=float(req.trade_cost or 0.0),
+                topk_frac=float(req.topk_frac or 0.2),
                 rank_mode=str(req.rank_mode or "sample"),
                 rolling_sample_mode=req.rolling_sample_mode,
                 rolling_stride=req.rolling_stride,
                 only_features=req.only_features,
+                side_filter=req.side_filter,
             )
             if not path:
                 detail = None
@@ -1600,6 +1614,7 @@ class WolfpackBacktestRequest(BaseModel):
     rank_mode: str = "cross_section"
     lookback_days: int = 1825
     only_features: Optional[str] = None
+    side_filter: str = "buy"
 
 @app.post("/api/backtest/vector")
 async def run_vector_backtest(req: VectorBacktestRequest):
@@ -1713,6 +1728,25 @@ async def run_wolfpack_backtest(req: WolfpackBacktestRequest):
     from DataAPI.ClickHouseAPI import CClickHouseAPI
     effective_pool_id = str(req.pool_id or "").strip() or None
     pool_codes = []
+    def _get_pool_members_with_fallback(pool_id: Optional[str], start_dt: str, end_dt: str) -> List[str]:
+        pid = str(pool_id or "").strip()
+        if not pid:
+            return []
+        try:
+            codes = CClickHouseAPI.get_pool_members(pid, table="stock_constituent", limit=5000, as_of_date=str(start_dt))
+        except Exception:
+            codes = []
+        if not codes and end_dt and str(end_dt) != str(start_dt):
+            try:
+                codes = CClickHouseAPI.get_pool_members(pid, table="stock_constituent", limit=5000, as_of_date=str(end_dt))
+            except Exception:
+                codes = []
+        if not codes:
+            try:
+                codes = CClickHouseAPI.get_pool_members(pid, table="stock_constituent", limit=5000, as_of_date=None)
+            except Exception:
+                codes = []
+        return list(codes or [])
     if ":" in str(req.pool_id or ""):
         if bool(getattr(req, "point_in_time_pool", True)):
             try:
@@ -1733,9 +1767,9 @@ async def run_wolfpack_backtest(req: WolfpackBacktestRequest):
                             seen[cc] = True
                 pool_codes = list(seen.keys())
         if not pool_codes:
-            pool_codes = CClickHouseAPI.get_pool_members(req.pool_id, table="stock_constituent", limit=5000, as_of_date=str(start))
+            pool_codes = _get_pool_members_with_fallback(req.pool_id, str(start), str(end))
     else:
-        pool_codes = CClickHouseAPI.get_pool_members(req.pool_id, table="stock_constituent", limit=5000, as_of_date=str(start))
+        pool_codes = _get_pool_members_with_fallback(req.pool_id, str(start), str(end))
     if not pool_codes:
         try:
             pools = CClickHouseAPI.list_stock_pools(table="stock_constituent")
@@ -1769,11 +1803,10 @@ async def run_wolfpack_backtest(req: WolfpackBacktestRequest):
                                 seen[cc] = True
                     pool_codes = list(seen.keys())
             if not pool_codes:
-                pool_codes = CClickHouseAPI.get_pool_members(picked, table="stock_constituent", limit=5000, as_of_date=str(start))
+                pool_codes = _get_pool_members_with_fallback(picked, str(start), str(end))
         if not pool_codes:
-            if str(req.data_src or "").strip().lower() != "clickhouse":
-                from backend.vector_backtest import get_chinext50_stocks
-                pool_codes = get_chinext50_stocks()
+            from backend.vector_backtest import get_chinext50_stocks
+            pool_codes = get_chinext50_stocks()
 
     mw = _resolve_backtest_max_workers(getattr(req, "max_workers", 0), len(pool_codes))
 
@@ -1827,6 +1860,7 @@ async def run_wolfpack_backtest(req: WolfpackBacktestRequest):
         rank_mode=req.rank_mode,
         lookback_days=req.lookback_days,
         only_features=req.only_features,
+        side_filter=req.side_filter,
     )
 
 class BacktestPresetUpsertRequest(BaseModel):
@@ -1998,6 +2032,7 @@ async def analyze_stock(req: AnalyzeRequest):
             "profit_threshold": req.profit_threshold,
             "auto_profit_quantile": req.auto_profit_quantile,
             "profit_lookahead": req.profit_lookahead,
+            "side_filter": str(req.side_filter or "buy").strip().lower() or "buy",
             "autype": autype.name,
             "backtest_mode": req.backtest_mode,
             "walk_forward_max_folds": req.walk_forward_max_folds,
@@ -2096,6 +2131,7 @@ async def analyze_stock(req: AnalyzeRequest):
                 end_time=end_time,
                 enable_rolling_lookback=req.enable_rolling_lookback,
                 autype=autype,
+                side_filter=req.side_filter,
             )
         except Exception as e:
             import traceback
@@ -2173,6 +2209,7 @@ async def analyze_stock(req: AnalyzeRequest):
                     lgb_reg_lambda=req.lgb_reg_lambda,
                     rank_transform_enabled=req.rank_transform_enabled,
                     only_features=req.only_features,
+                    side_filter=req.side_filter,
                 )
                 if online_accuracy is not None:
                     online_accuracy["pretrained"] = False
@@ -2190,6 +2227,16 @@ async def analyze_stock(req: AnalyzeRequest):
                             pt = pretrained_bundle["meta"].get("profit_threshold", None)
                     except Exception:
                         pt = req.profit_threshold
+                    pretrained_meta = pretrained_bundle.get("meta") if isinstance(pretrained_bundle.get("meta"), dict) else {}
+                    pt_use_atr_label = bool(pretrained_meta.get("use_atr_label", req.use_atr_label))
+                    try:
+                        pt_atr_period = int(pretrained_meta.get("atr_period", req.atr_period) or req.atr_period)
+                    except Exception:
+                        pt_atr_period = int(req.atr_period)
+                    try:
+                        pt_atr_mult = float(pretrained_meta.get("atr_mult", req.atr_mult) or req.atr_mult)
+                    except Exception:
+                        pt_atr_mult = float(req.atr_mult)
                     pretrained_accuracy = evaluate_fixed_model_time_split(
                         bsp_dict,
                         pretrained_bst,
@@ -2202,6 +2249,10 @@ async def analyze_stock(req: AnalyzeRequest):
                         trade_cost=req.trade_cost,
                         topk_frac=req.topk_frac,
                         quantile_bin_count=req.quantile_bin_count,
+                        side_filter=req.side_filter,
+                        use_atr_label=pt_use_atr_label,
+                        atr_period=pt_atr_period,
+                        atr_mult=pt_atr_mult,
                     )
                     pretrained_accuracy["pretrained"] = True
                     pretrained_accuracy["mode"] = "pretrained"
@@ -2268,6 +2319,7 @@ async def analyze_stock(req: AnalyzeRequest):
                     lgb_reg_lambda=req.lgb_reg_lambda,
                     rank_transform_enabled=req.rank_transform_enabled,
                     only_features=req.only_features,
+                    side_filter=req.side_filter,
                 )
                 if accuracy_info is not None:
                     accuracy_info["pretrained"] = False
@@ -2277,45 +2329,47 @@ async def analyze_stock(req: AnalyzeRequest):
                 bsp_list = last_snapshot.get_latest_bsp()
                 if bsp_list:
                     latest_bsp = bsp_list[0]
-                    try:
-                        cur_lv_chan = last_snapshot[0]
-                        state_feat = extract_state_features_from_cur_lv(cur_lv_chan, last_klu)
-                        if state_feat:
-                            latest_bsp.features.add_feat(state_feat)
-                    except Exception:
-                        pass
-                    latest_bsp.features.add_feat(stragety_feature(last_klu))
-                    score = predict_bsp(bst, latest_bsp, feature_meta)
-                    if req.blend_models and accuracy_info and accuracy_info.get("mode") == "ensemble":
+                    if _side_filter_allows(bool(latest_bsp.is_buy), req.side_filter):
                         try:
-                            pretrained_bst = None
-                            pretrained_feature_meta = None
-                            if pretrained_bundle and pretrained_bundle.get("model") and pretrained_bundle.get("feature_meta"):
-                                pretrained_bst = pretrained_bundle["model"]
-                                pretrained_feature_meta = pretrained_bundle["feature_meta"]
-                            online_bst = bst
-                            online_feature_meta = feature_meta
-                            if pretrained_bst and online_bst and pretrained_feature_meta and online_feature_meta:
-                                score_pre = predict_bsp(pretrained_bst, latest_bsp, pretrained_feature_meta)
-                                score_on = predict_bsp(online_bst, latest_bsp, online_feature_meta)
-                                w_pre = float(accuracy_info.get("ensemble_weight_pretrained", 0.5) or 0.5)
-                                w_on = float(accuracy_info.get("ensemble_weight_online", 0.5) or 0.5)
-                                denom = (w_pre + w_on) if (w_pre + w_on) > 0 else 1.0
-                                score = (w_pre * float(score_pre) + w_on * float(score_on)) / denom
-                                accuracy_info["ensemble_score"] = float(score)
-                                accuracy_info["pretrained_score"] = float(score_pre)
-                                accuracy_info["online_score"] = float(score_on)
+                            cur_lv_chan = last_snapshot[0]
+                            state_feat = extract_state_features_from_cur_lv(cur_lv_chan, last_klu)
+                            if state_feat:
+                                latest_bsp.features.add_feat(state_feat)
                         except Exception:
                             pass
-                    days_diff = (last_klu.time.ts - latest_bsp.klu.time.ts) / (24 * 3600)
-                    
-                    latest_signal = {
-                        "is_buy": latest_bsp.is_buy,
-                        "type": latest_bsp.type2str(),
-                        "date": latest_bsp.klu.time.to_str(),
-                        "score": float(score),
-                        "days_diff": float(days_diff)
-                    }
+                        _add_sample_semantic_features(latest_bsp.features, bool(latest_bsp.is_buy), latest_bsp, "event_bsp")
+                        latest_bsp.features.add_feat(stragety_feature(last_klu))
+                        score = predict_bsp(bst, latest_bsp, feature_meta)
+                        if req.blend_models and accuracy_info and accuracy_info.get("mode") == "ensemble":
+                            try:
+                                pretrained_bst = None
+                                pretrained_feature_meta = None
+                                if pretrained_bundle and pretrained_bundle.get("model") and pretrained_bundle.get("feature_meta"):
+                                    pretrained_bst = pretrained_bundle["model"]
+                                    pretrained_feature_meta = pretrained_bundle["feature_meta"]
+                                online_bst = bst
+                                online_feature_meta = feature_meta
+                                if pretrained_bst and online_bst and pretrained_feature_meta and online_feature_meta:
+                                    score_pre = predict_bsp(pretrained_bst, latest_bsp, pretrained_feature_meta)
+                                    score_on = predict_bsp(online_bst, latest_bsp, online_feature_meta)
+                                    w_pre = float(accuracy_info.get("ensemble_weight_pretrained", 0.5) or 0.5)
+                                    w_on = float(accuracy_info.get("ensemble_weight_online", 0.5) or 0.5)
+                                    denom = (w_pre + w_on) if (w_pre + w_on) > 0 else 1.0
+                                    score = (w_pre * float(score_pre) + w_on * float(score_on)) / denom
+                                    accuracy_info["ensemble_score"] = float(score)
+                                    accuracy_info["pretrained_score"] = float(score_pre)
+                                    accuracy_info["online_score"] = float(score_on)
+                            except Exception:
+                                pass
+                        days_diff = (last_klu.time.ts - latest_bsp.klu.time.ts) / (24 * 3600)
+
+                        latest_signal = {
+                            "is_buy": latest_bsp.is_buy,
+                            "type": latest_bsp.type2str(),
+                            "date": latest_bsp.klu.time.to_str(),
+                            "score": float(score),
+                            "days_diff": float(days_diff)
+                        }
         
         # Check for data warnings from Chan instance
         data_warnings = getattr(chan, 'data_warnings', [])
@@ -2475,6 +2529,7 @@ async def validate_codes(req: ValidateRequest):
                     end_time=end_time,
                     enable_rolling_lookback=req.enable_rolling_lookback,
                     autype=autype,
+                    side_filter=req.side_filter,
                 )
                 if not bsp_dict:
                     item["detail"] = "no_bsp"
@@ -2506,6 +2561,7 @@ async def validate_codes(req: ValidateRequest):
                     lgb_max_depth=req.lgb_max_depth,
                     lgb_reg_alpha=req.lgb_reg_alpha,
                     lgb_reg_lambda=req.lgb_reg_lambda,
+                    side_filter=req.side_filter,
                 )
                 keep = [
                     "method",
@@ -2647,6 +2703,11 @@ async def pretrain_model(req: PretrainRequest):
             topk_frac=float(req.topk_frac or 0.2),
             portfolio_min_score=float(req.portfolio_min_score or 0.6),
             portfolio_top_n=int(req.portfolio_top_n or 2),
+            rank_mode=str(req.rank_mode or "sample"),
+            rolling_sample_mode=req.rolling_sample_mode,
+            rolling_stride=req.rolling_stride,
+            only_features=req.only_features,
+            side_filter=req.side_filter,
         )
         if not path:
             raise HTTPException(status_code=400, detail=result.get("detail", "pretrain failed"))
@@ -2790,8 +2851,12 @@ class LivePaperTradeStepRequest(BaseModel):
     frequency: str = "30m"
     data_src: str = "clickhouse"
     autype: str = "qfq"
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    initial_capital: Optional[float] = None
     lookback_days: int = 365 * 5
     enable_rolling_lookback: bool = True
+    portfolio_top_n: Optional[int] = None
     top_n: int = 2
     min_prob: float = 0.25
     holding_period: int = 3
@@ -2801,10 +2866,12 @@ class LivePaperTradeStepRequest(BaseModel):
     limit: int = 0
     use_latest_available_day: bool = True
     pretrained_model_key: Optional[str] = None
+    model: str = "xgboost"
+    train_on_fly: bool = False
     rank_mode: str = "cross_section"
     rolling_sample_mode: str = "every_bar"
     rolling_stride: int = 1
-    risk_filter_enabled: bool = True
+    risk_filter_enabled: bool = False
     risk_mode: str = "both"
     risk_index_code: str = "399006"
     risk_drop_threshold: float = -0.03
@@ -2819,6 +2886,11 @@ class LivePaperTradeStepRequest(BaseModel):
     risk_trend_ma_window: int = 20
     risk_data_fail_mode: str = "reduce"
     risk_intraday_data_fail_mode: str = "reduce"
+    point_in_time_pool: bool = True
+    index_filter_enabled: bool = False
+    index_code: str = "399006"
+    index_ma_window: int = 20
+    stop_loss: Optional[float] = None
     sell_mode: str = "baseline"
     t1_decision_time: str = "10:00"
     t1_gap_strong_threshold: float = 0.03
@@ -2916,6 +2988,7 @@ async def live_scan_features(req: LiveScanFeaturesRequest):
                         autype=autype,
                         rolling_sample_mode=rolling_sample_mode,
                         rolling_stride=rolling_stride,
+                        side_filter="buy",
                     )
                 else:
                     chan_snapshot, _, _, _ = get_chan_data(
@@ -2932,6 +3005,7 @@ async def live_scan_features(req: LiveScanFeaturesRequest):
                         autype=autype,
                         rolling_sample_mode=rolling_sample_mode,
                         rolling_stride=rolling_stride,
+                        side_filter="buy",
                     )
                     bsp_dict = None
 
@@ -3115,6 +3189,15 @@ async def live_create_run(req: LiveRunCreateRequest):
         if pid is None:
             pid = params.get("portfolio_id")
         params["portfolio_id"] = pid
+        try:
+            init_cap = float(params.get("initial_capital")) if "initial_capital" in params else None
+        except Exception:
+            init_cap = None
+        if init_cap is not None and init_cap > 0:
+            try:
+                storage.update_live_sim_initial_capital(sim_id, float(init_cap), reset_balance=True)
+            except Exception:
+                pass
         st = "running" if bool(req.start) else "stopped"
         nxt = int(time.time()) if st == "running" else 0
         out = storage.upsert_live_run(
@@ -3183,18 +3266,280 @@ async def live_equity_curve(sim_id: Optional[str] = None, run_id: Optional[str] 
     try:
         sid = str(sim_id or "").strip() or "default"
         tn = 2
+        freq_raw = "30m"
+        data_src_raw = "clickhouse"
+        autype_raw = "qfq"
+        initial_capital_from_run = None
         if run_id:
             r = storage.get_live_run(str(run_id))
             if r and isinstance(r.get("params"), dict):
                 try:
+                    initial_capital_from_run = float((r.get("params") or {}).get("initial_capital"))
+                except Exception:
+                    initial_capital_from_run = None
+                try:
                     tn = int((r.get("params") or {}).get("top_n") or 2)
                 except Exception:
                     tn = 2
+                freq_raw = str((r.get("params") or {}).get("frequency") or freq_raw)
+                data_src_raw = str((r.get("params") or {}).get("data_src") or data_src_raw)
+                autype_raw = str((r.get("params") or {}).get("autype") or autype_raw)
         tn = max(1, int(tn))
+        sim_info = storage.get_live_sim(sid)
+        try:
+            initial_capital = float(sim_info.get("initial_capital") or 100000.0) if sim_info else 100000.0
+        except Exception:
+            initial_capital = 100000.0
+        if initial_capital_from_run is not None:
+            try:
+                if float(initial_capital_from_run) > 0:
+                    initial_capital = float(initial_capital_from_run)
+            except Exception:
+                pass
+        if initial_capital <= 0:
+            initial_capital = 100000.0
+        steps = storage.list_live_step_results(sim_id=sid, run_id=run_id, portfolio_id=portfolio_id, limit=limit) or []
+        if (not steps) and run_id:
+            steps = storage.list_live_step_results(sim_id=sid, run_id=None, portfolio_id=portfolio_id, limit=limit) or []
+        if steps:
+            from backend.live.common import parse_autype, parse_data_src, parse_frequency, pick_kl_bar_asof
+            freq_raw, level = parse_frequency(freq_raw)
+            data_src = parse_data_src(data_src_raw)
+            autype = parse_autype(autype_raw)
+
+            steps = sorted(steps, key=lambda x: int(x.get("step_ts") or 0))
+            min_ts = None
+            max_ts = None
+            code_set = set()
+            for it in steps:
+                try:
+                    ts = int(it.get("step_ts") or 0)
+                except Exception:
+                    ts = 0
+                if ts > 0:
+                    min_ts = ts if min_ts is None else min(min_ts, ts)
+                    max_ts = ts if max_ts is None else max(max_ts, ts)
+                res = it.get("result") if isinstance(it.get("result"), dict) else {}
+                for p in (res.get("positions") or []):
+                    code = str(p.get("stock_code") or p.get("code") or "").strip()
+                    if code:
+                        code_set.add(code)
+                for tr in (res.get("trades") or []):
+                    code = str(tr.get("stock_code") or "").strip()
+                    if code:
+                        code_set.add(code)
+
+            if min_ts is None:
+                min_ts = int(time.time())
+            if max_ts is None:
+                max_ts = min_ts
+            begin_dt = datetime.datetime.fromtimestamp(int(min_ts)) - datetime.timedelta(days=7)
+            end_dt = datetime.datetime.fromtimestamp(int(max_ts)) + datetime.timedelta(days=1)
+            begin = begin_dt.strftime("%Y-%m-%d")
+            end = end_dt.strftime("%Y-%m-%d")
+
+            price_cache = {}
+            for code in code_set:
+                try:
+                    kl_list = fetch_stock_data(
+                        code,
+                        level,
+                        begin,
+                        end,
+                        data_src,
+                        autype=autype,
+                        use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
+                    )
+                except Exception:
+                    kl_list = None
+                price_cache[code] = kl_list or []
+
+            pts = []
+            positions = {}
+            last_price = {}
+            cash = float(initial_capital)
+            buy_fee_rate = 0.0002
+            sell_fee_rate = 0.001
+            last_trade_ts = 0
+            for it in steps:
+                res = it.get("result") if isinstance(it.get("result"), dict) else {}
+                try:
+                    step_ts = int(res.get("ts") or it.get("step_ts") or 0)
+                except Exception:
+                    step_ts = 0
+                trades = []
+                balance_snapshot = None
+                try:
+                    if res.get("balance") is not None:
+                        balance_snapshot = float(res.get("balance"))
+                except Exception:
+                    balance_snapshot = None
+
+                if balance_snapshot is not None:
+                    cash = float(balance_snapshot)
+                    positions = {}
+                    for p in (res.get("positions") or []):
+                        code = str(p.get("stock_code") or p.get("code") or "").strip()
+                        if not code:
+                            continue
+                        try:
+                            vol = int(p.get("volume") or 0)
+                        except Exception:
+                            vol = 0
+                        if vol > 0:
+                            positions[code] = int(vol)
+                        try:
+                            ep = float(p.get("entry_price") or 0.0)
+                        except Exception:
+                            ep = 0.0
+                        if ep > 0.0:
+                            last_price[code] = float(ep)
+                else:
+                    trades = res.get("trades") if isinstance(res.get("trades"), list) else []
+                    if trades:
+                        try:
+                            trades = sorted(trades, key=lambda x: int(x.get("trade_ts") or 0))
+                        except Exception:
+                            trades = list(trades)
+                    has_valid_trade = False
+                    for tr in trades:
+                        try:
+                            px = float(tr.get("price") or 0.0)
+                        except Exception:
+                            px = 0.0
+                        try:
+                            vol = int(tr.get("volume") or 0)
+                        except Exception:
+                            vol = 0
+                        if px > 0.0 and vol > 0:
+                            has_valid_trade = True
+                            break
+
+                    if not has_valid_trade:
+                        positions = {}
+                        cost_basis = 0.0
+                        for p in (res.get("positions") or []):
+                            code = str(p.get("stock_code") or p.get("code") or "").strip()
+                            if not code:
+                                continue
+                            try:
+                                vol = int(p.get("volume") or 0)
+                            except Exception:
+                                vol = 0
+                            if vol <= 0:
+                                continue
+                            positions[code] = int(vol)
+                            try:
+                                ep = float(p.get("entry_price") or 0.0)
+                            except Exception:
+                                ep = 0.0
+                            if ep > 0.0:
+                                last_price[code] = float(ep)
+                                cost_basis += float(ep) * float(vol) * float(1.0 + buy_fee_rate)
+                        cash = float(initial_capital) - float(cost_basis)
+                    else:
+                        for tr in trades:
+                            try:
+                                tts = int(tr.get("trade_ts") or 0)
+                            except Exception:
+                                tts = 0
+                            if tts <= 0 or tts <= int(last_trade_ts):
+                                continue
+                            if step_ts > 0 and int(tts) > int(step_ts):
+                                continue
+                            code = str(tr.get("stock_code") or "").strip()
+                            side = str(tr.get("side") or "").strip().lower()
+                            try:
+                                px = float(tr.get("price") or 0.0)
+                            except Exception:
+                                px = 0.0
+                            try:
+                                vol = int(tr.get("volume") or 0)
+                            except Exception:
+                                vol = 0
+                            if not code or px <= 0.0 or vol <= 0:
+                                continue
+                            last_price[code] = float(px)
+                            if side == "buy":
+                                cash -= float(px) * float(vol) * float(1.0 + buy_fee_rate)
+                                positions[code] = int(positions.get(code, 0)) + int(vol)
+                            elif side == "sell":
+                                cash += float(px) * float(vol) * float(1.0 - sell_fee_rate)
+                                positions[code] = int(positions.get(code, 0)) - int(vol)
+                                if positions.get(code, 0) <= 0:
+                                    positions.pop(code, None)
+                            last_trade_ts = max(int(last_trade_ts), int(tts))
+
+                market_value = 0.0
+                for code, vol in (positions or {}).items():
+                    if not code:
+                        continue
+                    try:
+                        vol = int(vol)
+                    except Exception:
+                        vol = 0
+                    if vol <= 0:
+                        continue
+                    px = 0.0
+                    kl_list = price_cache.get(code) or []
+                    if kl_list and step_ts > 0:
+                        try:
+                            k = pick_kl_bar_asof(kl_list, int(step_ts))
+                            if k:
+                                px = float(getattr(k, "close", 0.0) or 0.0)
+                        except Exception:
+                            px = 0.0
+                    if px <= 0.0:
+                        px = float(last_price.get(code, 0.0) or 0.0)
+                    if px > 0.0:
+                        market_value += float(px) * float(vol)
+
+                equity_value = float(cash) + float(market_value)
+                equity = float(equity_value / float(initial_capital)) if initial_capital > 0 else float(equity_value)
+
+                trade_code = ""
+                trade_side = ""
+                trade_price = None
+                picked_trade = None
+                picked_ts = -1
+                for tr in trades:
+                    try:
+                        tts = int(tr.get("trade_ts") or 0)
+                    except Exception:
+                        tts = 0
+                    if tts <= 0:
+                        continue
+                    if tts > picked_ts and (step_ts <= 0 or tts <= step_ts):
+                        picked_trade = tr
+                        picked_ts = tts
+                if isinstance(picked_trade, dict):
+                    trade_code = str(picked_trade.get("stock_code") or "")
+                    trade_side = str(picked_trade.get("side") or "")
+                    try:
+                        trade_price = float(picked_trade.get("price") or 0.0)
+                    except Exception:
+                        trade_price = None
+
+                pt = {"ts": int(step_ts), "equity": float(equity)}
+                if trade_code:
+                    pt["code"] = trade_code
+                if trade_side:
+                    pt["side"] = trade_side
+                if trade_price is not None:
+                    pt["price"] = float(trade_price)
+                pts.append(pt)
+            return {"sim_id": sid, "run_id": str(run_id or ""), "portfolio_id": portfolio_id, "top_n": int(tn), "points": pts}
+
         trades = storage.list_live_trades(limit=limit, sim_id=sid, portfolio_id=portfolio_id) or []
         trades = sorted(trades, key=lambda x: int(x.get("trade_ts") or 0))
         last_buy = {}
-        eq = 1.0
+        positions = {}
+        last_price = {}
+        cash = float(initial_capital)
+        buy_fee_rate = 0.0002
+        sell_fee_rate = 0.001
+        eq_ratio = 1.0
+        has_volume = False
         pts = []
         for tr in trades:
             code = str(tr.get("stock_code") or "").strip()
@@ -3203,18 +3548,52 @@ async def live_equity_curve(sim_id: Optional[str] = None, run_id: Optional[str] 
                 px = float(tr.get("price") or 0.0)
             except Exception:
                 px = 0.0
+            try:
+                vol = int(tr.get("volume") or 0)
+            except Exception:
+                vol = 0
             ts = int(tr.get("trade_ts") or 0)
             if not code or px <= 0.0 or ts <= 0:
                 continue
+            if vol > 0:
+                has_volume = True
+                last_price[code] = float(px)
+                if side == "buy":
+                    cash -= float(px) * float(vol) * float(1.0 + buy_fee_rate)
+                    positions[code] = int(positions.get(code, 0)) + int(vol)
+                elif side == "sell":
+                    cash += float(px) * float(vol) * float(1.0 - sell_fee_rate)
+                    positions[code] = int(positions.get(code, 0)) - int(vol)
+                    if positions.get(code, 0) <= 0:
+                        positions.pop(code, None)
+                market_value = 0.0
+                for p_code, p_vol in (positions or {}).items():
+                    if not p_code:
+                        continue
+                    try:
+                        p_vol = int(p_vol)
+                    except Exception:
+                        p_vol = 0
+                    if p_vol <= 0:
+                        continue
+                    p_px = float(last_price.get(p_code, 0.0) or 0.0)
+                    if p_px > 0.0:
+                        market_value += float(p_px) * float(p_vol)
+                equity_value = float(cash) + float(market_value)
+                eq_ratio = float(equity_value / float(initial_capital)) if initial_capital > 0 else float(equity_value)
+                pts.append({"ts": int(ts), "equity": float(eq_ratio), "code": code, "side": side, "price": float(px)})
+                continue
             if side == "buy":
                 last_buy[code] = float(px)
+                pts.append({"ts": int(ts), "equity": float(eq_ratio), "code": code, "side": side, "price": float(px)})
                 continue
             if side == "sell":
-                bp = last_buy.get(code)
-                if bp and bp > 0.0:
-                    rret = float(px / bp - 1.0)
-                    eq = float(eq) * float(1.0 + rret / float(tn))
-                pts.append({"ts": int(ts), "equity": float(eq), "code": code, "side": side, "price": float(px)})
+                if not has_volume:
+                    bp = last_buy.get(code)
+                    if bp and bp > 0.0:
+                        rret = float(px / bp - 1.0)
+                        eq_ratio = float(eq_ratio) * float(1.0 + rret / float(tn))
+                pts.append({"ts": int(ts), "equity": float(eq_ratio), "code": code, "side": side, "price": float(px)})
         return {"sim_id": sid, "run_id": str(run_id or ""), "portfolio_id": portfolio_id, "top_n": int(tn), "points": pts}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -3601,6 +3980,12 @@ async def live_positions_report(
             code = str(p.get("stock_code") or "").strip()
             if not code:
                 continue
+            try:
+                volume = int(p.get("volume") or 0)
+            except Exception:
+                volume = 0
+            if volume < 0:
+                volume = 0
             last_price = 0.0
             entry_price_qfq = 0.0
             try:
@@ -3620,15 +4005,19 @@ async def live_positions_report(
                 last_price = 0.0
 
             entry_price = entry_price_qfq if entry_price_qfq > 0 else float(p.get("entry_price") or 0.0)
-            pnl = (last_price - entry_price) if (entry_price and last_price) else 0.0
-            pnl_pct = (pnl / entry_price) if entry_price else 0.0
-            total_cost += entry_price
-            total_mv += last_price
+            entry_value = float(entry_price) * float(volume)
+            market_value = float(last_price) * float(volume)
+            pnl = (market_value - entry_value) if (entry_value and market_value) else 0.0
+            pnl_pct = (pnl / entry_value) if entry_value else 0.0
+            total_cost += entry_value
+            total_mv += market_value
             items.append({
                 **p,
                 "frequency": str(freq_raw or ""),
                 "entry_price": float(entry_price),
                 "current_price": float(last_price),
+                "market_value": float(market_value),
+                "cost": float(entry_value),
                 "pnl": float(pnl),
                 "pnl_pct": float(pnl_pct),
             })
@@ -3711,6 +4100,7 @@ def _scan_feature_worker(code, level, begin, end, data_src, autype, enable_rolli
             autype=autype,
             rolling_sample_mode=rolling_sample_mode,
             rolling_stride=rolling_stride,
+            side_filter="buy",
         )
         if not bsp_dict:
             return None
@@ -3792,6 +4182,8 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
 def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
     try:
         import concurrent.futures
+        import hashlib
+        import json
         import os
         import time
         from DataAPI.ClickHouseAPI import CClickHouseAPI
@@ -3814,7 +4206,36 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
             except Exception:
                 pid = None
         pool_id = str(req.pool_id or "").strip() or "index:IDX399673"
-        raw_codes = CClickHouseAPI.get_pool_members(pool_id=pool_id, table="stock_constituent", limit=5000)
+        freq_raw, level = parse_frequency(req.frequency)
+        data_src = parse_data_src(req.data_src)
+        autype = parse_autype("qfq")
+
+        end = datetime.datetime.now().strftime("%Y-%m-%d")
+        begin = (datetime.datetime.now() - datetime.timedelta(days=int(req.lookback_days or 365 * 5))).strftime("%Y-%m-%d")
+
+        # Resolve pool members with optional point-in-time snapshot (align with backtest)
+        raw_codes = []
+        try:
+            if (":" in str(pool_id)) and bool(getattr(req, "point_in_time_pool", True)):
+                snap = CClickHouseAPI.get_pool_snapshot_members(
+                    str(pool_id),
+                    str(begin),
+                    str(end),
+                    table="stock_constituent",
+                )
+                if snap:
+                    seen = {}
+                    for _, codes_list in (snap or {}).items():
+                        for c in (codes_list or []):
+                            cc = normalize_code(str(c))
+                            if cc:
+                                seen[cc] = True
+                    raw_codes = list(seen.keys())
+            if not raw_codes:
+                raw_codes = CClickHouseAPI.get_pool_members(pool_id=pool_id, table="stock_constituent", limit=5000)
+        except Exception:
+            raw_codes = CClickHouseAPI.get_pool_members(pool_id=pool_id, table="stock_constituent", limit=5000)
+
         codes = []
         for c in raw_codes or []:
             try:
@@ -3825,38 +4246,230 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
         if int(req.limit or 0) > 0:
             codes = codes[: int(req.limit)]
 
-        freq_raw, level = parse_frequency(req.frequency)
-        data_src = parse_data_src(req.data_src)
-        autype = parse_autype("qfq")
-
-        end = datetime.datetime.now().strftime("%Y-%m-%d")
-        begin = (datetime.datetime.now() - datetime.timedelta(days=int(req.lookback_days or 365 * 5))).strftime("%Y-%m-%d")
-
-        top_n = max(1, int(req.top_n or 2))
+        # Respect backtest naming: portfolio_top_n overrides top_n
+        top_n = max(1, int((req.portfolio_top_n if req.portfolio_top_n is not None else req.top_n) or 2))
         holding_period = max(1, int(req.holding_period or 3))
         min_prob = float(req.min_prob) if req.min_prob is not None else 0.25
         trade_cost = float(req.trade_cost) if req.trade_cost is not None else 0.0
 
         now_ts = int(time.time())
         cur_day = None
+        used_rank_mode = str(getattr(req, "rank_mode", None) or "cross_section").strip().lower() or "cross_section"
+        want_cross_section = used_rank_mode == "cross_section"
+        train_on_fly = bool(getattr(req, "train_on_fly", False))
 
+        # Align default model with backtest
+        used_model_type = str(getattr(req, "model", None) or "xgboost").strip().lower()
+        if used_model_type in ["lr", "logreg", "logistic"]:
+            used_model_type = "logistic_regression"
+        elif used_model_type in ["xgb"]:
+            used_model_type = "xgboost"
+
+        cache_key = None
         bundle = None
-        if req.pretrained_model_key:
-            bundle = load_pretrained_model_bundle_by_key(str(req.pretrained_model_key).strip())
+        pretrained_key = str(getattr(req, "pretrained_model_key", "") or "").strip()
+        if pretrained_key:
+            bundle = load_pretrained_model_bundle_by_key(pretrained_key)
         if bundle is None:
             bundle = load_pretrained_model_bundle(
-                "logistic_regression",
+                used_model_type,
                 str(req.frequency or "30m"),
                 str(req.data_src or "clickhouse"),
                 autype=autype,
-                rank_mode=str(req.rank_mode or "cross_section"),
+                rank_mode=str(used_rank_mode),
             )
-        if not bundle:
-            raise HTTPException(status_code=404, detail="no pretrained model for live paper trade (need rank_mode=cross_section logistic_regression)")
-        model = bundle.get("model")
-        feature_meta = bundle.get("feature_meta") or []
-        if not model or not feature_meta:
-            raise HTTPException(status_code=404, detail="pretrained model bundle is invalid")
+
+        model = None
+        feature_meta = []
+        model_source = None
+        if isinstance(bundle, dict) and bundle.get("model") is not None and isinstance(bundle.get("feature_meta"), list) and bundle.get("feature_meta"):
+            model = bundle.get("model")
+            feature_meta = list(bundle.get("feature_meta") or [])
+            model_source = "pretrained"
+        else:
+            try:
+                auto_train_flag = str(os.environ.get("MLCHAN_LIVE_AUTO_TRAIN_ON_FLY", "1") or "1").strip().lower()
+            except Exception:
+                auto_train_flag = "1"
+            auto_train_on_fly = bool((not train_on_fly) and (not pretrained_key) and run_id and auto_train_flag not in ("0", "false", "off", "no"))
+            train_on_fly_effective = bool(train_on_fly or auto_train_on_fly)
+        if model is None and (not feature_meta) and train_on_fly_effective and (not pretrained_key):
+            cache_params = {
+                "pool_id": str(pool_id),
+                "frequency": str(req.frequency or "30m"),
+                "data_src": str(req.data_src or "clickhouse"),
+                "autype": str(getattr(autype, "name", autype)),
+                "lookback_days": int(req.lookback_days or 0),
+                "enable_rolling_lookback": bool(req.enable_rolling_lookback),
+                "rolling_sample_mode": str(req.rolling_sample_mode or "every_bar"),
+                "rolling_stride": int(req.rolling_stride or 1),
+                "model": str(used_model_type),
+                "holding_period": int(holding_period),
+                "rank_mode": str(used_rank_mode),
+                "side_filter": "buy",
+            }
+            try:
+                cache_json = json.dumps(cache_params, sort_keys=True, ensure_ascii=False)
+                cache_key = hashlib.md5(cache_json.encode("utf-8")).hexdigest()
+            except Exception:
+                cache_key = None
+
+            ttl_sec = int(os.environ.get("MLCHAN_LIVE_TRAIN_CACHE_TTL_SEC", str(4 * 3600)) or (4 * 3600))
+            cached = None
+            if cache_key:
+                with _live_train_cache_lock:
+                    cached = _live_train_cache.get(cache_key)
+                if isinstance(cached, dict):
+                    try:
+                        trained_at = int(cached.get("trained_at_ts") or 0)
+                    except Exception:
+                        trained_at = 0
+                    if trained_at <= 0 or (ttl_sec > 0 and int(now_ts) - int(trained_at) > int(ttl_sec)):
+                        cached = None
+
+            if isinstance(cached, dict) and cached.get("model") is not None and isinstance(cached.get("feature_meta"), list) and cached.get("feature_meta"):
+                model = cached.get("model")
+                feature_meta = list(cached.get("feature_meta") or [])
+                model_source = "train_cache"
+            else:
+                try:
+                    train_code_limit = int(os.environ.get("MLCHAN_LIVE_TRAIN_MAX_CODES", "200") or 200)
+                except Exception:
+                    train_code_limit = 200
+                if train_code_limit <= 0:
+                    train_code_limit = 200
+                train_codes = list(codes[: min(int(train_code_limit), int(len(codes) if codes else 0))])
+
+                try:
+                    per_code_cap = int(os.environ.get("MLCHAN_LIVE_TRAIN_MAX_SAMPLES_PER_CODE", "2000") or 2000)
+                except Exception:
+                    per_code_cap = 2000
+                if per_code_cap <= 0:
+                    per_code_cap = 2000
+
+                merged_bsp = {}
+                merged_idx = 0
+                for code in (train_codes or []):
+                    kl_list = fetch_stock_data(
+                        code,
+                        level,
+                        begin,
+                        end,
+                        data_src,
+                        autype=autype,
+                        use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
+                    )
+                    if not kl_list or len(kl_list) < 50:
+                        continue
+                    _, bsp_dict, _, _ = get_chan_data(
+                        code,
+                        True,
+                        True,
+                        level,
+                        data_src,
+                        preloaded_data=kl_list,
+                        do_predict=True,
+                        begin_time=begin,
+                        end_time=end,
+                        enable_rolling_lookback=bool(req.enable_rolling_lookback),
+                        autype=autype,
+                        rolling_sample_mode=str(req.rolling_sample_mode or "every_bar"),
+                        rolling_stride=int(req.rolling_stride or 1),
+                        side_filter="buy",
+                    )
+                    if not bsp_dict:
+                        continue
+                    infos = list(bsp_dict.values())
+                    try:
+                        infos.sort(key=lambda i: getattr(i.get("open_time"), "ts", 0))
+                    except Exception:
+                        pass
+                    if per_code_cap > 0 and len(infos) > int(per_code_cap):
+                        infos = infos[-int(per_code_cap) :]
+                    for info in infos:
+                        merged_idx += 1
+                        merged_bsp[merged_idx] = info
+
+                if merged_bsp:
+                    model_type_arg = str(used_model_type).strip().lower()
+                    if model_type_arg in ["logistic_regression", "logreg"]:
+                        model_type_arg = "lr"
+                    elif model_type_arg in ["xgboost", "xgb"]:
+                        model_type_arg = "xgboost"
+
+                    trained_model, trained_meta, acc = train_time_split_backtest(
+                        merged_bsp,
+                        model_type=model_type_arg,
+                        backtest_mode="walk_forward",
+                        walk_forward_max_folds=int(getattr(req, "walk_forward_max_folds", 25) or 25),
+                        profit_lookahead=int(holding_period),
+                        trade_cost=float(trade_cost or 0.0),
+                        rank_transform_enabled=False if used_rank_mode in ("raw", "none", "off", "disabled") else True,
+                        side_filter="buy",
+                    )
+                    if trained_model is not None and isinstance(trained_meta, list) and trained_meta:
+                        model = trained_model
+                        feature_meta = list(trained_meta)
+                        model_source = "train_on_fly"
+                        if cache_key:
+                            with _live_train_cache_lock:
+                                _live_train_cache[cache_key] = {
+                                    "trained_at_ts": int(now_ts),
+                                    "model": trained_model,
+                                    "feature_meta": list(trained_meta),
+                                    "acc": acc if isinstance(acc, dict) else None,
+                                    "params": cache_params,
+                                }
+
+        if model is None or (not feature_meta):
+            if run_id:
+                return {
+                    "ts": int(now_ts),
+                    "day": int(day_key_from_ts(int(now_ts)) or 0),
+                    "pool_id": pool_id,
+                    "frequency": freq_raw,
+                    "model_key": "",
+                    "rank_mode": str(used_rank_mode or ""),
+                    "max_workers": int(getattr(req, "max_workers", 1) or 1),
+                    "sell_mode": str(getattr(req, "sell_mode", "baseline") or "baseline"),
+                    "market_open": True,
+                    "market_session": "model_missing",
+                    "next_exec_ts": int(_next_cn_30m_exec_ts(int(now_ts), 5)),
+                    "executed_pending": False,
+                    "selection_debug": {"error": f"no model available (model={str(used_model_type)} rank_mode={str(used_rank_mode)})"},
+                    "risk": {"enabled": bool(getattr(req, "risk_filter_enabled", False) or getattr(req, "index_filter_enabled", False)), "level": "normal", "effective_top_n": int(top_n), "index_code": str(getattr(req, "risk_index_code", None) or getattr(req, "index_code", "399006") or "399006")},
+                    "targets": [],
+                    "sell": [],
+                    "buy": [],
+                    "pending_orders": storage.list_live_orders(status=None, limit=1000, sim_id=sim_id, portfolio_id=pid),
+                    "trades": storage.list_live_trades(limit=200, sim_id=sim_id, portfolio_id=pid),
+                    "positions": storage.list_positions(sim_id=sim_id, portfolio_id=pid),
+                }
+            raise HTTPException(
+                status_code=404,
+                detail=f"no model available for live paper trade (model={str(used_model_type)} rank_mode={str(used_rank_mode)})",
+            )
+
+        model_key_out = ""
+        rank_mode_out = str(used_rank_mode or "")
+        if isinstance(bundle, dict):
+            try:
+                model_key_out = str(bundle.get("key") or "")
+            except Exception:
+                model_key_out = ""
+            try:
+                meta0 = bundle.get("meta")
+            except Exception:
+                meta0 = None
+            if isinstance(meta0, dict):
+                try:
+                    rm = meta0.get("rank_mode")
+                except Exception:
+                    rm = None
+                if rm is not None:
+                    rank_mode_out = str(rm or rank_mode_out)
+        if (not model_key_out) and cache_key:
+            model_key_out = str(cache_key)
 
         def _cn_dt(ts: int) -> datetime.datetime:
             try:
@@ -3955,11 +4568,20 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
         risk = None
         risk_level = "normal"
         effective_top_n = int(top_n)
-        if bool(getattr(req, "risk_filter_enabled", True)):
-            raw_idx = str(getattr(req, "risk_index_code", None) or "399006").strip()
-            idx_code = raw_idx
-            if idx_code.endswith("399006") and (not (idx_code.startswith("sz.") or idx_code.startswith("sh."))):
-                idx_code = "sz.399006"
+        effective_risk_enabled = bool(getattr(req, "risk_filter_enabled", False))
+        index_filter_enabled = bool(getattr(req, "index_filter_enabled", False))
+        effective_index_code = str(getattr(req, "risk_index_code", None) or getattr(req, "index_code", "399006") or "399006").strip()
+        effective_ma_window = int(getattr(req, "risk_trend_ma_window", None) or getattr(req, "index_ma_window", 20) or 20)
+        if index_filter_enabled and (not effective_risk_enabled):
+            effective_risk_enabled = True
+        raw_idx = str(effective_index_code or "399006").strip()
+        try:
+            idx_code = normalize_code(str(raw_idx))
+        except Exception:
+            idx_code = str(raw_idx).strip().lower()
+        if idx_code.endswith("399006") and (not (idx_code.startswith("sz.") or idx_code.startswith("sh."))):
+            idx_code = "sz.399006"
+        if bool(effective_risk_enabled):
             try:
                 atr_window = int(getattr(req, "risk_atr_window", 14) or 14)
             except Exception:
@@ -3975,7 +4597,7 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                 float(getattr(req, "risk_atr_pct_threshold", 0.04) or 0.04),
                 float(getattr(req, "risk_flat_atr_pct_threshold", 0.06) or 0.06),
                 float(getattr(req, "risk_gap_down_threshold", -0.015) or -0.015),
-                int(getattr(req, "risk_trend_ma_window", 20) or 20),
+                int(effective_ma_window or 20),
                 str(data_src),
                 str(autype),
             )
@@ -3995,6 +4617,19 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                     data_src,
                     autype=autype,
                     use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
+                    asset_type="INDEX",
+                )
+                if out:
+                    return out
+                out = fetch_stock_data(
+                    idx_code,
+                    KL_TYPE.K_DAY,
+                    begin_d.strftime("%Y-%m-%d"),
+                    end_d.strftime("%Y-%m-%d"),
+                    data_src,
+                    autype=autype,
+                    use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
+                    asset_type="STOCK",
                 )
                 if out:
                     return out
@@ -4006,9 +4641,20 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                     data_src,
                     autype=autype,
                     use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
+                    asset_type="INDEX",
                 )
                 if out:
                     return out
+                out = fetch_stock_data(
+                    idx_code,
+                    KL_TYPE.K_30M,
+                    begin_d.strftime("%Y-%m-%d"),
+                    end_d.strftime("%Y-%m-%d"),
+                    data_src,
+                    autype=autype,
+                    use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
+                    asset_type="STOCK",
+                )
                 return out
 
             risk = get_cached_index_risk(
@@ -4091,7 +4737,19 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                         data_src,
                         autype=autype,
                         use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
+                        asset_type="INDEX",
                     )
+                    if not kl:
+                        kl = fetch_stock_data(
+                            idx_code,
+                            KL_TYPE.K_30M,
+                            begin_d.strftime("%Y-%m-%d"),
+                            end_d.strftime("%Y-%m-%d"),
+                            data_src,
+                            autype=autype,
+                            use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
+                            asset_type="STOCK",
+                        )
                     cur_px = _pick_intraday_close(kl)
                 except Exception:
                     cur_px = None
@@ -4150,6 +4808,58 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
             cur_day = day_key_from_ts(now_ts)
         if cur_day is None:
             cur_day = int(next_exec_day or 0)
+
+        index_filter_pass = True
+        if index_filter_enabled:
+            try:
+                mw = int(effective_ma_window or 20)
+            except Exception:
+                mw = 20
+            mw = 20 if mw <= 1 else mw
+            idx_kl = None
+            try:
+                idx_kl = fetch_stock_data(
+                    idx_code,
+                    KL_TYPE.K_DAY,
+                    begin,
+                    end,
+                    data_src,
+                    autype=autype,
+                    use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
+                    asset_type="INDEX",
+                )
+            except Exception:
+                idx_kl = None
+            if idx_kl:
+                closes = []
+                dks = []
+                for k in idx_kl:
+                    try:
+                        ts = int(getattr(getattr(k, "time", None), "ts", 0) or 0)
+                    except Exception:
+                        ts = 0
+                    if ts <= 0:
+                        continue
+                    dk = day_key_from_ts(ts)
+                    if dk is None:
+                        continue
+                    try:
+                        c = float(getattr(k, "close", 0.0) or 0.0)
+                    except Exception:
+                        c = 0.0
+                    if c <= 0:
+                        continue
+                    dks.append(int(dk))
+                    closes.append(float(c))
+                if len(closes) >= mw + 1:
+                    ma = float(sum(closes[-mw - 1 : -1]) / float(mw))
+                    prev_close = float(closes[-2])
+                    try:
+                        index_filter_pass = bool(prev_close > ma)
+                    except Exception:
+                        index_filter_pass = True
+            if not index_filter_pass:
+                effective_top_n = 0
 
         pending_orders = storage.list_live_orders(status=None, limit=1000, sim_id=sim_id, portfolio_id=pid)
         can_execute_session = bool(market_open)
@@ -4282,9 +4992,73 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
         positions = storage.list_positions(sim_id=sim_id, portfolio_id=pid)
         pos_map = {p.get("stock_code"): p for p in (positions or []) if p.get("stock_code")}
         to_force_sell = [p["stock_code"] for p in (positions or []) if int(p.get("bars_held") or 0) >= int(holding_period)]
+        stop_loss_th = None
+        try:
+            if req.stop_loss is not None:
+                stop_loss_th = float(req.stop_loss)
+        except Exception:
+            stop_loss_th = None
+        if stop_loss_th is not None:
+            quote_cache_sl = {}
+            def _get_quote_sl(code: str):
+                code = str(code or "").strip()
+                if not code:
+                    return None
+                key = (code, int(now_ts // 60))
+                if key in quote_cache_sl:
+                    return quote_cache_sl.get(key)
+                out = None
+                try:
+                    kl_list = fetch_stock_data(
+                        code,
+                        level,
+                        begin,
+                        end,
+                        data_src,
+                        autype=autype,
+                        use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE),
+                    )
+                    if kl_list:
+                        k = pick_kl_bar_asof(kl_list, int(now_ts))
+                        c = float(getattr(k, "close", 0.0) or 0.0)
+                        out = {"close": c}
+                except Exception:
+                    out = None
+                quote_cache_sl[key] = out
+                return out
+            sl_sell = []
+            for p in positions or []:
+                code = str(p.get("stock_code") or "").strip()
+                if not code:
+                    continue
+                try:
+                    entry_px = float(p.get("entry_price") or 0.0)
+                except Exception:
+                    entry_px = 0.0
+                if entry_px <= 0.0:
+                    continue
+                q = _get_quote_sl(code)
+                cur_px = float((q or {}).get("close") or 0.0)
+                if cur_px <= 0.0:
+                    continue
+                change = float(cur_px / entry_px - 1.0)
+                try:
+                    if change <= float(stop_loss_th):
+                        sl_sell.append(code)
+                except Exception:
+                    continue
+            if sl_sell:
+                to_force_sell = list(dict.fromkeys(list(to_force_sell) + list(sl_sell)))
 
         results = []
-        mw = max(1, min(int(_env_int("MLCHAN_LIVE_MAX_WORKERS", 8)), int(len(codes) if codes else 1)))
+        try:
+            req_mw = int(getattr(req, "max_workers", 0) or 0)
+        except Exception:
+            req_mw = 0
+        if int(req_mw) > 0:
+            mw = max(1, min(int(req_mw), int(len(codes) if codes else 1)))
+        else:
+            mw = max(1, min(int(_env_int("MLCHAN_LIVE_MAX_WORKERS", 8)), int(len(codes) if codes else 1)))
 
         if int(mw) <= 1 or not codes:
             for code in codes:
@@ -4329,10 +5103,11 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                     if r:
                         results.append(r)
 
-        try:
-            cross_section_rank_transform_rows(results, feature_meta, missing_value=-9999999.0)
-        except TypeError:
-            cross_section_rank_transform_rows(results)
+        if want_cross_section:
+            try:
+                cross_section_rank_transform_rows(results, feature_meta, missing_value=-9999999.0)
+            except TypeError:
+                cross_section_rank_transform_rows(results)
         X = []
         for r in results:
             feat = r.get("feature") if isinstance(r.get("feature"), dict) else {}
@@ -4619,6 +5394,8 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
             dt_cn = _cn_dt(now_ts)
             now_min = int(dt_cn.hour) * 60 + int(dt_cn.minute)
             if now_min < int(decision_min):
+                sim_info = storage.get_live_sim(sim_id)
+                current_balance = float(sim_info.get("balance", 100000.0)) if sim_info else 100000.0
                 delayed_pos = storage.list_positions(sim_id=sim_id, portfolio_id=pid)
                 for p in delayed_pos or []:
                     if not p.get("stock_name"):
@@ -4640,8 +5417,8 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                     "day": int(cur_day or 0),
                     "pool_id": pool_id,
                     "frequency": freq_raw,
-                    "model_key": str(bundle.get("key") or ""),
-                    "rank_mode": str((bundle.get("meta") or {}).get("rank_mode") or ""),
+                    "model_key": str(model_key_out or ""),
+                    "rank_mode": str(rank_mode_out or ""),
                     "max_workers": int(mw),
                     "sell_mode": str(sell_mode),
                     "market_open": True,
@@ -4650,17 +5427,17 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                     "executed_pending": bool(executed_pending),
                     "selection_debug": selection_debug_local,
                     "risk": {
-                        "enabled": bool(getattr(req, "risk_filter_enabled", True)),
+                    "enabled": bool(effective_risk_enabled),
                         "level": str(risk_level),
                         "effective_top_n": int(effective_top_n),
-                        "index_code": str(getattr(req, "risk_index_code", "399006") or "399006"),
+                    "index_code": str(effective_index_code or "399006"),
                         "ret1d": (risk or {}).get("ret1d") if isinstance(risk, dict) else None,
                         "atr_pct": (risk or {}).get("atr_pct") if isinstance(risk, dict) else None,
                         "gap_open_pct": (risk or {}).get("gap_open_pct") if isinstance(risk, dict) else None,
                         "today_open": (risk or {}).get("today_open") if isinstance(risk, dict) else None,
                         "prev_close": (risk or {}).get("prev_close") if isinstance(risk, dict) else None,
                         "ma20": (risk or {}).get("ma20") if isinstance(risk, dict) else None,
-                        "trend_ma_window": int(getattr(req, "risk_trend_ma_window", 20) or 20),
+                    "trend_ma_window": int(effective_ma_window or 20),
                         "intraday_enabled": bool(getattr(req, "risk_intraday_enabled", True)),
                         "intraday_bear_threshold": float(getattr(req, "risk_intraday_bear_threshold", -0.015) or -0.015),
                         "intraday_bull_threshold": float(getattr(req, "risk_intraday_bull_threshold", -0.03) or -0.03),
@@ -4679,6 +5456,7 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                     "pending_orders": storage.list_live_orders(status=None, limit=1000, sim_id=sim_id, portfolio_id=pid),
                     "trades": storage.list_live_trades(limit=200, sim_id=sim_id, portfolio_id=pid),
                     "positions": delayed_pos,
+                    "balance": float(current_balance),
                 }
                 try:
                     storage.add_live_step_record(
@@ -4701,6 +5479,8 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                 return resp
 
         if not market_open:
+            sim_info = storage.get_live_sim(sim_id)
+            current_balance = float(sim_info.get("balance", 100000.0)) if sim_info else 100000.0
             pending = []
             for t in targets:
                 if t.get("code") in buy_codes:
@@ -4724,8 +5504,8 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                 "day": int(cur_day or 0),
                 "pool_id": pool_id,
                 "frequency": freq_raw,
-                "model_key": str(bundle.get("key") or ""),
-                "rank_mode": str((bundle.get("meta") or {}).get("rank_mode") or ""),
+                "model_key": str(model_key_out or ""),
+                "rank_mode": str(rank_mode_out or ""),
                 "max_workers": int(mw),
                 "sell_mode": str(sell_mode),
                 "market_open": False,
@@ -4737,7 +5517,7 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                     "enabled": bool(getattr(req, "risk_filter_enabled", True)),
                     "level": str(risk_level),
                     "effective_top_n": int(effective_top_n),
-                    "index_code": str(getattr(req, "risk_index_code", "399006") or "399006"),
+                    "index_code": str(idx_code or (getattr(req, "risk_index_code", "399006") or "399006")),
                     "ret1d": (risk or {}).get("ret1d") if isinstance(risk, dict) else None,
                     "atr_pct": (risk or {}).get("atr_pct") if isinstance(risk, dict) else None,
                     "gap_open_pct": (risk or {}).get("gap_open_pct") if isinstance(risk, dict) else None,
@@ -4763,6 +5543,7 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                 "pending_orders": storage.list_live_orders(status=None, limit=1000, sim_id=sim_id, portfolio_id=pid),
                 "trades": storage.list_live_trades(limit=200, sim_id=sim_id, portfolio_id=pid),
                 "positions": storage.list_positions(sim_id=sim_id, portfolio_id=pid),
+                "balance": float(current_balance),
             }
             try:
                 storage.add_live_step_record(
@@ -4985,8 +5766,8 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
             "day": int(cur_day or 0),
             "pool_id": pool_id,
             "frequency": freq_raw,
-            "model_key": str(bundle.get("key") or ""),
-            "rank_mode": str((bundle.get("meta") or {}).get("rank_mode") or ""),
+            "model_key": str(model_key_out or ""),
+            "rank_mode": str(rank_mode_out or ""),
             "max_workers": int(mw),
             "sell_mode": str(sell_mode),
             "market_open": True,
@@ -4998,7 +5779,7 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                 "enabled": bool(getattr(req, "risk_filter_enabled", True)),
                 "level": str(risk_level),
                 "effective_top_n": int(effective_top_n),
-                "index_code": str(getattr(req, "risk_index_code", "399006") or "399006"),
+                "index_code": str(idx_code or (getattr(req, "risk_index_code", "399006") or "399006")),
                 "ret1d": (risk or {}).get("ret1d") if isinstance(risk, dict) else None,
                 "atr_pct": (risk or {}).get("atr_pct") if isinstance(risk, dict) else None,
                 "gap_open_pct": (risk or {}).get("gap_open_pct") if isinstance(risk, dict) else None,
@@ -5024,6 +5805,7 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
             "pending_orders": storage.list_live_orders(status=None, limit=1000, sim_id=sim_id, portfolio_id=pid),
             "trades": storage.list_live_trades(limit=200, sim_id=sim_id, portfolio_id=pid),
             "positions": after_pos,
+            "balance": float(current_balance),
         }
         try:
             storage.add_live_step_record(
@@ -5044,6 +5826,8 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
         except Exception:
             pass
         return resp
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()

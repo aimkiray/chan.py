@@ -1202,8 +1202,145 @@ def extract_state_features(chan_snapshot):
     return extract_state_features_from_cur_lv(cur_lv_chan, last_klu)
 
 
-def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, data_src_type=DATA_SRC.BAO_STOCK, preloaded_data=None, do_predict=False, begin_time=None, end_time=None, enable_rolling_lookback=True, autype: AUTYPE = AUTYPE.QFQ, rolling_sample_mode: Optional[str] = None, rolling_stride: Optional[int] = None):
+def _normalize_side_filter(side_filter, default: str = "both") -> str:
+    raw = str(side_filter if side_filter is not None else default).strip().lower()
+    if raw in ["buy", "long", "bull", "b"]:
+        return "buy"
+    if raw in ["sell", "short", "bear", "s"]:
+        return "sell"
+    if raw in ["both", "all", "any", "*", ""]:
+        return "both"
+    return str(default or "both").strip().lower() or "both"
+
+
+def _side_filter_allows(is_buy, side_filter) -> bool:
+    side = _normalize_side_filter(side_filter)
+    if side == "buy":
+        return bool(is_buy)
+    if side == "sell":
+        return not bool(is_buy)
+    return True
+
+
+def _bsp_type_features(bsp_obj, is_buy: bool, sample_kind: str):
+    types = set(getattr(bsp_obj, "type", []) or []) if bsp_obj is not None else set()
+    return {
+        "bsp_is_buy": 1.0 if bool(is_buy) else 0.0,
+        "bsp_type_t1": 1.0 if BSP_TYPE.T1 in types else 0.0,
+        "bsp_type_t1p": 1.0 if BSP_TYPE.T1P in types else 0.0,
+        "bsp_type_t2": 1.0 if BSP_TYPE.T2 in types else 0.0,
+        "bsp_type_t2s": 1.0 if BSP_TYPE.T2S in types else 0.0,
+        "bsp_type_t3a": 1.0 if BSP_TYPE.T3A in types else 0.0,
+        "bsp_type_t3b": 1.0 if BSP_TYPE.T3B in types else 0.0,
+        "sample_kind_event_bsp": 1.0 if str(sample_kind) == "event_bsp" else 0.0,
+        "sample_kind_rolling": 1.0 if str(sample_kind).startswith("rolling") else 0.0,
+        "sample_kind_rolling_bsp": 1.0 if str(sample_kind) == "rolling_bsp" else 0.0,
+        "sample_kind_rolling_every_bar": 1.0 if str(sample_kind) == "rolling_every_bar" else 0.0,
+    }
+
+
+def _add_sample_semantic_features(feat_obj, is_buy: bool, bsp_obj=None, sample_kind: str = "event_bsp"):
+    if feat_obj is None:
+        return
+    try:
+        feat_obj.add_feat(_bsp_type_features(bsp_obj, bool(is_buy), str(sample_kind or "event_bsp")))
+    except Exception:
+        pass
+
+
+def _feature_items_to_dict(feat):
+    try:
+        if feat is None:
+            return {}
+        if isinstance(feat, dict):
+            return dict(feat)
+        if hasattr(feat, "items"):
+            return dict(feat.items())
+        return dict(feat)
+    except Exception:
+        return {}
+
+
+def _sample_semantic_summary_from_infos(infos):
+    out = {
+        "total": 0,
+        "buy": 0,
+        "sell": 0,
+        "event_bsp": 0,
+        "rolling": 0,
+        "types": {"t1": 0, "t1p": 0, "t2": 0, "t2s": 0, "t3a": 0, "t3b": 0},
+    }
+    for info in infos or []:
+        if not isinstance(info, dict):
+            continue
+        out["total"] += 1
+        if bool(info.get("is_buy", False)):
+            out["buy"] += 1
+        else:
+            out["sell"] += 1
+        kind = str(info.get("sample_kind") or "")
+        if kind == "event_bsp":
+            out["event_bsp"] += 1
+        if kind.startswith("rolling"):
+            out["rolling"] += 1
+        bsp_obj = info.get("bsp_obj")
+        types = set(getattr(bsp_obj, "type", []) or []) if bsp_obj is not None else set()
+        if BSP_TYPE.T1 in types:
+            out["types"]["t1"] += 1
+        if BSP_TYPE.T1P in types:
+            out["types"]["t1p"] += 1
+        if BSP_TYPE.T2 in types:
+            out["types"]["t2"] += 1
+        if BSP_TYPE.T2S in types:
+            out["types"]["t2s"] += 1
+        if BSP_TYPE.T3A in types:
+            out["types"]["t3a"] += 1
+        if BSP_TYPE.T3B in types:
+            out["types"]["t3b"] += 1
+    return out
+
+
+def _sample_semantic_summary_from_rows(rows):
+    out = {
+        "total": 0,
+        "buy": 0,
+        "sell": 0,
+        "event_bsp": 0,
+        "rolling": 0,
+        "types": {"t1": 0, "t1p": 0, "t2": 0, "t2s": 0, "t3a": 0, "t3b": 0},
+    }
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        out["total"] += 1
+        if bool(row.get("is_buy", False)):
+            out["buy"] += 1
+        else:
+            out["sell"] += 1
+        kind = str(row.get("sample_kind") or "")
+        if kind == "event_bsp":
+            out["event_bsp"] += 1
+        if kind.startswith("rolling"):
+            out["rolling"] += 1
+        feat = row.get("feature") if isinstance(row.get("feature"), dict) else {}
+        if float(feat.get("bsp_type_t1", 0.0) or 0.0) > 0:
+            out["types"]["t1"] += 1
+        if float(feat.get("bsp_type_t1p", 0.0) or 0.0) > 0:
+            out["types"]["t1p"] += 1
+        if float(feat.get("bsp_type_t2", 0.0) or 0.0) > 0:
+            out["types"]["t2"] += 1
+        if float(feat.get("bsp_type_t2s", 0.0) or 0.0) > 0:
+            out["types"]["t2s"] += 1
+        if float(feat.get("bsp_type_t3a", 0.0) or 0.0) > 0:
+            out["types"]["t3a"] += 1
+        if float(feat.get("bsp_type_t3b", 0.0) or 0.0) > 0:
+            out["types"]["t3b"] += 1
+    return out
+
+
+def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, data_src_type=DATA_SRC.BAO_STOCK, preloaded_data=None, do_predict=False, begin_time=None, end_time=None, enable_rolling_lookback=True, autype: AUTYPE = AUTYPE.QFQ, rolling_sample_mode: Optional[str] = None, rolling_stride: Optional[int] = None, side_filter: Optional[str] = None):
     code = normalize_code(code)
+    side_filter = _normalize_side_filter(side_filter, default="both")
     
     # Adjust begin_time based on frequency to avoid fetching too much data
     import datetime
@@ -1309,9 +1446,10 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
             state_feat = extract_state_features_from_cur_lv(cur_lv_chan, last_klu)
             
             # Record BSP when it appears
-            if last_bsp and last_bsp.klu.idx not in bsp_dict and cur_lv_chan[-2].idx == last_bsp.klu.klc.idx:
+            if last_bsp and _side_filter_allows(last_bsp.is_buy, side_filter) and last_bsp.klu.idx not in bsp_dict and cur_lv_chan[-2].idx == last_bsp.klu.klc.idx:
                 bsp_count += 1
                 feat_copy = CFeatures(dict(last_bsp.features.items()))
+                _add_sample_semantic_features(feat_copy, bool(last_bsp.is_buy), last_bsp, "event_bsp")
                 if state_feat:
                     try:
                         feat_copy.add_feat(state_feat)
@@ -1327,22 +1465,30 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
                     "open_time": last_klu.time,
                     "bsp_obj": last_bsp,
                     "decision_klu": last_klu,
+                    "sample_kind": "event_bsp",
                 }
 
             if rolling_enabled and (i % rolling_stride == 0):
                 is_buy = True
                 base_feat = {}
                 bsp_obj = None
+                sample_kind = "rolling_every_bar"
                 if rolling_mode == "bsp":
                     if not last_bsp:
                         continue
                     is_buy = bool(last_bsp.is_buy)
+                    if not _side_filter_allows(is_buy, side_filter):
+                        continue
                     base_feat = dict(last_bsp.features.items())
                     bsp_obj = last_bsp
+                    sample_kind = "rolling_bsp"
+                elif not _side_filter_allows(is_buy, side_filter):
+                    continue
                 rk = rolling_key_base + int(last_klu.idx) * 2 + (1 if bool(is_buy) else 0)
                 if rk not in bsp_dict:
                     rolling_count += 1
                     feat_copy = CFeatures(dict(base_feat.items()))
+                    _add_sample_semantic_features(feat_copy, bool(is_buy), bsp_obj, sample_kind)
                     if state_feat:
                         try:
                             feat_copy.add_feat(state_feat)
@@ -1358,6 +1504,7 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
                         "open_time": last_klu.time,
                         "bsp_obj": bsp_obj,
                         "decision_klu": last_klu,
+                        "sample_kind": sample_kind,
                     }
 
         print(f"[DEBUG] {code}: Processed {kl_count} K-lines, Found {bsp_count} event BSP samples, Added {rolling_count} rolling samples, Total {len(bsp_dict)}")
@@ -1505,10 +1652,30 @@ def _t1_exit_klu(cur_klu, lookahead: int = 3):
     return future_klu
 
 
+def _info_decision_klu(info):
+    try:
+        decision_klu = (info or {}).get("decision_klu")
+    except Exception:
+        decision_klu = None
+    if decision_klu is not None:
+        return decision_klu
+    try:
+        bsp_obj = (info or {}).get("bsp_obj")
+    except Exception:
+        bsp_obj = None
+    return getattr(bsp_obj, "klu", None) if bsp_obj is not None else None
+
+
 def _profit_for_info(info, lookahead: int = 3, enforce_t1: bool = False):
-    decision_klu = info.get('decision_klu')
-    cur_klu = decision_klu if decision_klu else info['bsp_obj'].klu
-    base_price = cur_klu.close
+    cur_klu = _info_decision_klu(info)
+    if cur_klu is None:
+        return 0.0
+    try:
+        base_price = float(getattr(cur_klu, "close", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+    if base_price <= 0.0:
+        return 0.0
     if bool(enforce_t1):
         future_klu = _t1_exit_klu(cur_klu, lookahead=lookahead)
     else:
@@ -1519,11 +1686,73 @@ def _profit_for_info(info, lookahead: int = 3, enforce_t1: bool = False):
                 future_klu = nxt
             else:
                 break
-    if info['is_buy']:
-        profit = (future_klu.close - base_price) / (base_price or 1e-12)
+    if future_klu is None:
+        return 0.0
+    try:
+        future_close = float(getattr(future_klu, "close", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+    if bool((info or {}).get("is_buy", False)):
+        profit = (future_close - base_price) / (base_price or 1e-12)
     else:
-        profit = (base_price - future_klu.close) / (base_price or 1e-12)
+        profit = (base_price - future_close) / (base_price or 1e-12)
     return float(profit)
+
+
+def _dynamic_profit_threshold_for_info(info, base_threshold: float, use_atr_label: bool = False, atr_period: int = 14, atr_mult: float = 1.0):
+    try:
+        dyn_th = float(base_threshold)
+    except Exception:
+        dyn_th = 0.0
+    if not bool(use_atr_label):
+        return float(dyn_th)
+    cur_klu = _info_decision_klu(info)
+    atr_pct = _atr_pct_from_klu(cur_klu, period=atr_period)
+    if atr_pct is None:
+        return float(dyn_th)
+    try:
+        return float(max(float(dyn_th), float(atr_mult) * float(atr_pct)))
+    except Exception:
+        return float(dyn_th)
+
+
+def _label_from_profit(profit, base_threshold: float, atr_pct=None, use_atr_label: bool = False, atr_mult: float = 1.0, trade_cost: float = 0.0):
+    try:
+        dyn_th = float(base_threshold)
+    except Exception:
+        dyn_th = 0.0
+    if bool(use_atr_label) and atr_pct is not None:
+        try:
+            dyn_th = float(max(float(dyn_th), float(atr_mult) * float(atr_pct)))
+        except Exception:
+            pass
+    try:
+        net_profit = float(profit) - float(trade_cost or 0.0)
+    except Exception:
+        net_profit = 0.0
+    return 1 if float(net_profit) > float(dyn_th) else 0, float(net_profit), float(dyn_th)
+
+
+def _label_for_info(info, base_threshold: float, profit_lookahead: int = 3, use_atr_label: bool = False, atr_period: int = 14, atr_mult: float = 1.0, enforce_t1: bool = False, trade_cost: float = 0.0):
+    profit = _profit_for_info(info, lookahead=profit_lookahead, enforce_t1=enforce_t1)
+    atr_pct = None
+    if bool(use_atr_label):
+        atr_pct = _atr_pct_from_klu(_info_decision_klu(info), period=atr_period)
+    label, net_profit, dyn_th = _label_from_profit(
+        profit,
+        base_threshold,
+        atr_pct=atr_pct,
+        use_atr_label=use_atr_label,
+        atr_mult=atr_mult,
+        trade_cost=trade_cost,
+    )
+    return {
+        "label": int(label),
+        "profit": float(profit),
+        "net_profit": float(net_profit),
+        "threshold": float(dyn_th),
+        "atr_pct": atr_pct,
+    }
 
 def _exit_ts_for_info(info, lookahead: int = 3, enforce_t1: bool = False) -> int:
     try:
@@ -1614,11 +1843,11 @@ def _min_profit_for_info(info, lookahead: int = 3, enforce_t1: bool = False):
         return 0.0
     return float(min_p)
 
-def _auto_profit_threshold_from_infos(infos, q: float = 0.7, min_threshold: float = 0.0, profit_lookahead: int = 3, enforce_t1: bool = False):
+def _auto_profit_threshold_from_infos(infos, q: float = 0.7, min_threshold: float = 0.0, profit_lookahead: int = 3, enforce_t1: bool = False, trade_cost: float = 0.0):
     profits = []
     for info in infos or []:
         try:
-            profits.append(_profit_for_info(info, lookahead=profit_lookahead, enforce_t1=enforce_t1))
+            profits.append(_profit_for_info(info, lookahead=profit_lookahead, enforce_t1=enforce_t1) - float(trade_cost or 0.0))
         except Exception:
             continue
     if not profits:
@@ -1635,6 +1864,7 @@ def build_training_data(
     atr_period: int = 14,
     atr_mult: float = 1.0,
     enforce_t1: bool = False,
+    trade_cost: float = 0.0,
 ):
     X = []
     y = []
@@ -1650,27 +1880,25 @@ def build_training_data(
 
     infos = list(bsp_dict.values())
     if profit_threshold is None:
-        used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1)
+        used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1, trade_cost=trade_cost)
     else:
         used_profit_threshold = float(profit_threshold)
 
     for _, info in bsp_dict.items():
         try:
-            profit = _profit_for_info(info, lookahead=profit_lookahead, enforce_t1=enforce_t1)
+            label_meta = _label_for_info(
+                info,
+                used_profit_threshold,
+                profit_lookahead=profit_lookahead,
+                use_atr_label=use_atr_label,
+                atr_period=atr_period,
+                atr_mult=atr_mult,
+                enforce_t1=enforce_t1,
+                trade_cost=trade_cost,
+            )
         except Exception:
-            profit = 0.0
-        dyn_th = float(used_profit_threshold)
-        if bool(use_atr_label):
-            decision_klu = info.get("decision_klu")
-            bsp_obj = info.get("bsp_obj")
-            cur_klu = decision_klu if decision_klu is not None else (getattr(bsp_obj, "klu", None) if bsp_obj is not None else None)
-            atr_pct = _atr_pct_from_klu(cur_klu, period=atr_period)
-            if atr_pct is not None:
-                try:
-                    dyn_th = float(max(dyn_th, float(atr_mult) * float(atr_pct)))
-                except Exception:
-                    dyn_th = float(used_profit_threshold)
-        label = 1 if float(profit) > float(dyn_th) else 0
+            label_meta = {"label": 0}
+        label = int(label_meta.get("label", 0))
         fill_zero_features = {"bsp2s_break_bi_amp", "bsp2_break_bi_amp", "divergence_rate"}
         feat_vec = []
         for k in feature_meta:
@@ -1694,14 +1922,21 @@ def build_training_data(
 
     return X, y, feature_meta
 
+def build_feature_meta_from_infos(infos):
+    if not infos:
+        return []
+    all_keys = set()
+    for info in infos or []:
+        feat = (info or {}).get("feature") if isinstance(info, dict) else None
+        for k in _feature_items_to_dict(feat).keys():
+            all_keys.add(k)
+    return sorted(all_keys)
+
+
 def build_feature_meta(bsp_dict):
     if not bsp_dict:
         return []
-    all_keys = set()
-    for info in bsp_dict.values():
-        for k in info['feature'].keys():
-            all_keys.add(k)
-    return sorted(all_keys)
+    return build_feature_meta_from_infos(list(bsp_dict.values()))
 
 def build_training_data_from_infos(
     infos,
@@ -1713,6 +1948,7 @@ def build_training_data_from_infos(
     atr_period: int = 14,
     atr_mult: float = 1.0,
     enforce_t1: bool = False,
+    trade_cost: float = 0.0,
 ):
     X = []
     y = []
@@ -1720,27 +1956,25 @@ def build_training_data_from_infos(
         return X, y
 
     if profit_threshold is None:
-        used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1)
+        used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1, trade_cost=trade_cost)
     else:
         used_profit_threshold = float(profit_threshold)
 
     for info in infos:
         try:
-            profit = _profit_for_info(info, lookahead=profit_lookahead, enforce_t1=enforce_t1)
+            label_meta = _label_for_info(
+                info,
+                used_profit_threshold,
+                profit_lookahead=profit_lookahead,
+                use_atr_label=use_atr_label,
+                atr_period=atr_period,
+                atr_mult=atr_mult,
+                enforce_t1=enforce_t1,
+                trade_cost=trade_cost,
+            )
         except Exception:
-            profit = 0.0
-        dyn_th = float(used_profit_threshold)
-        if bool(use_atr_label):
-            decision_klu = info.get("decision_klu")
-            bsp_obj = info.get("bsp_obj")
-            cur_klu = decision_klu if decision_klu is not None else (getattr(bsp_obj, "klu", None) if bsp_obj is not None else None)
-            atr_pct = _atr_pct_from_klu(cur_klu, period=atr_period)
-            if atr_pct is not None:
-                try:
-                    dyn_th = float(max(dyn_th, float(atr_mult) * float(atr_pct)))
-                except Exception:
-                    dyn_th = float(used_profit_threshold)
-        label = 1 if float(profit) > float(dyn_th) else 0
+            label_meta = {"label": 0}
+        label = int(label_meta.get("label", 0))
         fill_zero_features = {"bsp2s_break_bi_amp", "bsp2_break_bi_amp", "divergence_rate"}
         feat_vec = []
         for k in feature_meta:
@@ -4428,13 +4662,13 @@ def _walk_forward_eval_infos(
             continue
 
         if profit_threshold is None:
-            used_profit_threshold = _auto_profit_threshold_from_infos(train_infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1)
+            used_profit_threshold = _auto_profit_threshold_from_infos(train_infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1, trade_cost=trade_cost)
         else:
             used_profit_threshold = float(profit_threshold)
 
-        X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
-        X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
-        X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
+        X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+        X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+        X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
 
         if not X_train or not X_test or len(set(y_train)) < 2:
             train_end += step
@@ -4468,23 +4702,23 @@ def _walk_forward_eval_infos(
                 filtered_meta, sign_map = _ic_filter_feature_meta(X_train, y_train, feature_meta, abs_ic_threshold=abs_th, top_n=ic_top_n, min_n=ic_min_n)
                 if filtered_meta and len(filtered_meta) >= 2 and filtered_meta != list(feature_meta or []):
                     feature_meta = list(filtered_meta)
-                    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
-                    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
-                    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
+                    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+                    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+                    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
                 drop_features = _env_csv_list("MLCHAN_DROP_FEATURES", "zs_last_is_sure")
                 feature_meta2, changed = _apply_drop_features(feature_meta, drop_features)
                 if changed:
                     feature_meta = list(feature_meta2)
-                    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
-                    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
-                    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
+                    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+                    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+                    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
                 if forced_features:
                     merged = _merge_forced_features(feature_meta, forced_features, max_n=max(2, int(len(feature_meta or [])) + int(len(forced_features or []))))
                     if merged and merged != list(feature_meta or []):
                         feature_meta = list(merged)
-                        X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
-                        X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
-                        X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
+                        X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+                        X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+                        X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
                 monotone_constraints = _build_monotone_constraints(feature_meta, sign_map=sign_map)
 
         dbg_feats = _debug_feature_list()
@@ -4551,9 +4785,9 @@ def _walk_forward_eval_infos(
             feature_meta = list(feature_meta2)
         selected_features = list(feature_sel_meta.get("selected_features") or feature_meta or [])
 
-        X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
-        X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
-        X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1)
+        X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+        X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+        X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
         if not X_train or not X_test or len(set(y_train)) < 2:
             train_end += step
             used_folds += 1
@@ -4990,9 +5224,10 @@ def evaluate_model_accuracy(model, X, y, threshold=0.5):
 
     return correct, total, (correct / total if total > 0 else 0.0)
 
-def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, val_ratio=0.2, threshold=0.5, calibrate_method="none", min_train=200, min_val=200, min_test=500, n_jobs=-1, profit_threshold: Optional[float] = 0.02, auto_profit_quantile: float = 0.7, profit_lookahead: int = 3, use_atr_label: bool = False, atr_period: int = 14, atr_mult: float = 1.0, use_scale_pos_weight: bool = False, xgb_max_depth: Optional[int] = None, xgb_reg_alpha: Optional[float] = None, xgb_reg_lambda: Optional[float] = None, lgb_max_depth: Optional[int] = None, lgb_reg_alpha: Optional[float] = None, lgb_reg_lambda: Optional[float] = None, backtest_mode: str = "auto", walk_forward_max_folds: int = 20, walk_forward_test_window: Optional[int] = None, walk_forward_val_window: Optional[int] = None, walk_forward_step: Optional[int] = None, trade_cost: float = 0.0, topk_frac: float = 0.2, quantile_bin_count: int = 5, rank_transform_enabled: Optional[bool] = None, only_features=None, enforce_t1: bool = False, fixed_test_start_ts: Optional[int] = None):
+def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, val_ratio=0.2, threshold=0.5, calibrate_method="none", min_train=200, min_val=200, min_test=500, n_jobs=-1, profit_threshold: Optional[float] = 0.02, auto_profit_quantile: float = 0.7, profit_lookahead: int = 3, use_atr_label: bool = False, atr_period: int = 14, atr_mult: float = 1.0, use_scale_pos_weight: bool = False, xgb_max_depth: Optional[int] = None, xgb_reg_alpha: Optional[float] = None, xgb_reg_lambda: Optional[float] = None, lgb_max_depth: Optional[int] = None, lgb_reg_alpha: Optional[float] = None, lgb_reg_lambda: Optional[float] = None, backtest_mode: str = "auto", walk_forward_max_folds: int = 20, walk_forward_test_window: Optional[int] = None, walk_forward_val_window: Optional[int] = None, walk_forward_step: Optional[int] = None, trade_cost: float = 0.0, topk_frac: float = 0.2, quantile_bin_count: int = 5, rank_transform_enabled: Optional[bool] = None, only_features=None, enforce_t1: bool = False, fixed_test_start_ts: Optional[int] = None, side_filter: Optional[str] = None):
     empty_model = None
     empty_meta = []
+    side_filter = _normalize_side_filter(side_filter, default="both")
     if not bsp_dict:
         return empty_model, empty_meta, {
             "valid_count": 0,
@@ -5011,17 +5246,22 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             "pr_auc": None,
             "logloss": 0.0,
             "baseline": {},
+            "side_filter": side_filter,
+            "sample_summary": _sample_semantic_summary_from_infos([]),
             "trading": {},
             "reversal_check": {},
         }
 
     infos = list(bsp_dict.values())
+    if side_filter != "both":
+        infos = [info for info in infos if _side_filter_allows((info or {}).get("is_buy", False), side_filter)]
     try:
         infos.sort(key=lambda i: getattr(i.get("open_time"), "ts", 0))
     except Exception:
         pass
 
     n = len(infos)
+    sample_summary = _sample_semantic_summary_from_infos(infos)
     calibrate_method_req = _normalize_calibrate_method(calibrate_method)
     forced_features = _force_feature_list()
     only_features_list = _csv_list_from_raw(only_features) if only_features is not None else None
@@ -5062,6 +5302,8 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             "bad_cases": [],
             "feature_importance": [],
             "baseline": {},
+            "side_filter": side_filter,
+            "sample_summary": sample_summary,
             "trading": {}
         }
 
@@ -5118,14 +5360,14 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             fixed_test_start_ts=fixed_test_start_ts,
         )
 
-        feature_meta = build_feature_meta(bsp_dict)
+        feature_meta = build_feature_meta_from_infos(infos)
         if only_features_list:
             feature_meta = list(only_features_list or [])
         if profit_threshold is None:
-            used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1)
+            used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1, trade_cost=trade_cost)
         else:
             used_profit_threshold = float(profit_threshold)
-        X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1)
+        X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
 
         monotone_constraints = None
         monotone_sign_map = None
@@ -5157,17 +5399,17 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
                 filtered_meta, sign_map = _ic_filter_feature_meta(X_all, y_all, feature_meta, abs_ic_threshold=abs_th, top_n=ic_top_n, min_n=ic_min_n)
                 if filtered_meta and len(filtered_meta) >= 2 and filtered_meta != list(feature_meta or []):
                     feature_meta = list(filtered_meta)
-                    X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                    X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
                 drop_features = _env_csv_list("MLCHAN_DROP_FEATURES", "zs_last_is_sure")
                 feature_meta2, changed = _apply_drop_features(feature_meta, drop_features)
                 if changed:
                     feature_meta = list(feature_meta2)
-                    X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                    X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
                 if forced_features:
                     merged = _merge_forced_features(feature_meta, forced_features, max_n=max(2, int(len(feature_meta or [])) + int(len(forced_features or []))))
                     if merged and merged != list(feature_meta or []):
                         feature_meta = list(merged)
-                        X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                        X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
                 monotone_constraints = _build_monotone_constraints(feature_meta, sign_map=sign_map)
                 if isinstance(sign_map, dict):
                     monotone_sign_map = dict(sign_map)
@@ -5211,7 +5453,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
                     selected_features = _merge_forced_features(selected_features, forced_features, max_n=int(topk))
                 if len(selected_features) >= 2:
                     feature_meta2 = list(selected_features)
-                    X_all2, y_all2 = build_training_data_from_infos(infos, feature_meta2, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                    X_all2, y_all2 = build_training_data_from_infos(infos, feature_meta2, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
                     if X_all2 and len(set(y_all2 or [])) >= 2:
                         try:
                             monotone_constraints2 = None
@@ -5358,6 +5600,8 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             info["final_model_calibrate_method"] = final_calibrate_method
             info["profit_threshold"] = float(used_profit_threshold)
             info["profit_lookahead"] = int(profit_lookahead or 0)
+            info["side_filter"] = side_filter
+            info["sample_summary"] = sample_summary
             info["selected_features"] = list(selected_features or [])
             info["rank_transformed"] = bool(rank_cols_all)
             info["winsorized"] = bool(winsor_bounds_all)
@@ -5376,7 +5620,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
         test_ratio = 0.3
 
     if n < (min_train + min_val + min_test):
-        feature_meta = build_feature_meta(bsp_dict)
+        feature_meta = build_feature_meta_from_infos(infos)
         return None, feature_meta, {
             "valid_count": 0,
             "total_count": 0,
@@ -5388,6 +5632,8 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             "brier_score": 0.0,
             "ece": 0.0,
             "calibration_bins": [],
+            "side_filter": side_filter,
+            "sample_summary": sample_summary,
             "detail": f"need>={int(min_train) + int(min_val) + int(min_test)} samples for train/val/test; got n={int(n)}",
         }
 
@@ -5400,16 +5646,16 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
     val_infos = infos[train_end:val_end]
     test_infos = infos[val_end:]
 
-    feature_meta = build_feature_meta(bsp_dict)
+    feature_meta = build_feature_meta_from_infos(infos)
     if only_features_list:
         feature_meta = list(only_features_list or [])
     if profit_threshold is None:
-        used_profit_threshold = _auto_profit_threshold_from_infos(train_infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead)
+        used_profit_threshold = _auto_profit_threshold_from_infos(train_infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1, trade_cost=trade_cost)
     else:
         used_profit_threshold = float(profit_threshold)
-    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
+    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
     monotone_constraints = None
     winsor_bounds = None
     if model_type in ["xgboost", "lightgbm"]:
@@ -5438,23 +5684,23 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             filtered_meta, sign_map = _ic_filter_feature_meta(X_train, y_train, feature_meta, abs_ic_threshold=abs_th, top_n=ic_top_n, min_n=ic_min_n)
             if filtered_meta and len(filtered_meta) >= 2 and filtered_meta != list(feature_meta or []):
                 feature_meta = list(filtered_meta)
-                X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-                X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-                X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
+                X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+                X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+                X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
             drop_features = _env_csv_list("MLCHAN_DROP_FEATURES", "zs_last_is_sure")
             feature_meta2, changed = _apply_drop_features(feature_meta, drop_features)
             if changed:
                 feature_meta = list(feature_meta2)
-                X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
-                X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
-                X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+                X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+                X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
             if forced_features:
                 merged = _merge_forced_features(feature_meta, forced_features, max_n=max(2, int(len(feature_meta or [])) + int(len(forced_features or []))))
                 if merged and merged != list(feature_meta or []):
                     feature_meta = list(merged)
-                    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
-                    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
-                    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+                    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+                    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
             monotone_constraints = _build_monotone_constraints(feature_meta, sign_map=sign_map)
 
     dbg_feats = _debug_feature_list()
@@ -5490,6 +5736,8 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             "ece": 0.0,
             "calibration_bins": [],
             "class_balance": class_balance,
+            "side_filter": side_filter,
+            "sample_summary": sample_summary,
             "scale_pos_weight": scale_pos_weight,
         }
 
@@ -5543,9 +5791,9 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             if feature_meta2:
                 feature_meta = list(feature_meta2)
                 selected_features = list(feature_meta2)
-                X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
-                X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
-                X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead)
+                X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+                X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+                X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
                 X_train, X_val, X_test, rank_cols = _maybe_rank_transform_splits(X_train, X_val, X_test, feature_meta=feature_meta, rank_transform_enabled=rank_transform_enabled)
                 X_train, X_val, X_test, winsor_bounds = _maybe_winsorize_splits(X_train, X_val, X_test)
                 class_balance = {
@@ -5715,6 +5963,8 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
         "train_count": len(X_train),
         "val_count": len(X_val),
         "test_count": len(X_test),
+        "side_filter": side_filter,
+        "sample_summary": sample_summary,
         "rank_transformed": bool(rank_cols),
         "rank_transform": _rank_debug_meta(feature_meta, rank_cols),
         "feature_value_stats": {"train_pre_rank": dbg_pre, "train_post_rank": dbg_post_rank, "train_post_winsor": dbg_post_winsor},
@@ -6449,7 +6699,7 @@ def _find_bad_cases(infos, probs, y_true, profits, prob_threshold=0.1):
     bad_cases.sort(key=lambda x: x["profit"], reverse=True)
     return bad_cases[:20] # Return top 20
 
-def evaluate_fixed_model_time_split(bsp_dict, model, feature_meta, test_ratio=0.2, threshold=0.5, min_test=500, profit_threshold: Optional[float] = 0.02, auto_profit_quantile: float = 0.7, profit_lookahead: int = 3, trade_cost: float = 0.0, topk_frac: float = 0.2, quantile_bin_count: int = 5):
+def evaluate_fixed_model_time_split(bsp_dict, model, feature_meta, test_ratio=0.2, threshold=0.5, min_test=500, profit_threshold: Optional[float] = 0.02, auto_profit_quantile: float = 0.7, profit_lookahead: int = 3, trade_cost: float = 0.0, topk_frac: float = 0.2, quantile_bin_count: int = 5, side_filter: Optional[str] = None, use_atr_label: bool = False, atr_period: int = 14, atr_mult: float = 1.0, enforce_t1: bool = False):
     if not bsp_dict or not model or not feature_meta:
         return {
             "valid_count": 0,
@@ -6470,14 +6720,18 @@ def evaluate_fixed_model_time_split(bsp_dict, model, feature_meta, test_ratio=0.
         }
 
     infos = list(bsp_dict.values())
+    side_filter = _normalize_side_filter(side_filter, default="both")
+    if side_filter != "both":
+        infos = [info for info in infos if _side_filter_allows((info or {}).get("is_buy", False), side_filter)]
     try:
         infos.sort(key=lambda i: getattr(i.get("open_time"), "ts", 0))
     except Exception:
         pass
 
     n = len(infos)
+    sample_summary = _sample_semantic_summary_from_infos(infos)
     if n <= 1:
-        X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=profit_threshold, auto_profit_quantile=auto_profit_quantile, profit_lookahead=profit_lookahead)
+        X_all, y_all = build_training_data_from_infos(infos, feature_meta, profit_threshold=profit_threshold, auto_profit_quantile=auto_profit_quantile, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
         probs = predict_proba_1(model, X_all) if X_all and y_all else []
         valid_count, total_count, acc = _accuracy_from_probs(y_all, probs, threshold=threshold)
         return {
@@ -6495,6 +6749,8 @@ def evaluate_fixed_model_time_split(bsp_dict, model, feature_meta, test_ratio=0.
             "pr_auc": _pr_auc_from_probs(y_all, probs),
             "logloss": _logloss_from_probs(y_all, probs),
             "baseline": {},
+            "side_filter": side_filter,
+            "sample_summary": sample_summary,
             "trading": {}
         }
 
@@ -6505,14 +6761,14 @@ def evaluate_fixed_model_time_split(bsp_dict, model, feature_meta, test_ratio=0.
     train_infos = infos[:split]
     test_infos = infos[split:]
 
-    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=profit_threshold, auto_profit_quantile=auto_profit_quantile, profit_lookahead=profit_lookahead)
+    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=profit_threshold, auto_profit_quantile=auto_profit_quantile, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
     probs = predict_proba_1(model, X_test) if X_test and y_test else []
     valid_count, total_count, acc = _accuracy_from_probs(y_test, probs, threshold=threshold)
 
     profit_test = []
     for info in test_infos:
         try:
-            profit_test.append(float(_profit_for_info(info, lookahead=profit_lookahead)))
+            profit_test.append(float(_profit_for_info(info, lookahead=profit_lookahead, enforce_t1=enforce_t1)))
         except Exception:
             profit_test.append(0.0)
 
@@ -6522,7 +6778,7 @@ def evaluate_fixed_model_time_split(bsp_dict, model, feature_meta, test_ratio=0.
     bad_cases = _find_bad_cases(test_infos, probs, y_test, profit_test, prob_threshold=0.1)
     feat_imp = _get_feature_importance(model, feature_meta)
 
-    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=profit_threshold, auto_profit_quantile=auto_profit_quantile, profit_lookahead=profit_lookahead)
+    X_train, y_train = build_training_data_from_infos(train_infos, feature_meta, profit_threshold=profit_threshold, auto_profit_quantile=auto_profit_quantile, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
     neg_c, pos_c = _binary_class_counts(y_train)
     train_pos_rate = (float(pos_c) / float(neg_c + pos_c)) if (neg_c + pos_c) > 0 else 0.0
     baseline_zero = [0.0 for _ in range(len(y_test or []))]
@@ -6533,7 +6789,7 @@ def evaluate_fixed_model_time_split(bsp_dict, model, feature_meta, test_ratio=0.
     profit_test = []
     for info in test_infos:
         try:
-            profit_test.append(float(_profit_for_info(info, lookahead=profit_lookahead)))
+            profit_test.append(float(_profit_for_info(info, lookahead=profit_lookahead, enforce_t1=enforce_t1)))
         except Exception:
             profit_test.append(0.0)
 
@@ -6618,6 +6874,8 @@ def evaluate_fixed_model_time_split(bsp_dict, model, feature_meta, test_ratio=0.
                 "train_pos_rate": float(train_pos_rate),
             },
         },
+        "side_filter": side_filter,
+        "sample_summary": sample_summary,
         "trading": {
             "threshold": {
                 "threshold": float(threshold),
@@ -6661,6 +6919,8 @@ def _process_code_for_pretrain(args):
     atr_period = 14
     atr_mult = 1.0
     high_vol_atr_pct_min = None
+    trade_cost = 0.0
+    side_filter = "buy"
     if isinstance(args, (list, tuple)) and len(args) >= 6:
         code, level, begin_time, data_src_type, profit_threshold, profit_lookahead = args[:6]
         if len(args) >= 7:
@@ -6681,6 +6941,14 @@ def _process_code_for_pretrain(args):
         code, level, begin_time, data_src_type = args
         if isinstance(args, (list, tuple)) and len(args) >= 5:
             autype = args[4]
+    if isinstance(args, (list, tuple)) and len(args) >= 14:
+        try:
+            trade_cost = float(args[13] or 0.0)
+        except Exception:
+            trade_cost = 0.0
+    if isinstance(args, (list, tuple)) and len(args) >= 15:
+        side_filter = args[14]
+    side_filter = _normalize_side_filter(side_filter, default="buy")
     code = normalize_code(code)
     try:
         if not isinstance(autype, AUTYPE):
@@ -6745,6 +7013,7 @@ def _process_code_for_pretrain(args):
             autype=autype,
             rolling_sample_mode=rolling_mode,
             rolling_stride=stride_override,
+            side_filter=side_filter,
         )
         
         local_samples = []
@@ -6752,33 +7021,33 @@ def _process_code_for_pretrain(args):
         
         if bsp_dict:
             for info in bsp_dict.values():
-                decision_klu = info.get("decision_klu", None)
-                bsp_obj = info.get("bsp_obj", None)
-                cur_klu = decision_klu if decision_klu is not None else (getattr(bsp_obj, "klu", None) if bsp_obj else None)
+                cur_klu = _info_decision_klu(info)
                 if not cur_klu:
                     continue
-                future_klu = cur_klu
-                for _ in range(int(profit_lookahead or 0)):
-                    nxt = getattr(future_klu, "next", None)
-                    if nxt:
-                        future_klu = nxt
-                    else:
-                        break
-                try:
-                    cur_close = float(cur_klu.close)
-                    future_close = float(future_klu.close)
-                except Exception:
-                    continue
-                if not cur_close:
-                    continue
-
-                is_buy = bool(info.get("is_buy", False))
-                profit = (future_close - cur_close) / cur_close if is_buy else (cur_close - future_close) / cur_close
+                profit = _profit_for_info(info, lookahead=int(profit_lookahead or 0))
                 try:
                     used_profit_threshold = None if profit_threshold is None else float(profit_threshold)
                 except Exception:
                     used_profit_threshold = 0.01
-                label = None if used_profit_threshold is None else (1 if float(profit) > used_profit_threshold else 0)
+                atr_pct = None
+                if bool(use_atr_label):
+                    try:
+                        atr_pct = _atr_pct_from_klu(cur_klu, period=atr_period)
+                    except Exception:
+                        atr_pct = None
+                if used_profit_threshold is None:
+                    label = None
+                    net_profit = float(profit) - float(trade_cost or 0.0)
+                    label_threshold = None
+                else:
+                    label, net_profit, label_threshold = _label_from_profit(
+                        profit,
+                        used_profit_threshold,
+                        atr_pct=atr_pct,
+                        use_atr_label=use_atr_label,
+                        atr_mult=atr_mult,
+                        trade_cost=trade_cost,
+                    )
 
                 feat = info.get("feature", None)
                 feat_dict = {}
@@ -6803,12 +7072,19 @@ def _process_code_for_pretrain(args):
                     open_ts = int(getattr(info.get("open_time", None), "ts", 0) or 0)
                 except Exception:
                     open_ts = 0
-                sample = {"code": code, "open_ts": open_ts, "feature": feat_dict, "profit": float(profit), "label": label}
+                sample = {
+                    "code": code,
+                    "open_ts": open_ts,
+                    "feature": feat_dict,
+                    "profit": float(profit),
+                    "net_profit": float(net_profit),
+                    "label": label,
+                    "label_threshold": label_threshold,
+                    "is_buy": bool(info.get("is_buy", False)),
+                    "sample_kind": str(info.get("sample_kind") or ""),
+                }
                 if bool(use_atr_label):
-                    try:
-                        sample["atr_pct"] = _atr_pct_from_klu(cur_klu, period=atr_period)
-                    except Exception:
-                        sample["atr_pct"] = None
+                    sample["atr_pct"] = atr_pct
                 local_samples.append(sample)
         
         return code, latest_time, local_samples, feature_keys, {"atr_pct": vol_atr_pct, "high_vol_filtered": False}
@@ -6836,10 +7112,15 @@ def pretrain_and_persist_model(
     use_atr_label: bool = False,
     atr_period: int = 14,
     atr_mult: float = 1.0,
+    trade_cost: float = 0.0,
+    topk_frac: float = 0.2,
+    portfolio_min_score: Optional[float] = None,
+    portfolio_top_n: Optional[int] = None,
     rank_mode: str = "sample",
     rolling_sample_mode: Optional[str] = None,
     rolling_stride: Optional[int] = None,
     only_features: Optional[list] = None,
+    side_filter: str = "buy",
 ):
     if not codes:
         return None, {
@@ -6866,6 +7147,7 @@ def pretrain_and_persist_model(
     filtered_codes = []
     samples = []
     feature_keys = set()
+    side_filter = _normalize_side_filter(side_filter, default="buy")
 
     if whitelist_codes:
         wl = set()
@@ -6912,7 +7194,7 @@ def pretrain_and_persist_model(
                 autype_name = "HFQ"
 
             tasks = [
-                (code, level, begin_time, data_src_type, profit_threshold, profit_lookahead, autype_name, bool(use_atr_label), atr_period, atr_mult, high_vol_atr_pct_min, rolling_sample_mode, rolling_stride)
+                (code, level, begin_time, data_src_type, profit_threshold, profit_lookahead, autype_name, bool(use_atr_label), atr_period, atr_mult, high_vol_atr_pct_min, rolling_sample_mode, rolling_stride, float(trade_cost or 0.0), side_filter)
                 for code in codes
             ]
             future_to_code = {executor.submit(_process_code_for_pretrain, t): t[0] for t in tasks}
@@ -6971,6 +7253,7 @@ def pretrain_and_persist_model(
             if keep:
                 feature_meta = keep
         samples.sort(key=lambda s: int(s.get("open_ts", 0) or 0))
+        sample_summary = _sample_semantic_summary_from_rows(samples)
 
         rm = str(rank_mode or "sample").strip().lower()
         if rm == "cross_section":
@@ -6995,15 +7278,15 @@ def pretrain_and_persist_model(
                 if "profit" in r and r.get("profit") is not None:
                     try:
                         p = float(r.get("profit"))
-                        th = float(used_profit_threshold)
-                        if bool(use_atr_label):
-                            ap = r.get("atr_pct", None)
-                            if ap is not None:
-                                try:
-                                    th = float(max(th, float(atr_mult) * float(ap)))
-                                except Exception:
-                                    th = float(used_profit_threshold)
-                        y.append(1 if float(p) > float(th) else 0)
+                        label, _, _ = _label_from_profit(
+                            p,
+                            used_profit_threshold,
+                            atr_pct=r.get("atr_pct", None),
+                            use_atr_label=use_atr_label,
+                            atr_mult=atr_mult,
+                            trade_cost=trade_cost,
+                        )
+                        y.append(int(label))
                     except Exception:
                         y.append(int(r.get("label", 0) or 0))
                 else:
@@ -7026,7 +7309,7 @@ def pretrain_and_persist_model(
                     if r.get("profit") is None:
                         continue
                     try:
-                        profits.append(float(r.get("profit")))
+                        profits.append(float(r.get("profit")) - float(trade_cost or 0.0))
                     except Exception:
                         continue
                 used_profit_threshold = max(0.0, _quantile(profits, auto_profit_quantile)) if profits else 0.0
@@ -7068,7 +7351,7 @@ def pretrain_and_persist_model(
                     if r.get("profit") is None:
                         continue
                     try:
-                        profits.append(float(r.get("profit")))
+                        profits.append(float(r.get("profit")) - float(trade_cost or 0.0))
                     except Exception:
                         continue
                 used_profit_threshold = max(0.0, _quantile(profits, auto_profit_quantile)) if profits else 0.0
@@ -7251,6 +7534,10 @@ def pretrain_and_persist_model(
 
             model = score_model
 
+        if isinstance(accuracy_info, dict):
+            accuracy_info["side_filter"] = side_filter
+            accuracy_info["sample_summary"] = sample_summary
+
         if not model:
             return None, {
                 "status": "error",
@@ -7265,6 +7552,7 @@ def pretrain_and_persist_model(
             "per_code_latest_time": per_code_latest_time,
             "per_code_sample_count": per_code_sample_count,
             "sample_count": len(samples),
+            "sample_summary": sample_summary,
             "pool_name": pool_name,
             "whitelist_codes": (list(whitelist_codes) if whitelist_codes else None),
             "high_vol_atr_pct_min": (float(high_vol_atr_pct_min) if high_vol_atr_pct_min is not None else None),
@@ -7273,12 +7561,16 @@ def pretrain_and_persist_model(
             "use_atr_label": bool(use_atr_label),
             "atr_period": int(atr_period or 0),
             "atr_mult": float(atr_mult),
+            "trade_cost": float(trade_cost or 0.0),
             "profit_threshold": used_profit_threshold,
             "profit_lookahead": int(profit_lookahead or 0),
+            "side_filter": side_filter,
             "rank_mode": rm,
             "rolling_sample_mode": (str(rolling_sample_mode or "").strip().lower() if rolling_sample_mode is not None else None),
             "rolling_stride": (int(rolling_stride) if rolling_stride is not None else None),
             "only_features": (list(feature_meta) if feature_meta else None),
+            "portfolio_min_score": (float(portfolio_min_score) if portfolio_min_score is not None else None),
+            "portfolio_top_n": (int(portfolio_top_n) if portfolio_top_n is not None else None),
         }
         report("saving", 0.95, "saving")
         path, model_key, trained_at = save_pretrained_model_bundle(
