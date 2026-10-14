@@ -1,0 +1,211 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-07-07",
+  "presets": [
+    {
+      "name": "balanced_purify_5m",
+      "version": "2026.07.07",
+      "status": "active",
+      "description": "5min 默认均衡提纯策略，适合样本充足、波动适中的个股。",
+      "tags": ["5m", "balanced", "xgboost", "buy"],
+      "scenario": {
+        "frequency": "5m",
+        "holding": "short_swing",
+        "suitable_for": ["成交活跃", "趋势和震荡切换", "买点样本充足"],
+        "avoid": ["极端低流动性", "原始买点盈亏比显著偏弱"]
+      },
+      "params": {
+        "frequency": "5m",
+        "data_length_mode": "default",
+        "data_length_years": 0.25,
+        "model": "xgboost",
+        "feature_preset": "purify_compact",
+        "side_filter": "buy",
+        "profit_lookahead": 6,
+        "holding_period": 6,
+        "trade_cost": 0.001,
+        "topk_frac": 0.2,
+        "backtest_mode": "walk_forward",
+        "walk_forward_max_folds": 20,
+        "rank_transform_enabled": true,
+        "enforce_t1": true
+      },
+      "gates": [
+        {"metric": "sample_summary.buy", "op": ">=", "value": 200, "message": "buy samples should be at least 200"},
+        {"metric": "roc_auc", "op": ">=", "value": 0.58, "message": "AUC should show useful ranking power"},
+        {"metric": "brier_score", "op": "<=", "value": 0.25, "message": "probability calibration should stay controlled"},
+        {"metric": "trading.topk.avg_net_profit", "op": ">", "value": 0.0, "message": "top-k net expectancy must be positive"},
+        {"metric": "trading.topk.profit_factor", "op": ">=", "value": 1.3, "message": "top-k profit factor should clear the live threshold"}
+      ],
+      "score": {
+        "terms": [
+          {"metric": "trading.topk.avg_net_profit", "weight": 100.0},
+          {"metric": "trading.topk.profit_factor", "weight": 0.2, "infinite": 10.0},
+          {"metric": "roc_auc", "weight": 1.0},
+          {"metric": "brier_score", "weight": -0.8}
+        ]
+      }
+    },
+    {
+      "name": "trend_extend_5m",
+      "version": "2026.07.07",
+      "status": "active",
+      "description": "趋势延续策略，持有窗口更长，适合主升或强趋势延续场景。",
+      "tags": ["5m", "trend", "xgboost", "buy"],
+      "scenario": {
+        "frequency": "5m",
+        "holding": "trend_extend",
+        "suitable_for": ["趋势斜率稳定", "回撤不深", "量能延续"],
+        "avoid": ["单日脉冲后快速衰竭", "箱体震荡"]
+      },
+      "params": {
+        "frequency": "5m",
+        "data_length_mode": "default",
+        "data_length_years": 0.25,
+        "model": "xgboost",
+        "feature_preset": "purify_v1",
+        "side_filter": "buy",
+        "profit_lookahead": 12,
+        "holding_period": 12,
+        "trade_cost": 0.001,
+        "topk_frac": 0.1,
+        "backtest_mode": "walk_forward",
+        "walk_forward_max_folds": 20,
+        "rank_transform_enabled": true,
+        "enforce_t1": true
+      },
+      "gates": [
+        {"metric": "sample_summary.buy", "op": ">=", "value": 180},
+        {"metric": "roc_auc", "op": ">=", "value": 0.58},
+        {"metric": "brier_score", "op": "<=", "value": 0.255},
+        {"metric": "trading.topk.avg_net_profit", "op": ">", "value": 0.001},
+        {"metric": "trading.topk.profit_factor", "op": ">=", "value": 1.35}
+      ],
+      "score": {
+        "terms": [
+          {"metric": "trading.topk.avg_net_profit", "weight": 120.0},
+          {"metric": "trading.topk.profit_factor", "weight": 0.25, "infinite": 10.0},
+          {"metric": "roc_auc", "weight": 0.8},
+          {"metric": "trading.topk.max_drawdown", "weight": -1.0}
+        ]
+      }
+    },
+    {
+      "name": "rebound_purify_5m",
+      "version": "2026.07.07",
+      "status": "active",
+      "description": "短线反弹策略，使用更长样本窗口和较短收益观察期，适合超跌修复。",
+      "tags": ["5m", "rebound", "xgboost", "buy"],
+      "scenario": {
+        "frequency": "5m",
+        "holding": "short_rebound",
+        "suitable_for": ["快速下跌后的修复", "波动放大", "短持仓验证"],
+        "avoid": ["单边阴跌", "低成交量反抽"]
+      },
+      "params": {
+        "frequency": "5m",
+        "data_length_mode": "default",
+        "data_length_years": 0.5,
+        "model": "xgboost",
+        "feature_preset": "purify_compact",
+        "side_filter": "buy",
+        "profit_lookahead": 3,
+        "holding_period": 3,
+        "trade_cost": 0.001,
+        "topk_frac": 0.2,
+        "backtest_mode": "walk_forward",
+        "walk_forward_max_folds": 25,
+        "rank_transform_enabled": true,
+        "enforce_t1": true
+      },
+      "gates": [
+        {"metric": "sample_summary.buy", "op": ">=", "value": 220},
+        {"metric": "roc_auc", "op": ">=", "value": 0.57},
+        {"metric": "brier_score", "op": "<=", "value": 0.255},
+        {"metric": "trading.topk.avg_net_profit", "op": ">", "value": 0.0},
+        {"metric": "trading.topk.profit_factor", "op": ">=", "value": 1.25}
+      ],
+      "score": {
+        "terms": [
+          {"metric": "trading.topk.avg_net_profit", "weight": 100.0},
+          {"metric": "trading.topk.profit_factor", "weight": 0.18, "infinite": 10.0},
+          {"metric": "roc_auc", "weight": 0.9},
+          {"metric": "brier_score", "weight": -0.6}
+        ]
+      }
+    },
+    {
+      "name": "shock_lr_5m",
+      "version": "2026.07.07",
+      "status": "experimental",
+      "description": "震荡市轻量线性策略，严格依赖 compact 特征和更窄 top-k。",
+      "tags": ["5m", "shock", "logistic_regression", "buy"],
+      "scenario": {
+        "frequency": "5m",
+        "holding": "range_bound",
+        "suitable_for": ["震荡反复", "样本较少但结构稳定", "需要可解释性"],
+        "avoid": ["强趋势加速", "特征缺失率过高"]
+      },
+      "params": {
+        "frequency": "5m",
+        "data_length_mode": "default",
+        "data_length_years": 0.17,
+        "model": "logistic_regression",
+        "feature_preset": "purify_compact",
+        "side_filter": "buy",
+        "profit_lookahead": 3,
+        "holding_period": 3,
+        "trade_cost": 0.001,
+        "topk_frac": 0.1,
+        "backtest_mode": "walk_forward",
+        "walk_forward_max_folds": 20,
+        "rank_transform_enabled": true,
+        "enforce_t1": true
+      },
+      "gates": [
+        {"metric": "sample_summary.buy", "op": ">=", "value": 120},
+        {"metric": "roc_auc", "op": ">=", "value": 0.6},
+        {"metric": "brier_score", "op": "<=", "value": 0.245},
+        {"metric": "trading.topk.avg_net_profit", "op": ">", "value": 0.0008},
+        {"metric": "trading.topk.profit_factor", "op": ">=", "value": 1.5}
+      ],
+      "score": {
+        "terms": [
+          {"metric": "trading.topk.avg_net_profit", "weight": 110.0},
+          {"metric": "trading.topk.profit_factor", "weight": 0.25, "infinite": 10.0},
+          {"metric": "roc_auc", "weight": 1.2},
+          {"metric": "brier_score", "weight": -1.0}
+        ]
+      }
+    },
+    {
+      "name": "reject_no_trade",
+      "version": "2026.07.07",
+      "status": "guardrail",
+      "description": "只做风控拒绝判断，不作为训练模板；任何核心质量指标不达标时避免交易。",
+      "tags": ["guardrail", "risk", "no_trade"],
+      "scenario": {
+        "suitable_for": ["样本不足", "模型无排序力", "top-k 期望收益为负"],
+        "action": "skip"
+      },
+      "params": {
+        "side_filter": "buy",
+        "enforce_t1": true
+      },
+      "gates": [
+        {"metric": "sample_summary.buy", "op": ">=", "value": 80},
+        {"metric": "roc_auc", "op": ">=", "value": 0.54},
+        {"metric": "brier_score", "op": "<=", "value": 0.27},
+        {"metric": "trading.topk.avg_net_profit", "op": ">=", "value": 0.0},
+        {"metric": "trading.topk.profit_factor", "op": ">=", "value": 1.0}
+      ],
+      "score": {
+        "terms": [
+          {"metric": "trading.topk.avg_net_profit", "weight": 50.0},
+          {"metric": "roc_auc", "weight": 0.5},
+          {"metric": "brier_score", "weight": -0.5}
+        ]
+      }
+    }
+  ]
+}

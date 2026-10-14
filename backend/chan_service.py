@@ -1430,6 +1430,13 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
         rolling_stride = max(1, int(rolling_stride or 1))
         rolling_enabled = str(os.environ.get("MLCHAN_ROLLING_SAMPLE_ENABLED", "1") or "1").strip().lower() not in ["0", "false", "no", "off"]
         rolling_mode = str(rolling_sample_mode or os.environ.get("MLCHAN_ROLLING_SAMPLE_MODE", "bsp") or "bsp").strip().lower()
+        if rolling_mode in ["none", "off", "false", "0", "event", "events", "event_bsp", "event-only", "event_only"]:
+            rolling_enabled = False
+            rolling_mode = "none"
+        elif rolling_mode in ["bsp", "signal", "signals", "rolling_bsp"]:
+            rolling_mode = "bsp"
+        else:
+            rolling_mode = "every_bar"
         rolling_key_base = 10_000_000_000
         
         # Iterate through steps to collect training samples
@@ -1444,12 +1451,18 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
             last_bsp = bsp_list[0] if bsp_list else None
             cur_lv_chan = chan_snapshot[0]
             state_feat = extract_state_features_from_cur_lv(cur_lv_chan, last_klu)
+            chan_state_feat = build_chan_state_feature(cur_lv_chan, last_klu, last_bsp)
             
             # Record BSP when it appears
             if last_bsp and _side_filter_allows(last_bsp.is_buy, side_filter) and last_bsp.klu.idx not in bsp_dict and cur_lv_chan[-2].idx == last_bsp.klu.klc.idx:
                 bsp_count += 1
                 feat_copy = CFeatures(dict(last_bsp.features.items()))
                 _add_sample_semantic_features(feat_copy, bool(last_bsp.is_buy), last_bsp, "event_bsp")
+                if chan_state_feat:
+                    try:
+                        feat_copy.add_feat(chan_state_feat)
+                    except Exception:
+                        pass
                 if state_feat:
                     try:
                         feat_copy.add_feat(state_feat)
@@ -1489,6 +1502,12 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
                     rolling_count += 1
                     feat_copy = CFeatures(dict(base_feat.items()))
                     _add_sample_semantic_features(feat_copy, bool(is_buy), bsp_obj, sample_kind)
+                    roll_chan_state_feat = build_chan_state_feature(cur_lv_chan, last_klu, bsp_obj) if bsp_obj is not last_bsp else chan_state_feat
+                    if roll_chan_state_feat:
+                        try:
+                            feat_copy.add_feat(roll_chan_state_feat)
+                        except Exception:
+                            pass
                     if state_feat:
                         try:
                             feat_copy.add_feat(state_feat)
@@ -2381,6 +2400,193 @@ def _env_csv_list(key: str, default: str = ""):
         dedup.append(s)
     return dedup
 
+def _feature_preset_definitions():
+    semantic = [
+        "bsp_type_t1",
+        "bsp_type_t1p",
+        "bsp_type_t2",
+        "bsp_type_t2s",
+        "bsp_type_t3a",
+        "bsp_type_t3b",
+        "sample_kind_event_bsp",
+        "sample_kind_rolling_bsp",
+        "sample_kind_rolling_every_bar",
+    ]
+    morph = [
+        "divergence_rate",
+        "zs_cnt",
+        "bsp1_bi_amp",
+        "bsp2_retrace_rate",
+        "bsp2_break_bi_amp",
+        "bsp2_bi_amp",
+        "bsp2s_retrace_rate",
+        "bsp2s_break_bi_amp",
+        "bsp2s_bi_amp",
+        "bsp2s_lv",
+        "bsp3_zs_height",
+        "bsp3_bi_amp",
+    ]
+    state = [
+        "bi_last_amp_r",
+        "bi_prev_amp_r",
+        "bi_last_over_prev_amp",
+        "bi_last_klu_cnt",
+        "seg_last_dir",
+        "seg_last_amp_r",
+        "seg_last_bi_cnt",
+        "zs_last_width_r",
+        "zs_last_mid_r",
+        "zs_last_pos",
+        "zs_last_height",
+        "zs_last_age",
+        "chan_bi_cnt",
+        "chan_seg_cnt",
+        "chan_zs_cnt",
+        "chan_last_bi_is_up",
+        "chan_last_bi_is_sure",
+        "chan_last_bi_amp_rate",
+        "chan_last_bi_klu_cnt",
+        "chan_last_bi_age",
+        "chan_last_seg_is_down",
+        "chan_last_seg_is_sure",
+        "chan_last_seg_amp_rate",
+        "chan_last_seg_bi_cnt",
+        "chan_last_seg_age",
+        "chan_last_zs_height_rate",
+        "chan_in_last_zs",
+        "chan_last_zs_age",
+        "chan_last_zs_bi_span",
+    ]
+    momentum = [
+        "open_klu_rate",
+        "high_low_rate",
+        "close_open_ratio",
+        "close_pos_in_bar",
+        "price_rank_250",
+        "volatility_250",
+        "macd_dif",
+        "macd_dea",
+        "macd_bar",
+    ]
+
+    def uniq(items):
+        out = []
+        seen = set()
+        for item in items or []:
+            s = str(item or "").strip()
+            if not s or s in seen:
+                continue
+            out.append(s)
+            seen.add(s)
+        return out
+
+    return {
+        "lr_default": ["volatility_250", "bsp3_zs_height"],
+        "purify_compact": uniq(semantic + [
+            "divergence_rate",
+            "bsp2_retrace_rate",
+            "bsp2s_retrace_rate",
+            "bsp3_zs_height",
+            "bi_last_amp_r",
+            "bi_prev_amp_r",
+            "seg_last_dir",
+            "zs_last_pos",
+            "zs_last_age",
+            "close_pos_in_bar",
+            "price_rank_250",
+            "volatility_250",
+            "macd_bar",
+        ]),
+        "purify_v1": uniq(semantic + morph + state + momentum),
+    }
+
+def _normalize_feature_preset(raw):
+    s = str(raw or "").strip().lower()
+    if s in ["", "none", "off", "false", "0", "all", "auto"]:
+        return None
+    if s in ["purify", "purify-full", "purify_full", "default_purify"]:
+        return "purify_v1"
+    if s in ["compact", "purify-compact", "purify_compact"]:
+        return "purify_compact"
+    if s in ["lr", "logreg", "logistic", "lr-default", "lr_default"]:
+        return "lr_default"
+    defs = _feature_preset_definitions()
+    return s if s in defs else None
+
+def _feature_preset_list(feature_preset):
+    name = _normalize_feature_preset(feature_preset)
+    if not name:
+        return []
+    return list(_feature_preset_definitions().get(name) or [])
+
+def _fixed_feature_selection(only_features=None, feature_preset=None):
+    explicit = _csv_list_from_raw(only_features) if only_features is not None else None
+    explicit_source = "only_features"
+    if explicit is None:
+        explicit = _only_feature_list()
+        explicit_source = "env_only_features"
+    if explicit:
+        return list(explicit), {
+            "source": explicit_source,
+            "feature_preset": None,
+            "requested_count": int(len(explicit)),
+            "requested_features": list(explicit),
+            "requested_feature_hash": _feature_meta_hash(explicit),
+        }
+    preset_name = _normalize_feature_preset(feature_preset or os.environ.get("MLCHAN_FEATURE_PRESET", ""))
+    preset_features = _feature_preset_list(preset_name)
+    if preset_name and preset_features:
+        return list(preset_features), {
+            "source": "feature_preset",
+            "feature_preset": preset_name,
+            "requested_count": int(len(preset_features)),
+            "requested_features": list(preset_features),
+            "requested_feature_hash": _feature_meta_hash(preset_features),
+        }
+    return [], {
+        "source": "auto",
+        "feature_preset": preset_name,
+        "requested_count": 0,
+        "requested_features": [],
+        "requested_feature_hash": None,
+    }
+
+def _apply_fixed_feature_selection(feature_meta, fixed_features, min_keep: int = 2):
+    base = list(feature_meta or [])
+    fixed = [str(f) for f in (fixed_features or []) if str(f)]
+    if not fixed:
+        return base, {"applied": False, "kept_count": int(len(base)), "missing_count": 0, "missing_features": []}
+    available = set(str(f) for f in base)
+    kept = [f for f in fixed if f in available]
+    missing = [f for f in fixed if f not in available]
+    if len(kept) < int(min_keep):
+        return base, {
+            "applied": False,
+            "fallback": "insufficient_available_features",
+            "kept_count": int(len(kept)),
+            "missing_count": int(len(missing)),
+            "missing_features": missing[:50],
+        }
+    return kept, {
+        "applied": True,
+        "kept_count": int(len(kept)),
+        "missing_count": int(len(missing)),
+        "missing_features": missing[:50],
+    }
+
+def _merge_feature_selection_meta(selection_meta, apply_meta=None, feature_meta=None):
+    meta = dict(selection_meta or {})
+    if apply_meta:
+        meta.update(dict(apply_meta or {}))
+    meta.setdefault("applied", False)
+    meta.setdefault("missing_count", 0)
+    meta.setdefault("missing_features", [])
+    if feature_meta is not None:
+        meta["final_count"] = int(len(feature_meta or []))
+    elif "kept_count" not in meta:
+        meta["kept_count"] = 0
+    return meta
+
 def _csv_list_from_raw(raw):
     if raw is None:
         return None
@@ -2410,6 +2616,125 @@ def _csv_list_from_raw(raw):
         seen.add(s)
         dedup.append(s)
     return dedup
+
+def _feature_list_signature(raw):
+    items = _csv_list_from_raw(raw)
+    if items is None:
+        return None
+    out = []
+    for item in items:
+        s = str(item or "").strip()
+        if s:
+            out.append(s)
+    return tuple(out)
+
+def _bundle_feature_preset(m):
+    try:
+        meta = m.get("meta", {}) if isinstance(m.get("meta", {}), dict) else {}
+        got_fp = _normalize_feature_preset(meta.get("feature_preset"))
+        if not got_fp and isinstance(meta.get("feature_selection"), dict):
+            got_fp = _normalize_feature_preset((meta.get("feature_selection") or {}).get("feature_preset"))
+        return got_fp
+    except Exception:
+        return None
+
+def _bundle_feature_signature(m):
+    try:
+        meta = m.get("meta", {}) if isinstance(m.get("meta", {}), dict) else {}
+    except Exception:
+        meta = {}
+    for raw in [
+        meta.get("only_features") if isinstance(meta, dict) else None,
+        meta.get("feature_meta") if isinstance(meta, dict) else None,
+        m.get("feature_meta") if isinstance(m, dict) else None,
+    ]:
+        sig = _feature_list_signature(raw)
+        if sig:
+            return sig
+    return None
+
+def _bundle_feature_hash(m):
+    try:
+        meta = m.get("meta", {}) if isinstance(m.get("meta", {}), dict) else {}
+    except Exception:
+        meta = {}
+    for raw in [
+        m.get("feature_hash") if isinstance(m, dict) else None,
+        meta.get("feature_hash") if isinstance(meta, dict) else None,
+        (meta.get("feature_identity") or {}).get("feature_hash") if isinstance(meta.get("feature_identity"), dict) else None,
+    ]:
+        s = str(raw or "").strip()
+        if s:
+            return s
+    sig = _bundle_feature_signature(m)
+    if sig:
+        return _feature_meta_hash(sig)
+    return None
+
+def _pretrained_feature_match_diagnostics(m, tier, want_features=None, want_feature_preset=None, explicit_features: bool = False, ignored_autype: bool = False):
+    want_sig = _feature_list_signature(want_features) or tuple()
+    got_sig = _bundle_feature_signature(m) or tuple()
+    got_set = set(got_sig)
+    missing = [x for x in want_sig if x not in got_set]
+    extra = [x for x in got_sig if x not in set(want_sig)] if want_sig else []
+    got_hash = _bundle_feature_hash(m)
+    want_hash = _feature_meta_hash(want_sig) if want_sig else None
+    got_fp = _bundle_feature_preset(m)
+    want_fp = _normalize_feature_preset(want_feature_preset)
+    out = {
+        "tier": int(tier) if tier is not None else None,
+        "exact_match": bool(tier == 0),
+        "preset_fallback": bool(tier == 1),
+        "legacy_fallback": bool(tier is not None and int(tier) >= 10),
+        "explicit_features": bool(explicit_features),
+        "ignored_autype": bool(ignored_autype),
+        "requested_feature_preset": want_fp,
+        "bundle_feature_preset": got_fp,
+        "requested_feature_count": int(len(want_sig)),
+        "effective_feature_count": int(len(got_sig)),
+        "requested_feature_hash": want_hash,
+        "effective_feature_hash": got_hash,
+        "missing_count": int(len(missing)),
+        "missing_features": missing[:100],
+        "extra_count": int(len(extra)),
+        "extra_features": extra[:100],
+    }
+    warnings = []
+    if tier == 1:
+        warnings.append("Loaded via same feature_preset with non-exact effective feature hash.")
+    if tier is not None and int(tier) >= 10:
+        warnings.append("Loaded legacy model without feature identity metadata.")
+    if ignored_autype:
+        warnings.append("Loaded model after relaxing autype match.")
+    if missing:
+        warnings.append(f"Requested features missing from bundle: {len(missing)}")
+    if warnings:
+        out["warning"] = " ".join(warnings)
+    return out
+
+def _pretrained_feature_match_tier(m, want_features=None, want_feature_preset=None, allow_legacy_feature_fallback: bool = False, exact_feature_match_required: bool = False):
+    want_sig = _feature_list_signature(want_features)
+    want_fp = _normalize_feature_preset(want_feature_preset)
+    if not want_sig and not want_fp:
+        return 0
+    want_hash = _feature_meta_hash(want_sig) if want_sig else None
+    got_sig = _bundle_feature_signature(m)
+    got_hash = _bundle_feature_hash(m)
+    got_fp = _bundle_feature_preset(m)
+    if want_hash and got_hash:
+        if str(got_hash) == str(want_hash):
+            return 0
+        if bool(exact_feature_match_required) or not want_fp:
+            return None
+    if want_sig and got_sig == want_sig:
+        return 0
+    if bool(exact_feature_match_required) and want_sig:
+        return None
+    if want_fp and got_fp == want_fp:
+        return 1
+    if bool(allow_legacy_feature_fallback) and want_fp and (not got_fp) and got_sig is None and got_hash is None:
+        return 10
+    return None
 
 def _env_float(key: str, default: Optional[float] = None) -> Optional[float]:
     raw = os.environ.get(key, None)
@@ -3688,18 +4013,19 @@ def _threshold_curve_from_profits(probs, profits, trade_cost: float = 0.0, max_p
                     "sharpe": 0.0,
                     "max_drawdown": 0.0,
                     "win_rate": 0.0,
+                    "profit_factor": None,
+                    "profit_factor_is_infinite": False,
+                    "expectancy": 0.0,
+                    "avg_win": 0.0,
+                    "avg_loss": 0.0,
                 }
             )
             continue
+        q = _profit_quality_metrics(pnls)
         curve.append(
             {
                 "threshold": float(thr),
-                "trade_count": int(len(pnls)),
-                "avg_net_profit": float(sum(pnls) / len(pnls)),
-                "total_net_profit": float(sum(pnls)),
-                "sharpe": _sharpe_from_returns(pnls),
-                "max_drawdown": _max_drawdown_from_pnls(pnls),
-                "win_rate": float(sum(1 for r in pnls if float(r) > 0.0) / len(pnls)),
+                **q,
             }
         )
     return curve
@@ -3968,8 +4294,8 @@ def _accuracy_from_probs(y, probs, threshold: float = 0.5):
 def _max_drawdown_from_pnls(pnls):
     if not pnls:
         return 0.0
-    eq = 0.0
-    peak = 0.0
+    eq = 1.0
+    peak = 1.0
     mdd = 0.0
     for r in pnls:
         try:
@@ -4019,6 +4345,184 @@ def _sharpe_from_returns(returns):
     if sd <= 0.0:
         return 0.0
     return float(mu / sd)
+
+def _profit_quality_metrics(pnls):
+    clean = []
+    for x in pnls or []:
+        try:
+            v = float(x)
+        except Exception:
+            continue
+        if np.isfinite(v):
+            clean.append(float(v))
+    if not clean:
+        return {
+            "trade_count": 0,
+            "avg_net_profit": 0.0,
+            "total_net_profit": 0.0,
+            "win_rate": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "profit_factor": None,
+            "profit_factor_is_infinite": False,
+            "expectancy": 0.0,
+            "max_drawdown": 0.0,
+            "sharpe": 0.0,
+        }
+    wins = [x for x in clean if x > 0.0]
+    losses = [x for x in clean if x < 0.0]
+    pos_sum = float(sum(wins))
+    neg_sum = float(sum(losses))
+    avg_win = float(pos_sum / len(wins)) if wins else 0.0
+    avg_loss = float(neg_sum / len(losses)) if losses else 0.0
+    profit_factor = None
+    if neg_sum < 0.0:
+        denom = abs(float(neg_sum))
+        profit_factor = float(pos_sum / denom) if denom > 0.0 else None
+    elif pos_sum > 0.0:
+        profit_factor = float("inf")
+    profit_factor_is_infinite = bool(profit_factor is not None and math.isinf(float(profit_factor)))
+    return {
+        "trade_count": int(len(clean)),
+        "avg_net_profit": float(sum(clean) / len(clean)),
+        "total_net_profit": float(sum(clean)),
+        "win_rate": float(len(wins) / len(clean)),
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "profit_factor": profit_factor,
+        "profit_factor_is_infinite": profit_factor_is_infinite,
+        "expectancy": float(sum(clean) / len(clean)),
+        "max_drawdown": _max_drawdown_from_pnls(clean),
+        "sharpe": _sharpe_from_returns(clean),
+    }
+
+def _feature_meta_hash(feature_meta):
+    items = [str(x) for x in (feature_meta or []) if str(x)]
+    raw = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+def json_safe_value(value, inf_replacement: float = 999.0, _depth: int = 0):
+    if _depth > 40:
+        return None
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        value = float(value)
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        try:
+            if math.isnan(value):
+                return None
+            if math.isinf(value):
+                return float(inf_replacement if value > 0 else -inf_replacement)
+        except Exception:
+            return None
+        return float(value)
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    if isinstance(value, np.ndarray):
+        return json_safe_value(value.tolist(), inf_replacement=inf_replacement, _depth=_depth + 1)
+    if isinstance(value, dict):
+        return {str(k): json_safe_value(v, inf_replacement=inf_replacement, _depth=_depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe_value(v, inf_replacement=inf_replacement, _depth=_depth + 1) for v in value]
+    return value
+
+def _feature_identity_meta(feature_meta, feature_preset=None, side_filter=None, requested_features=None, feature_selection=None):
+    items = [str(x) for x in (feature_meta or []) if str(x)]
+    feature_selection = feature_selection if isinstance(feature_selection, dict) else {}
+    preset_name = _normalize_feature_preset(feature_preset or feature_selection.get("feature_preset"))
+    req = _csv_list_from_raw(requested_features) if requested_features is not None else None
+    if req is None:
+        req = _csv_list_from_raw(feature_selection.get("requested_features"))
+    if req is None and preset_name:
+        req = _feature_preset_list(preset_name)
+    if req is None:
+        req = []
+    req = [str(x) for x in (req or []) if str(x)]
+    reported_missing_count = None
+    try:
+        if feature_selection and feature_selection.get("missing_count") is not None:
+            reported_missing_count = int(float(feature_selection.get("missing_count")))
+    except Exception:
+        reported_missing_count = None
+    missing = _csv_list_from_raw(feature_selection.get("missing_features")) if feature_selection else None
+    if missing is None and req:
+        have = set(items)
+        missing = [x for x in req if x not in have]
+    missing = [str(x) for x in (missing or []) if str(x)]
+    if reported_missing_count is None:
+        reported_missing_count = int(len(missing))
+    else:
+        reported_missing_count = int(max(int(reported_missing_count), int(len(missing))))
+    effective_hash = _feature_meta_hash(items)
+    requested_hash = _feature_meta_hash(req) if req else None
+    return {
+        "feature_count": int(len(items)),
+        "feature_hash": effective_hash,
+        "feature_preset": preset_name,
+        "feature_preset_version": "2026-07-05",
+        "side_filter": _normalize_side_filter(side_filter, default="both") if side_filter is not None else None,
+        "requested_preset": preset_name,
+        "requested_feature_count": int(len(req)),
+        "requested_feature_hash": requested_hash,
+        "requested_features": list(req),
+        "effective_feature_count": int(len(items)),
+        "effective_feature_hash": effective_hash,
+        "effective_features": list(items),
+        "missing_count": int(reported_missing_count),
+        "missing_features": list(missing),
+    }
+
+def _feature_availability_diagnostics(X, feature_meta, missing_value: float = -9999999.0, top_n: int = 20):
+    if not X or not feature_meta:
+        return {"sample_count": 0, "feature_count": int(len(feature_meta or [])), "features": []}
+    try:
+        arr = np.asarray(X, dtype=float)
+    except Exception:
+        return {"sample_count": int(len(X or [])), "feature_count": int(len(feature_meta or [])), "features": []}
+    if arr.ndim != 2:
+        return {"sample_count": int(len(X or [])), "feature_count": int(len(feature_meta or [])), "features": []}
+    n = int(arr.shape[0])
+    out = []
+    for j, name in enumerate(feature_meta or []):
+        if j >= arr.shape[1]:
+            break
+        col = arr[:, j]
+        finite = np.isfinite(col)
+        missing = (~finite) | (np.abs(col - float(missing_value)) < 1e-9)
+        valid = col[~missing]
+        missing_rate = float(np.mean(missing)) if n > 0 else 0.0
+        constant_rate = 0.0
+        if valid.size > 0:
+            try:
+                vals, counts = np.unique(valid, return_counts=True)
+                constant_rate = float(np.max(counts) / float(valid.size)) if counts.size > 0 else 0.0
+            except Exception:
+                constant_rate = 0.0
+        out.append({
+            "feature": str(name),
+            "missing_rate": missing_rate,
+            "valid_rate": float(1.0 - missing_rate),
+            "constant_rate": constant_rate,
+            "valid_count": int(valid.size),
+        })
+    out.sort(key=lambda r: (float(r.get("missing_rate", 0.0)), float(r.get("constant_rate", 0.0))), reverse=True)
+    return {
+        "sample_count": n,
+        "feature_count": int(len(feature_meta or [])),
+        "high_missing_count": int(sum(1 for r in out if float(r.get("missing_rate", 0.0)) >= 0.9)),
+        "high_constant_count": int(sum(1 for r in out if float(r.get("constant_rate", 0.0)) >= 0.98)),
+        "features": out[: int(top_n or 20)],
+    }
 
 def _topk_vector_metrics_from_infos(
     infos,
@@ -4126,19 +4630,30 @@ def _topk_vector_metrics_from_infos(
     eq = 1.0
     for r in rets:
         eq = eq * (1.0 + float(r))
+    quality = _profit_quality_metrics(pos_rets)
     return {
         "topk_frac": float(tk_frac),
         "min_score": min_score,
         "top_n": int(top_n) if top_n is not None else None,
         "holding_period": int(hp) if hp is not None else None,
         "bars": int(len(rets)),
+        "trade_count": int(quality.get("trade_count", 0) or 0),
         "avg_positions": (float(sum(bar_counts)) / float(len(bar_counts)) if bar_counts else 0.0),
         "avg_bar_return": float(sum(rets) / float(len(rets))) if rets else 0.0,
+        "avg_net_profit": float(quality.get("avg_net_profit", 0.0) or 0.0),
+        "total_net_profit": float(quality.get("total_net_profit", 0.0) or 0.0),
         "total_return": float(eq - 1.0),
         "max_drawdown": _max_drawdown_from_returns(rets),
+        "position_max_drawdown": float(quality.get("max_drawdown", 0.0) or 0.0),
         "sharpe": _sharpe_from_returns(rets),
+        "win_rate": float(quality.get("win_rate", 0.0) or 0.0),
         "pos_win_rate": (float(sum(1 for r in pos_rets if r > 0.0) / float(len(pos_rets))) if pos_rets else 0.0),
         "bar_win_rate": (float(sum(1 for r in rets if r > 0.0) / float(len(rets))) if rets else 0.0),
+        "profit_factor": quality.get("profit_factor"),
+        "profit_factor_is_infinite": bool(quality.get("profit_factor_is_infinite", False)),
+        "expectancy": float(quality.get("expectancy", 0.0) or 0.0),
+        "avg_win": float(quality.get("avg_win", 0.0) or 0.0),
+        "avg_loss": float(quality.get("avg_loss", 0.0) or 0.0),
     }
 
 def _simulate_threshold_hold(predictions, threshold: float = 0.7, trade_cost: float = 0.0, long_only: bool = True, no_overlap: bool = True):
@@ -4155,6 +4670,7 @@ def _simulate_threshold_hold(predictions, threshold: float = 0.7, trade_cost: fl
             "max_drawdown": 0.0,
             "sharpe": 0.0,
             "profit_factor": None,
+            "profit_factor_is_infinite": False,
             "equity_curve": [],
         }
     try:
@@ -4233,6 +4749,7 @@ def _simulate_threshold_hold(predictions, threshold: float = 0.7, trade_cost: fl
             "max_drawdown": 0.0,
             "sharpe": 0.0,
             "profit_factor": None,
+            "profit_factor_is_infinite": False,
             "equity_curve": [],
         }
 
@@ -4243,6 +4760,9 @@ def _simulate_threshold_hold(predictions, threshold: float = 0.7, trade_cost: fl
     pf = None
     if neg_sum < 0.0:
         pf = float(pos_sum / abs(float(neg_sum))) if abs(float(neg_sum)) > 0 else None
+    elif pos_sum > 0.0:
+        pf = float("inf")
+    pf_inf = bool(pf is not None and math.isinf(float(pf)))
     return {
         "threshold": float(thr),
         "trade_cost": float(tc),
@@ -4255,6 +4775,7 @@ def _simulate_threshold_hold(predictions, threshold: float = 0.7, trade_cost: fl
         "max_drawdown": _max_drawdown_from_returns(rets),
         "sharpe": _sharpe_from_returns(rets),
         "profit_factor": pf,
+        "profit_factor_is_infinite": pf_inf,
         "equity_curve": curve,
     }
 
@@ -4273,6 +4794,7 @@ def _simulate_intraday_top1(predictions, min_pred: float = 0.25, trade_cost: flo
             "max_drawdown": 0.0,
             "sharpe": 0.0,
             "profit_factor": None,
+            "profit_factor_is_infinite": False,
             "equity_curve": [],
         }
     try:
@@ -4403,6 +4925,9 @@ def _simulate_intraday_top1(predictions, min_pred: float = 0.25, trade_cost: flo
     pf = None
     if neg_sum < 0.0:
         pf = float(pos_sum / abs(float(neg_sum))) if abs(float(neg_sum)) > 0 else None
+    elif pos_sum > 0.0:
+        pf = float("inf")
+    pf_inf = bool(pf is not None and math.isinf(float(pf)))
     ann = None
     if first_exit_ts > 0 and last_exit_ts > first_exit_ts:
         span_days = float(last_exit_ts - first_exit_ts) / 86400.0
@@ -4425,6 +4950,7 @@ def _simulate_intraday_top1(predictions, min_pred: float = 0.25, trade_cost: flo
         "max_drawdown": _max_drawdown_from_returns(rets),
         "sharpe": _sharpe_from_returns(rets),
         "profit_factor": pf,
+        "profit_factor_is_infinite": pf_inf,
         "equity_curve": curve,
     }
 
@@ -4497,14 +5023,21 @@ def _walk_forward_eval_infos(
     quantile_bin_count: int = 5,
     rank_transform_enabled: Optional[bool] = None,
     only_features=None,
+    feature_preset: Optional[str] = None,
     enforce_t1: bool = False,
     fixed_test_start_ts: Optional[int] = None,
 ):
+    only_features_list, feature_selection_meta = _fixed_feature_selection(
+        only_features=only_features,
+        feature_preset=feature_preset,
+    )
+    feature_selection_effective = _merge_feature_selection_meta(feature_selection_meta)
     n = len(infos or [])
     if n <= 0:
         return None, {
             "status": "error",
-            "detail": "no infos"
+            "detail": "no infos",
+            "feature_selection": feature_selection_effective,
         }
 
     if walk_forward_test_window is None:
@@ -4517,9 +5050,6 @@ def _walk_forward_eval_infos(
 
     used_calibrate_method_req = _normalize_calibrate_method(calibrate_method)
     forced_features = _force_feature_list()
-    only_features_list = _csv_list_from_raw(only_features) if only_features is not None else None
-    if only_features_list is None:
-        only_features_list = _only_feature_list()
     if only_features_list:
         forced_features = []
 
@@ -4583,6 +5113,7 @@ def _walk_forward_eval_infos(
         return None, {
             "status": "error",
             "detail": f"insufficient_data_for_walk_forward: n={n} need>={start_train_end + val_window + test_window}",
+            "feature_selection": feature_selection_effective,
         }
 
     try:
@@ -4654,8 +5185,13 @@ def _walk_forward_eval_infos(
         test_infos = infos[test_start:test_end]
 
         feature_meta = _feature_meta_from_infos(train_infos)
+        fixed_feature_applied = False
+        fold_feature_selection = _merge_feature_selection_meta(feature_selection_meta, feature_meta=feature_meta)
         if only_features_list:
-            feature_meta = list(only_features_list or [])
+            feature_meta, feature_selection_apply = _apply_fixed_feature_selection(feature_meta, only_features_list)
+            fixed_feature_applied = bool((feature_selection_apply or {}).get("applied"))
+            fold_feature_selection = _merge_feature_selection_meta(feature_selection_meta, feature_selection_apply, feature_meta)
+        feature_selection_effective = fold_feature_selection
         if not feature_meta:
             train_end += step
             used_folds += 1
@@ -4677,7 +5213,7 @@ def _walk_forward_eval_infos(
 
         monotone_constraints = None
         if model_type in ["xgboost", "lightgbm"]:
-            if only_features_list:
+            if fixed_feature_applied:
                 sign_map = {}
                 table = compute_feature_ic_table(X_train, y_train, feature_meta, min_n=50)
                 for r in (table or []):
@@ -4731,7 +5267,31 @@ def _walk_forward_eval_infos(
         selected_features = []
         feature_sel_meta = {"selected_features": [], "dropped_by_importance": 0, "dropped_by_corr": 0}
         model = None
-        if model_type in ["xgboost", "lightgbm"]:
+        if fixed_feature_applied:
+            try:
+                model = train_model_from_xy(
+                    X_train,
+                    y_train,
+                    model_type=model_type,
+                    n_jobs=n_jobs,
+                    use_scale_pos_weight=use_scale_pos_weight,
+                    xgb_max_depth=xgb_max_depth,
+                    xgb_reg_alpha=xgb_reg_alpha,
+                    xgb_reg_lambda=xgb_reg_lambda,
+                    lgb_max_depth=lgb_max_depth,
+                    lgb_reg_alpha=lgb_reg_alpha,
+                    lgb_reg_lambda=lgb_reg_lambda,
+                    X_val=X_val,
+                    y_val=y_val,
+                    monotone_constraints=monotone_constraints,
+                )
+                feature_meta2 = list(feature_meta or [])
+                feature_sel_meta = {"selected_features": list(feature_meta2), "dropped_by_importance": 0, "dropped_by_corr": 0}
+            except Exception:
+                model = None
+                feature_meta2 = None
+                feature_sel_meta = {"selected_features": [], "dropped_by_importance": 0, "dropped_by_corr": 0}
+        elif model_type in ["xgboost", "lightgbm"]:
             try:
                 model = train_model_from_xy(
                     X_train,
@@ -4878,7 +5438,7 @@ def _walk_forward_eval_infos(
                 dbg_oos[str(f)]["x"].append(float(xv))
                 dbg_oos[str(f)]["y"].append(int(y_test[i]))
             try:
-                pr = float(_profit_for_info(test_infos[i], lookahead=profit_lookahead))
+                pr = float(_profit_for_info(test_infos[i], lookahead=profit_lookahead, enforce_t1=enforce_t1))
             except Exception:
                 pr = 0.0
             profit_all.append(float(pr))
@@ -4895,9 +5455,14 @@ def _walk_forward_eval_infos(
             "rank_transformed": bool(rank_cols),
             "rank_transform": _rank_debug_meta(feature_meta, rank_cols),
             "feature_value_stats": {"train_pre_rank": dbg_pre, "train_post_rank": dbg_post_rank, "train_post_winsor": dbg_post_winsor},
+            "feature_availability": {
+                "train": _feature_availability_diagnostics(X_train, feature_meta),
+                "test": _feature_availability_diagnostics(X_test, feature_meta),
+            },
             "winsorized": bool(winsor_bounds),
             "calibrated": bool(calibrated),
             "calibrate_method": used_calibrate_method,
+            "feature_selection": fold_feature_selection,
             "selected_features": list(selected_features or []),
             "dropped_by_importance": int((feature_sel_meta or {}).get("dropped_by_importance", 0) or 0),
             "dropped_by_corr": int((feature_sel_meta or {}).get("dropped_by_corr", 0) or 0),
@@ -4929,6 +5494,7 @@ def _walk_forward_eval_infos(
             portfolio_min_score=portfolio_min_score,
             portfolio_top_n=portfolio_top_n,
             holding_period=profit_lookahead,
+            enforce_t1=enforce_t1,
         )
         if vec_fold is not None:
             fold_info["trading"] = {"topk_vector": vec_fold}
@@ -4940,7 +5506,8 @@ def _walk_forward_eval_infos(
     if not y_all or not p_all:
         return None, {
             "status": "error",
-            "detail": "insufficient_data"
+            "detail": "insufficient_data",
+            "feature_selection": feature_selection_effective,
         }
 
     total_correct, total_count, acc = _accuracy_from_probs(y_all, p_all, threshold=threshold)
@@ -5011,32 +5578,19 @@ def _walk_forward_eval_infos(
     trading = {
         "threshold": {
             "threshold": float(threshold),
-            "trade_count": int(len(trade_idxs)),
-            "avg_net_profit": float(sum(trade_pnls) / len(trade_pnls)) if trade_pnls else 0.0,
-            "total_net_profit": float(sum(trade_pnls)) if trade_pnls else 0.0,
-            "max_drawdown": _max_drawdown_from_pnls(trade_pnls),
-            "sharpe": _sharpe_from_returns(trade_pnls),
-            "win_rate": float(sum(1 for r in trade_pnls if r > 0.0) / len(trade_pnls)) if trade_pnls else 0.0,
+            **_profit_quality_metrics(trade_pnls),
         },
         "topk": {
             "topk_frac": float(tk_frac),
             "topk_n": int(topk_n),
             "hit_rate": float(topk_hit),
-            "avg_net_profit": float(sum(topk_pnls) / len(topk_pnls)) if topk_pnls else 0.0,
-            "total_net_profit": float(sum(topk_pnls)) if topk_pnls else 0.0,
-            "max_drawdown": _max_drawdown_from_pnls(topk_pnls),
-            "sharpe": _sharpe_from_returns(topk_pnls),
-            "win_rate": float(sum(1 for r in topk_pnls if r > 0.0) / len(topk_pnls)) if topk_pnls else 0.0,
+            **_profit_quality_metrics(topk_pnls),
         },
         "top10": {
             "topk_frac": 0.1,
             "topk_n": int(top10_n),
             "hit_rate": float(top10_hit),
-            "avg_net_profit": float(sum(top10_pnls) / len(top10_pnls)) if top10_pnls else 0.0,
-            "total_net_profit": float(sum(top10_pnls)) if top10_pnls else 0.0,
-            "max_drawdown": _max_drawdown_from_pnls(top10_pnls),
-            "sharpe": _sharpe_from_returns(top10_pnls),
-            "win_rate": float(sum(1 for r in top10_pnls if r > 0.0) / len(top10_pnls)) if top10_pnls else 0.0,
+            **_profit_quality_metrics(top10_pnls),
         },
     }
     vec_all = _topk_vector_metrics_from_infos(
@@ -5132,6 +5686,7 @@ def _walk_forward_eval_infos(
         "method": "walk_forward",
         "rank_transform": (dict((folds[-1] or {}).get("rank_transform") or {}) if folds else _rank_debug_meta(last_meta, None)),
         "feature_value_stats": (dict((folds[-1] or {}).get("feature_value_stats") or {}) if folds else {}),
+        "feature_availability": (dict((folds[-1] or {}).get("feature_availability") or {}) if folds else {}),
         "calibrate_method_requested": str(calibrate_method),
         "calibrate_method_effective": (str(used_calibrate_method_req) if used_calibrate_method_req is not None else None),
         "train_count": int(folds[-1]["train_count"]) if folds else 0,
@@ -5160,6 +5715,7 @@ def _walk_forward_eval_infos(
         "bad_cases": bad_cases,
         "feature_importance": feat_imp,
         "feature_ic": last_fold_ic,
+        "feature_selection": feature_selection_effective,
         "selected_features": (list((folds[-1] or {}).get("selected_features") or []) if folds else []),
         "folds": folds,
         "class_balance": {
@@ -5224,10 +5780,15 @@ def evaluate_model_accuracy(model, X, y, threshold=0.5):
 
     return correct, total, (correct / total if total > 0 else 0.0)
 
-def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, val_ratio=0.2, threshold=0.5, calibrate_method="none", min_train=200, min_val=200, min_test=500, n_jobs=-1, profit_threshold: Optional[float] = 0.02, auto_profit_quantile: float = 0.7, profit_lookahead: int = 3, use_atr_label: bool = False, atr_period: int = 14, atr_mult: float = 1.0, use_scale_pos_weight: bool = False, xgb_max_depth: Optional[int] = None, xgb_reg_alpha: Optional[float] = None, xgb_reg_lambda: Optional[float] = None, lgb_max_depth: Optional[int] = None, lgb_reg_alpha: Optional[float] = None, lgb_reg_lambda: Optional[float] = None, backtest_mode: str = "auto", walk_forward_max_folds: int = 20, walk_forward_test_window: Optional[int] = None, walk_forward_val_window: Optional[int] = None, walk_forward_step: Optional[int] = None, trade_cost: float = 0.0, topk_frac: float = 0.2, quantile_bin_count: int = 5, rank_transform_enabled: Optional[bool] = None, only_features=None, enforce_t1: bool = False, fixed_test_start_ts: Optional[int] = None, side_filter: Optional[str] = None):
+def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, val_ratio=0.2, threshold=0.5, calibrate_method="none", min_train=200, min_val=200, min_test=500, n_jobs=-1, profit_threshold: Optional[float] = 0.02, auto_profit_quantile: float = 0.7, profit_lookahead: int = 3, use_atr_label: bool = False, atr_period: int = 14, atr_mult: float = 1.0, use_scale_pos_weight: bool = False, xgb_max_depth: Optional[int] = None, xgb_reg_alpha: Optional[float] = None, xgb_reg_lambda: Optional[float] = None, lgb_max_depth: Optional[int] = None, lgb_reg_alpha: Optional[float] = None, lgb_reg_lambda: Optional[float] = None, backtest_mode: str = "auto", walk_forward_max_folds: int = 20, walk_forward_test_window: Optional[int] = None, walk_forward_val_window: Optional[int] = None, walk_forward_step: Optional[int] = None, trade_cost: float = 0.0, topk_frac: float = 0.2, quantile_bin_count: int = 5, rank_transform_enabled: Optional[bool] = None, only_features=None, feature_preset: Optional[str] = None, enforce_t1: bool = False, fixed_test_start_ts: Optional[int] = None, side_filter: Optional[str] = None):
     empty_model = None
     empty_meta = []
     side_filter = _normalize_side_filter(side_filter, default="both")
+    only_features_list, feature_selection_meta = _fixed_feature_selection(
+        only_features=only_features,
+        feature_preset=feature_preset,
+    )
+    feature_selection_effective = _merge_feature_selection_meta(feature_selection_meta)
     if not bsp_dict:
         return empty_model, empty_meta, {
             "valid_count": 0,
@@ -5248,6 +5809,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             "baseline": {},
             "side_filter": side_filter,
             "sample_summary": _sample_semantic_summary_from_infos([]),
+            "feature_selection": feature_selection_effective,
             "trading": {},
             "reversal_check": {},
         }
@@ -5264,9 +5826,6 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
     sample_summary = _sample_semantic_summary_from_infos(infos)
     calibrate_method_req = _normalize_calibrate_method(calibrate_method)
     forced_features = _force_feature_list()
-    only_features_list = _csv_list_from_raw(only_features) if only_features is not None else None
-    if only_features_list is None:
-        only_features_list = _only_feature_list()
     if only_features_list:
         forced_features = []
     try:
@@ -5304,6 +5863,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             "baseline": {},
             "side_filter": side_filter,
             "sample_summary": sample_summary,
+            "feature_selection": feature_selection_effective,
             "trading": {}
         }
 
@@ -5355,14 +5915,20 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             topk_frac=topk_frac,
             quantile_bin_count=quantile_bin_count,
             rank_transform_enabled=rank_transform_enabled,
-            only_features=only_features_list,
+            only_features=only_features,
+            feature_preset=feature_preset,
             enforce_t1=enforce_t1,
             fixed_test_start_ts=fixed_test_start_ts,
         )
 
         feature_meta = build_feature_meta_from_infos(infos)
+        fixed_feature_applied_all = False
         if only_features_list:
-            feature_meta = list(only_features_list or [])
+            feature_meta, feature_selection_apply = _apply_fixed_feature_selection(feature_meta, only_features_list)
+            fixed_feature_applied_all = bool((feature_selection_apply or {}).get("applied"))
+            feature_selection_effective = _merge_feature_selection_meta(feature_selection_meta, feature_selection_apply, feature_meta)
+        else:
+            feature_selection_effective = _merge_feature_selection_meta(feature_selection_meta, feature_meta=feature_meta)
         if profit_threshold is None:
             used_profit_threshold = _auto_profit_threshold_from_infos(infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1, trade_cost=trade_cost)
         else:
@@ -5373,7 +5939,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
         monotone_sign_map = None
         winsor_bounds_all = None
         if str(model_type or "").strip().lower() in ["xgboost", "lightgbm"] and X_all and y_all and feature_meta and len(set(y_all)) >= 2:
-            if only_features_list:
+            if fixed_feature_applied_all:
                 sign_map = {}
                 table = compute_feature_ic_table(X_all, y_all, feature_meta, min_n=50)
                 for r in (table or []):
@@ -5439,7 +6005,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
 
         selected_features = []
         feature_importance_full = []
-        if final_model and feature_meta and (not only_features_list):
+        if final_model and feature_meta and (not fixed_feature_applied_all):
             feature_importance_full = _get_feature_importance(final_model, feature_meta)
             topk = 5
             if forced_features:
@@ -5571,6 +6137,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
                 "folds": [],
                 "baseline": {},
                 "trading": {},
+                "feature_selection": feature_selection_effective,
                 "detail": wf_debug,
             }
         else:
@@ -5602,6 +6169,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             info["profit_lookahead"] = int(profit_lookahead or 0)
             info["side_filter"] = side_filter
             info["sample_summary"] = sample_summary
+            info["feature_selection"] = feature_selection_effective
             info["selected_features"] = list(selected_features or [])
             info["rank_transformed"] = bool(rank_cols_all)
             info["winsorized"] = bool(winsor_bounds_all)
@@ -5621,6 +6189,11 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
 
     if n < (min_train + min_val + min_test):
         feature_meta = build_feature_meta_from_infos(infos)
+        if only_features_list:
+            feature_meta, feature_selection_apply = _apply_fixed_feature_selection(feature_meta, only_features_list)
+            feature_selection_effective = _merge_feature_selection_meta(feature_selection_meta, feature_selection_apply, feature_meta)
+        else:
+            feature_selection_effective = _merge_feature_selection_meta(feature_selection_meta, feature_meta=feature_meta)
         return None, feature_meta, {
             "valid_count": 0,
             "total_count": 0,
@@ -5634,6 +6207,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             "calibration_bins": [],
             "side_filter": side_filter,
             "sample_summary": sample_summary,
+            "feature_selection": feature_selection_effective,
             "detail": f"need>={int(min_train) + int(min_val) + int(min_test)} samples for train/val/test; got n={int(n)}",
         }
 
@@ -5647,8 +6221,13 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
     test_infos = infos[val_end:]
 
     feature_meta = build_feature_meta_from_infos(infos)
+    fixed_feature_applied = False
     if only_features_list:
-        feature_meta = list(only_features_list or [])
+        feature_meta, feature_selection_apply = _apply_fixed_feature_selection(feature_meta, only_features_list)
+        fixed_feature_applied = bool((feature_selection_apply or {}).get("applied"))
+        feature_selection_effective = _merge_feature_selection_meta(feature_selection_meta, feature_selection_apply, feature_meta)
+    else:
+        feature_selection_effective = _merge_feature_selection_meta(feature_selection_meta, feature_meta=feature_meta)
     if profit_threshold is None:
         used_profit_threshold = _auto_profit_threshold_from_infos(train_infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1, trade_cost=trade_cost)
     else:
@@ -5659,7 +6238,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
     monotone_constraints = None
     winsor_bounds = None
     if model_type in ["xgboost", "lightgbm"]:
-        if only_features_list:
+        if fixed_feature_applied:
             sign_map = {}
             table = compute_feature_ic_table(X_train, y_train, feature_meta, min_n=50)
             for r in (table or []):
@@ -5738,6 +6317,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
             "class_balance": class_balance,
             "side_filter": side_filter,
             "sample_summary": sample_summary,
+            "feature_selection": feature_selection_effective,
             "scale_pos_weight": scale_pos_weight,
         }
 
@@ -5745,7 +6325,32 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
     feature_importance_full = []
     feature_sel_meta = {"selected_features": [], "dropped_by_importance": 0, "dropped_by_corr": 0}
     model = None
-    if model_type in ["xgboost", "lightgbm"]:
+    if fixed_feature_applied:
+        try:
+            model = train_model_from_xy(
+                X_train,
+                y_train,
+                model_type=model_type,
+                n_jobs=n_jobs,
+                use_scale_pos_weight=use_scale_pos_weight,
+                xgb_max_depth=xgb_max_depth,
+                xgb_reg_alpha=xgb_reg_alpha,
+                xgb_reg_lambda=xgb_reg_lambda,
+                lgb_max_depth=lgb_max_depth,
+                lgb_reg_alpha=lgb_reg_alpha,
+                lgb_reg_lambda=lgb_reg_lambda,
+                X_val=X_val,
+                y_val=y_val,
+                monotone_constraints=monotone_constraints,
+            )
+            feature_meta2 = list(feature_meta or [])
+            feature_sel_meta = {"selected_features": list(feature_meta2), "dropped_by_importance": 0, "dropped_by_corr": 0}
+            if feature_meta2:
+                selected_features = list(feature_meta2)
+        except Exception:
+            model = None
+            feature_sel_meta = {"selected_features": [], "dropped_by_importance": 0, "dropped_by_corr": 0}
+    elif model_type in ["xgboost", "lightgbm"]:
         try:
             model = train_model_from_xy(
                 X_train,
@@ -5806,7 +6411,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
         except Exception:
             model = None
             feature_sel_meta = {"selected_features": [], "dropped_by_importance": 0, "dropped_by_corr": 0}
-    if model and feature_meta and (not only_features_list):
+    if model and feature_meta and (not fixed_feature_applied):
         feature_importance_full = _get_feature_importance(model, feature_meta)
     feature_ic_selected_train = compute_feature_ic_report(X_train, y_train, feature_meta, include_table=False, top_n=20)
     feature_ic_selected_test = compute_feature_ic_report(X_test, y_test, feature_meta, include_table=False, top_n=20)
@@ -5896,7 +6501,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
     profit_test = []
     for info in test_infos:
         try:
-            profit_test.append(float(_profit_for_info(info, lookahead=profit_lookahead)))
+            profit_test.append(float(_profit_for_info(info, lookahead=profit_lookahead, enforce_t1=enforce_t1)))
         except Exception:
             profit_test.append(0.0)
 
@@ -5953,6 +6558,36 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
     else:
         advice.append("Brier <= 0.25：概率质量可用，可尝试阈值或分桶策略。")
 
+    trading = {
+        "threshold": {
+            "threshold": float(threshold),
+            **_profit_quality_metrics(trade_pnls),
+        },
+        "topk": {
+            "topk_frac": float(tk_frac),
+            "topk_n": int(topk_n),
+            "hit_rate": float(topk_hit),
+            **_profit_quality_metrics(topk_pnls),
+        },
+        "top10": {
+            "topk_frac": 0.1,
+            "topk_n": int(top10_n),
+            "hit_rate": float(top10_hit),
+            **_profit_quality_metrics(top10_pnls),
+        },
+    }
+    vec_test = _topk_vector_metrics_from_infos(
+        test_infos,
+        probs,
+        profit_test,
+        topk_frac=tk_frac,
+        trade_cost=trade_cost,
+        holding_period=profit_lookahead,
+        enforce_t1=enforce_t1,
+    )
+    if vec_test is not None:
+        trading["topk_vector"] = vec_test
+
     return score_model, feature_meta, {
         "valid_count": valid_count,
         "total_count": total_count,
@@ -5965,9 +6600,14 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
         "test_count": len(X_test),
         "side_filter": side_filter,
         "sample_summary": sample_summary,
+        "feature_selection": feature_selection_effective,
         "rank_transformed": bool(rank_cols),
         "rank_transform": _rank_debug_meta(feature_meta, rank_cols),
         "feature_value_stats": {"train_pre_rank": dbg_pre, "train_post_rank": dbg_post_rank, "train_post_winsor": dbg_post_winsor},
+        "feature_availability": {
+            "train": _feature_availability_diagnostics(X_train, feature_meta),
+            "test": _feature_availability_diagnostics(X_test, feature_meta),
+        },
         "debug_feature_checks_test": _debug_feature_checks_from_collections(_collect_feature_cols(X_test, y_test, feature_meta, dbg_feats)),
         "winsorized": bool(winsor_bounds),
         "brier_score": brier_val,
@@ -6020,34 +6660,7 @@ def train_time_split_backtest(bsp_dict, model_type="xgboost", test_ratio=0.3, va
                 "pr_auc": _pr_auc_from_probs(y_test, logreg_probs),
             },
         },
-        "trading": {
-            "threshold": {
-                "threshold": float(threshold),
-                "trade_count": int(len(trade_idxs)),
-                "avg_net_profit": float(sum(trade_pnls) / len(trade_pnls)) if trade_pnls else 0.0,
-                "total_net_profit": float(sum(trade_pnls)) if trade_pnls else 0.0,
-                "max_drawdown": _max_drawdown_from_pnls(trade_pnls),
-                "win_rate": float(sum(1 for r in trade_pnls if r > 0.0) / len(trade_pnls)) if trade_pnls else 0.0,
-            },
-            "topk": {
-                "topk_frac": float(tk_frac),
-                "topk_n": int(topk_n),
-                "hit_rate": float(topk_hit),
-                "avg_net_profit": float(sum(topk_pnls) / len(topk_pnls)) if topk_pnls else 0.0,
-                "total_net_profit": float(sum(topk_pnls)) if topk_pnls else 0.0,
-                "max_drawdown": _max_drawdown_from_pnls(topk_pnls),
-                "win_rate": float(sum(1 for r in topk_pnls if r > 0.0) / len(topk_pnls)) if topk_pnls else 0.0,
-            },
-            "top10": {
-                "topk_frac": 0.1,
-                "topk_n": int(top10_n),
-                "hit_rate": float(top10_hit),
-                "avg_net_profit": float(sum(top10_pnls) / len(top10_pnls)) if top10_pnls else 0.0,
-                "total_net_profit": float(sum(top10_pnls)) if top10_pnls else 0.0,
-                "max_drawdown": _max_drawdown_from_pnls(top10_pnls),
-                "win_rate": float(sum(1 for r in top10_pnls if r > 0.0) / len(top10_pnls)) if top10_pnls else 0.0,
-            },
-        },
+        "trading": trading,
         "threshold_curve": threshold_curve,
         "recommended_threshold_for_target_win": recommended_threshold_for_target_win,
         "estimated_trade_count": estimated_trade_count,
@@ -6089,7 +6702,13 @@ def compute_time_split_accuracy(bsp_dict, model_type="xgboost", test_ratio=0.3, 
     )
     return info
 
-def compute_recent_accuracy(bsp_dict, model_type="xgboost", recent_years: float = 1.0, threshold: float = 0.5, calibrate_method: str = "none", min_train: int = 200, min_val: int = 200, min_test: int = 500, n_jobs: int = -1, profit_threshold: Optional[float] = 0.02, auto_profit_quantile: float = 0.7, profit_lookahead: int = 3, use_atr_label: bool = False, atr_period: int = 14, atr_mult: float = 1.0):
+def compute_recent_accuracy(bsp_dict, model_type="xgboost", recent_years: float = 1.0, threshold: float = 0.5, calibrate_method: str = "none", min_train: int = 200, min_val: int = 200, min_test: int = 500, n_jobs: int = -1, profit_threshold: Optional[float] = 0.02, auto_profit_quantile: float = 0.7, profit_lookahead: int = 3, use_atr_label: bool = False, atr_period: int = 14, atr_mult: float = 1.0, enforce_t1: bool = False, trade_cost: float = 0.0, only_features=None, feature_preset: Optional[str] = None, side_filter: Optional[str] = None):
+    side_filter = _normalize_side_filter(side_filter, default="both")
+    only_features_list, feature_selection_meta = _fixed_feature_selection(
+        only_features=only_features,
+        feature_preset=feature_preset,
+    )
+    feature_selection_effective = _merge_feature_selection_meta(feature_selection_meta)
     if not bsp_dict:
         return {
             "valid_count": 0,
@@ -6098,10 +6717,14 @@ def compute_recent_accuracy(bsp_dict, model_type="xgboost", recent_years: float 
             "method": "recent_empty",
             "train_count": 0,
             "val_count": 0,
-            "test_count": 0
+            "test_count": 0,
+            "side_filter": side_filter,
+            "feature_selection": feature_selection_effective,
         }
 
     infos = list(bsp_dict.values())
+    if side_filter != "both":
+        infos = [info for info in infos if _side_filter_allows((info or {}).get("is_buy", False), side_filter)]
     try:
         infos.sort(key=lambda i: getattr(i.get("open_time"), "ts", 0))
     except Exception:
@@ -6115,7 +6738,9 @@ def compute_recent_accuracy(bsp_dict, model_type="xgboost", recent_years: float 
             "method": "recent_empty",
             "train_count": 0,
             "val_count": 0,
-            "test_count": 0
+            "test_count": 0,
+            "side_filter": side_filter,
+            "feature_selection": feature_selection_effective,
         }
 
     anchor_ts = getattr(infos[-1].get("open_time"), "ts", 0) or 0
@@ -6144,12 +6769,21 @@ def compute_recent_accuracy(bsp_dict, model_type="xgboost", recent_years: float 
             "method": "recent_insufficient_data",
             "train_count": len(train_infos),
             "val_count": 0,
-            "test_count": len(test_infos)
+            "test_count": len(test_infos),
+            "side_filter": side_filter,
+            "feature_selection": feature_selection_effective,
         }
 
-    feature_meta = build_feature_meta(bsp_dict)
+    feature_meta = build_feature_meta_from_infos(infos)
+    fixed_feature_applied = False
+    if only_features_list:
+        feature_meta, feature_selection_apply = _apply_fixed_feature_selection(feature_meta, only_features_list)
+        fixed_feature_applied = bool((feature_selection_apply or {}).get("applied"))
+        feature_selection_effective = _merge_feature_selection_meta(feature_selection_meta, feature_selection_apply, feature_meta)
+    else:
+        feature_selection_effective = _merge_feature_selection_meta(feature_selection_meta, feature_meta=feature_meta)
     if profit_threshold is None:
-        used_profit_threshold = _auto_profit_threshold_from_infos(train_infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead)
+        used_profit_threshold = _auto_profit_threshold_from_infos(train_infos, q=auto_profit_quantile, min_threshold=0.0, profit_lookahead=profit_lookahead, enforce_t1=enforce_t1, trade_cost=trade_cost)
     else:
         used_profit_threshold = float(profit_threshold)
 
@@ -6160,9 +6794,9 @@ def compute_recent_accuracy(bsp_dict, model_type="xgboost", recent_years: float 
     base_train_infos = train_infos[:-val_size] if val_size > 0 else train_infos
     val_infos = train_infos[-val_size:] if val_size > 0 else []
 
-    X_train, y_train = build_training_data_from_infos(base_train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
+    X_train, y_train = build_training_data_from_infos(base_train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+    X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+    X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
 
     if len(set(y_train)) < 2 or len(set(y_test)) < 2:
         return {
@@ -6172,7 +6806,9 @@ def compute_recent_accuracy(bsp_dict, model_type="xgboost", recent_years: float 
             "method": "recent_single_class_split",
             "train_count": len(X_train),
             "val_count": len(X_val),
-            "test_count": len(X_test)
+            "test_count": len(X_test),
+            "side_filter": side_filter,
+            "feature_selection": feature_selection_effective,
         }
 
     use_scale_pos_weight = str(model_type or "").strip().lower() in ["xgboost", "lightgbm"]
@@ -6180,22 +6816,35 @@ def compute_recent_accuracy(bsp_dict, model_type="xgboost", recent_years: float 
     feature_sel_meta = {"selected_features": [], "dropped_by_importance": 0, "dropped_by_corr": 0}
     model = None
     try:
-        model, feature_meta2, feature_sel_meta = train_model_with_feature_selection(
-            X_train,
-            y_train,
-            feature_meta,
-            model_type=model_type,
-            n_jobs=n_jobs,
-            use_scale_pos_weight=use_scale_pos_weight,
-            X_val=X_val,
-            y_val=y_val,
-        )
-        if feature_meta2:
-            feature_meta = list(feature_meta2)
-            selected_features = list(feature_meta2)
-            X_train, y_train = build_training_data_from_infos(base_train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-            X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
-            X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult)
+        if fixed_feature_applied:
+            model = train_model_from_xy(
+                X_train,
+                y_train,
+                model_type=model_type,
+                n_jobs=n_jobs,
+                use_scale_pos_weight=use_scale_pos_weight,
+                X_val=X_val,
+                y_val=y_val,
+            )
+            selected_features = list(feature_meta or [])
+            feature_sel_meta = {"selected_features": list(selected_features), "dropped_by_importance": 0, "dropped_by_corr": 0}
+        else:
+            model, feature_meta2, feature_sel_meta = train_model_with_feature_selection(
+                X_train,
+                y_train,
+                feature_meta,
+                model_type=model_type,
+                n_jobs=n_jobs,
+                use_scale_pos_weight=use_scale_pos_weight,
+                X_val=X_val,
+                y_val=y_val,
+            )
+            if feature_meta2:
+                feature_meta = list(feature_meta2)
+                selected_features = list(feature_meta2)
+                X_train, y_train = build_training_data_from_infos(base_train_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+                X_val, y_val = build_training_data_from_infos(val_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
+                X_test, y_test = build_training_data_from_infos(test_infos, feature_meta, profit_threshold=used_profit_threshold, profit_lookahead=profit_lookahead, use_atr_label=use_atr_label, atr_period=atr_period, atr_mult=atr_mult, enforce_t1=enforce_t1, trade_cost=trade_cost)
     except Exception:
         model = None
 
@@ -6207,7 +6856,9 @@ def compute_recent_accuracy(bsp_dict, model_type="xgboost", recent_years: float 
             "method": "recent_train_failed",
             "train_count": len(X_train),
             "val_count": len(X_val),
-            "test_count": len(X_test)
+            "test_count": len(X_test),
+            "side_filter": side_filter,
+            "feature_selection": feature_selection_effective,
         }
 
     score_model = model
@@ -6238,6 +6889,8 @@ def compute_recent_accuracy(bsp_dict, model_type="xgboost", recent_years: float 
         "val_count": len(X_val),
         "test_count": len(X_test),
         "brier_score": brier_score(score_model, X_test, y_test),
+        "side_filter": side_filter,
+        "feature_selection": feature_selection_effective,
         "selected_features": list(selected_features or []),
         "dropped_by_importance": int((feature_sel_meta or {}).get("dropped_by_importance", 0) or 0),
         "dropped_by_corr": int((feature_sel_meta or {}).get("dropped_by_corr", 0) or 0),
@@ -6400,8 +7053,24 @@ def save_pretrained_model_bundle(model, feature_meta, model_type: str, frequency
     if model_key is None:
         # Use the unified key builder which is now unique
         model_key = build_pretrained_model_key(model_type, frequency, data_src)
-    trained_at = datetime.datetime.utcnow().isoformat() + "Z"
+    trained_at = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
     bundle_path, meta_path = _pretrained_model_paths_by_key(model_key)
+    meta_payload = dict(meta or {})
+    identity = _feature_identity_meta(
+        feature_meta,
+        feature_preset=meta_payload.get("feature_preset") or ((meta_payload.get("feature_selection") or {}).get("feature_preset") if isinstance(meta_payload.get("feature_selection"), dict) else None),
+        side_filter=meta_payload.get("side_filter"),
+        requested_features=meta_payload.get("requested_features") or ((meta_payload.get("feature_selection") or {}).get("requested_features") if isinstance(meta_payload.get("feature_selection"), dict) else None),
+        feature_selection=meta_payload.get("feature_selection") if isinstance(meta_payload.get("feature_selection"), dict) else None,
+    )
+    meta_payload.setdefault("feature_identity", identity)
+    meta_payload.setdefault("feature_hash", identity.get("feature_hash"))
+    meta_payload.setdefault("effective_feature_hash", identity.get("effective_feature_hash"))
+    meta_payload.setdefault("requested_feature_hash", identity.get("requested_feature_hash"))
+    meta_payload.setdefault("feature_preset_version", identity.get("feature_preset_version"))
+    if identity.get("side_filter") is not None:
+        meta_payload.setdefault("side_filter", identity.get("side_filter"))
+    meta_payload = json_safe_value(meta_payload)
 
     bundle = {
         "version": MODEL_CACHE_VERSION,
@@ -6411,8 +7080,12 @@ def save_pretrained_model_bundle(model, feature_meta, model_type: str, frequency
         "data_src": data_src,
         "trained_at": trained_at,
         "feature_meta": feature_meta,
+        "feature_hash": identity.get("feature_hash"),
+        "effective_feature_hash": identity.get("effective_feature_hash"),
+        "requested_feature_hash": identity.get("requested_feature_hash"),
+        "feature_identity": identity,
         "model": model,
-        "meta": meta or {},
+        "meta": meta_payload,
     }
     with gzip.open(bundle_path, "wb") as f:
         pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -6424,11 +7097,16 @@ def save_pretrained_model_bundle(model, feature_meta, model_type: str, frequency
         "data_src": data_src,
         "bundle_path": bundle_path,
         "trained_at": trained_at,
-        "meta": meta or {},
+        "meta": meta_payload,
         "feature_count": len(feature_meta or []),
+        "feature_meta": list(feature_meta or []),
+        "feature_hash": identity.get("feature_hash"),
+        "effective_feature_hash": identity.get("effective_feature_hash"),
+        "requested_feature_hash": identity.get("requested_feature_hash"),
+        "feature_identity": identity,
     }
     with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(safe_meta, f, ensure_ascii=False, sort_keys=True, indent=2)
+        json.dump(json_safe_value(safe_meta), f, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
     return bundle_path, model_key, trained_at
 
 def list_pretrained_model_metas(limit: Optional[int] = 200):
@@ -6531,12 +7209,21 @@ def delete_pretrained_model_bundle_by_key(key: str):
         "missing": missing,
     }
 
-def load_pretrained_model_bundle(model_type: str, frequency: str, data_src: str, autype: Optional[object] = None, rank_mode: Optional[str] = None):
+def load_pretrained_model_bundle(model_type: str, frequency: str, data_src: str, autype: Optional[object] = None, rank_mode: Optional[str] = None, feature_preset: Optional[str] = None, only_features=None, side_filter: Optional[str] = None, allow_legacy_feature_fallback: bool = False):
     items = list_pretrained_model_metas(limit=None)
     mt = str(model_type or "")
     freq = str(frequency or "")
     src = str(data_src or "")
     want_rank_mode = str(rank_mode).strip().lower() if rank_mode is not None else None
+    want_feature_preset = _normalize_feature_preset(feature_preset)
+    want_side_filter = _normalize_side_filter(side_filter, default="both") if side_filter is not None else None
+    explicit_features = _csv_list_from_raw(only_features) if only_features is not None else None
+    if explicit_features:
+        want_features = list(explicit_features)
+    elif want_feature_preset:
+        want_features = _feature_preset_list(want_feature_preset)
+    else:
+        want_features = []
     want_autype = None
     if autype is not None:
         try:
@@ -6555,29 +7242,31 @@ def load_pretrained_model_bundle(model_type: str, frequency: str, data_src: str,
         except Exception:
             want_autype = None
 
-    candidates = []
-    for m in items or []:
+    def match_tier(m, ignore_autype: bool = False):
         if not isinstance(m, dict):
-            continue
+            return None
         if str(m.get("model_type") or "") != mt:
-            continue
+            return None
         if str(m.get("frequency") or "") != freq:
-            continue
+            return None
         if str(m.get("data_src") or "") != src:
-            continue
-        if int(m.get("version") or 0) != int(MODEL_CACHE_VERSION):
-            continue
+            return None
+        try:
+            if int(m.get("version") or 0) != int(MODEL_CACHE_VERSION):
+                return None
+        except Exception:
+            return None
         try:
             if int(m.get("feature_count") or 0) <= 0:
-                continue
+                return None
         except Exception:
-            continue
-        if want_autype:
+            return None
+        if want_autype and not bool(ignore_autype):
             try:
                 meta = m.get("meta", {}) if isinstance(m.get("meta", {}), dict) else {}
                 got = str(meta.get("autype") or "").strip().upper()
                 if got and got != want_autype:
-                    continue
+                    return None
             except Exception:
                 pass
         if want_rank_mode:
@@ -6585,44 +7274,64 @@ def load_pretrained_model_bundle(model_type: str, frequency: str, data_src: str,
                 meta = m.get("meta", {}) if isinstance(m.get("meta", {}), dict) else {}
                 got_rm = str(meta.get("rank_mode") or "").strip().lower()
                 if got_rm != want_rank_mode:
-                    continue
+                    return None
             except Exception:
-                continue
-        candidates.append(m)
-
-    if not candidates and want_autype:
-        for m in items or []:
-            if not isinstance(m, dict):
-                continue
-            if str(m.get("model_type") or "") != mt:
-                continue
-            if str(m.get("frequency") or "") != freq:
-                continue
-            if str(m.get("data_src") or "") != src:
-                continue
-            if int(m.get("version") or 0) != int(MODEL_CACHE_VERSION):
-                continue
+                return None
+        if want_side_filter:
             try:
-                if int(m.get("feature_count") or 0) <= 0:
-                    continue
+                meta = m.get("meta", {}) if isinstance(m.get("meta", {}), dict) else {}
+                got_side = str(meta.get("side_filter") or "").strip().lower()
+                if not got_side and isinstance(meta.get("feature_identity"), dict):
+                    got_side = str((meta.get("feature_identity") or {}).get("side_filter") or "").strip().lower()
+                got_side = _normalize_side_filter(got_side, default="both") if got_side else None
+                if got_side and got_side != want_side_filter:
+                    return None
             except Exception:
+                pass
+        return _pretrained_feature_match_tier(
+            m,
+            want_features=want_features,
+            want_feature_preset=want_feature_preset,
+            allow_legacy_feature_fallback=bool(allow_legacy_feature_fallback) and not explicit_features,
+            exact_feature_match_required=bool(explicit_features),
+        )
+
+    def collect(ignore_autype: bool = False):
+        ranked = []
+        for m in items or []:
+            tier = match_tier(m, ignore_autype=ignore_autype)
+            if tier is None:
                 continue
-            if want_rank_mode:
-                try:
-                    meta = m.get("meta", {}) if isinstance(m.get("meta", {}), dict) else {}
-                    got_rm = str(meta.get("rank_mode") or "").strip().lower()
-                    if got_rm != want_rank_mode:
-                        continue
-                except Exception:
-                    continue
-            candidates.append(m)
+            ranked.append((int(tier), m))
+        ranked.sort(key=lambda x: x[0])
+        return ranked
+
+    candidates = collect(ignore_autype=False)
+    ignored_autype = False
+    if not candidates and want_autype:
+        ignored_autype = True
+        candidates = collect(ignore_autype=True)
 
     if not candidates:
         return None
-    key = str(candidates[0].get("key") or "").strip()
+    chosen_tier, chosen_meta = candidates[0]
+    key = str(chosen_meta.get("key") or "").strip()
     if not key:
         return None
-    return load_pretrained_model_bundle_by_key(key)
+    bundle = load_pretrained_model_bundle_by_key(key)
+    if isinstance(bundle, dict):
+        match_info = _pretrained_feature_match_diagnostics(
+            chosen_meta,
+            chosen_tier,
+            want_features=want_features,
+            want_feature_preset=want_feature_preset,
+            explicit_features=bool(explicit_features),
+            ignored_autype=bool(ignored_autype),
+        )
+        bundle["feature_match"] = match_info
+        if isinstance(bundle.get("meta"), dict):
+            bundle["meta"]["feature_match"] = match_info
+    return bundle
 
 def load_pretrained_model_bundle_by_key(key: str):
     meta = get_pretrained_model_detail_by_key(key)
@@ -6816,6 +7525,15 @@ def evaluate_fixed_model_time_split(bsp_dict, model, feature_meta, test_ratio=0.
     trade_pnls = [(float(profit_test[i]) - float(trade_cost or 0.0)) for i in trade_idxs] if trade_idxs else []
     top10_pnls = [(float(profit_test[i]) - float(trade_cost or 0.0)) for i in top10_idxs] if top10_idxs else []
     topk_pnls = [(float(profit_test[i]) - float(trade_cost or 0.0)) for i in topk_idxs] if topk_idxs else []
+    fixed_topk_vector = _topk_vector_metrics_from_infos(
+        test_infos,
+        probs,
+        profit_test,
+        topk_frac=tk_frac,
+        trade_cost=trade_cost,
+        holding_period=profit_lookahead,
+        enforce_t1=enforce_t1,
+    )
 
     brier_val = _brier_from_probs(y_test, probs)
     roc_auc_val = _roc_auc_from_probs(y_test, probs)
@@ -6879,35 +7597,21 @@ def evaluate_fixed_model_time_split(bsp_dict, model, feature_meta, test_ratio=0.
         "trading": {
             "threshold": {
                 "threshold": float(threshold),
-                "trade_count": int(len(trade_idxs)),
-                "avg_net_profit": float(sum(trade_pnls) / len(trade_pnls)) if trade_pnls else 0.0,
-                "total_net_profit": float(sum(trade_pnls)) if trade_pnls else 0.0,
-                "max_drawdown": _max_drawdown_from_pnls(trade_pnls),
-                "win_rate": float(sum(1 for r in trade_pnls if r > 0.0) / len(trade_pnls)) if trade_pnls else 0.0,
+                **_profit_quality_metrics(trade_pnls),
             },
             "topk": {
                 "topk_frac": float(tk_frac),
                 "topk_n": int(topk_n),
                 "hit_rate": float(topk_hit),
-                "avg_net_profit": float(sum(topk_pnls) / len(topk_pnls)) if topk_pnls else 0.0,
-                "total_net_profit": float(sum(topk_pnls)) if topk_pnls else 0.0,
-                "max_drawdown": _max_drawdown_from_pnls(topk_pnls),
-                "win_rate": float(sum(1 for r in topk_pnls if r > 0.0) / len(topk_pnls)) if topk_pnls else 0.0,
+                **_profit_quality_metrics(topk_pnls),
             },
             "top10": {
                 "topk_frac": 0.1,
                 "topk_n": int(top10_n),
                 "hit_rate": float(top10_hit),
-                "avg_net_profit": float(sum(top10_pnls) / len(top10_pnls)) if top10_pnls else 0.0,
-                "total_net_profit": float(sum(top10_pnls)) if top10_pnls else 0.0,
-                "max_drawdown": _max_drawdown_from_pnls(top10_pnls),
-                "win_rate": float(sum(1 for r in top10_pnls if r > 0.0) / len(top10_pnls)) if top10_pnls else 0.0,
+                **_profit_quality_metrics(top10_pnls),
             },
-            **(
-                {"topk_vector": _topk_vector_metrics_from_infos(test_infos, probs, profit_test, topk_frac=tk_frac, trade_cost=trade_cost)}
-                if _topk_vector_metrics_from_infos(test_infos, probs, profit_test, topk_frac=tk_frac, trade_cost=trade_cost) is not None
-                else {}
-            ),
+            **({"topk_vector": fixed_topk_vector} if fixed_topk_vector is not None else {}),
         }
     }
 
@@ -6921,6 +7625,7 @@ def _process_code_for_pretrain(args):
     high_vol_atr_pct_min = None
     trade_cost = 0.0
     side_filter = "buy"
+    enforce_t1 = False
     if isinstance(args, (list, tuple)) and len(args) >= 6:
         code, level, begin_time, data_src_type, profit_threshold, profit_lookahead = args[:6]
         if len(args) >= 7:
@@ -6948,6 +7653,8 @@ def _process_code_for_pretrain(args):
             trade_cost = 0.0
     if isinstance(args, (list, tuple)) and len(args) >= 15:
         side_filter = args[14]
+    if isinstance(args, (list, tuple)) and len(args) >= 16:
+        enforce_t1 = bool(args[15])
     side_filter = _normalize_side_filter(side_filter, default="buy")
     code = normalize_code(code)
     try:
@@ -7024,7 +7731,7 @@ def _process_code_for_pretrain(args):
                 cur_klu = _info_decision_klu(info)
                 if not cur_klu:
                     continue
-                profit = _profit_for_info(info, lookahead=int(profit_lookahead or 0))
+                profit = _profit_for_info(info, lookahead=int(profit_lookahead or 0), enforce_t1=enforce_t1)
                 try:
                     used_profit_threshold = None if profit_threshold is None else float(profit_threshold)
                 except Exception:
@@ -7120,7 +7827,10 @@ def pretrain_and_persist_model(
     rolling_sample_mode: Optional[str] = None,
     rolling_stride: Optional[int] = None,
     only_features: Optional[list] = None,
+    feature_preset: Optional[str] = None,
     side_filter: str = "buy",
+    enforce_t1: bool = False,
+    strategy_preset: Optional[dict] = None,
 ):
     if not codes:
         return None, {
@@ -7194,7 +7904,7 @@ def pretrain_and_persist_model(
                 autype_name = "HFQ"
 
             tasks = [
-                (code, level, begin_time, data_src_type, profit_threshold, profit_lookahead, autype_name, bool(use_atr_label), atr_period, atr_mult, high_vol_atr_pct_min, rolling_sample_mode, rolling_stride, float(trade_cost or 0.0), side_filter)
+                (code, level, begin_time, data_src_type, profit_threshold, profit_lookahead, autype_name, bool(use_atr_label), atr_period, atr_mult, high_vol_atr_pct_min, rolling_sample_mode, rolling_stride, float(trade_cost or 0.0), side_filter, bool(enforce_t1))
                 for code in codes
             ]
             future_to_code = {executor.submit(_process_code_for_pretrain, t): t[0] for t in tasks}
@@ -7240,18 +7950,15 @@ def pretrain_and_persist_model(
         report("training", 0.85, "training")
 
         feature_meta = sorted(feature_keys)
-        if only_features:
-            keep = []
-            seen = set()
-            for f in only_features or []:
-                s = str(f or "").strip()
-                if not s or s in seen:
-                    continue
-                if s in feature_meta:
-                    keep.append(s)
-                    seen.add(s)
-            if keep:
-                feature_meta = keep
+        fixed_features, feature_selection_meta = _fixed_feature_selection(
+            only_features=only_features,
+            feature_preset=feature_preset,
+        )
+        if fixed_features:
+            feature_meta, feature_selection_apply = _apply_fixed_feature_selection(feature_meta, fixed_features)
+            feature_selection_effective = _merge_feature_selection_meta(feature_selection_meta, feature_selection_apply, feature_meta)
+        else:
+            feature_selection_effective = _merge_feature_selection_meta(feature_selection_meta, feature_meta=feature_meta)
         samples.sort(key=lambda s: int(s.get("open_ts", 0) or 0))
         sample_summary = _sample_semantic_summary_from_rows(samples)
 
@@ -7333,7 +8040,12 @@ def pretrain_and_persist_model(
                 "test_count": 0,
                 "brier_score": brier_score(model, X_all, y_all),
                 "ece": 0.0,
-                "calibration_bins": []
+                "calibration_bins": [],
+                "feature_availability": {
+                    "all": _feature_availability_diagnostics(X_all, feature_meta),
+                    "train": _feature_availability_diagnostics(X_all, feature_meta),
+                    "test": _feature_availability_diagnostics([], feature_meta),
+                },
             }
         else:
             train_end = int(n * (1 - val_ratio - test_ratio))
@@ -7472,6 +8184,11 @@ def pretrain_and_persist_model(
                 "brier_score": brier_score(score_model, X_test, y_test),
                 "ece": ece,
                 "calibration_bins": bins,
+                "feature_availability": {
+                    "train": _feature_availability_diagnostics(X_train, feature_meta),
+                    "val": _feature_availability_diagnostics(X_val, feature_meta),
+                    "test": _feature_availability_diagnostics(X_test, feature_meta),
+                },
                 "class_balance": {
                     "train": _binary_balance_meta(y_train),
                     "val": _binary_balance_meta(y_val),
@@ -7516,17 +8233,28 @@ def pretrain_and_persist_model(
                         eq = 1.0
                         for r in rets:
                             eq = eq * (1.0 + float(r))
+                        quality = _profit_quality_metrics(pos_rets)
                         accuracy_info["trading"] = {
                             "topk_vector": {
                                 "topk_frac": float(tk_frac),
                                 "bars": int(len(rets)),
+                                "trade_count": int(quality.get("trade_count", 0) or 0),
                                 "avg_positions": (float(sum(bar_counts)) / float(len(bar_counts)) if bar_counts else 0.0),
                                 "avg_bar_return": float(sum(rets) / float(len(rets))) if rets else 0.0,
+                                "avg_net_profit": float(quality.get("avg_net_profit", 0.0) or 0.0),
+                                "total_net_profit": float(quality.get("total_net_profit", 0.0) or 0.0),
                                 "total_return": float(eq - 1.0),
                                 "max_drawdown": _max_drawdown_from_returns(rets),
+                                "position_max_drawdown": float(quality.get("max_drawdown", 0.0) or 0.0),
                                 "sharpe": _sharpe_from_returns(rets),
+                                "win_rate": float(quality.get("win_rate", 0.0) or 0.0),
                                 "pos_win_rate": (float(sum(1 for r in pos_rets if r > 0.0) / float(len(pos_rets))) if pos_rets else 0.0),
                                 "bar_win_rate": (float(sum(1 for r in rets if r > 0.0) / float(len(rets))) if rets else 0.0),
+                                "profit_factor": quality.get("profit_factor"),
+                                "profit_factor_is_infinite": bool(quality.get("profit_factor_is_infinite", False)),
+                                "expectancy": float(quality.get("expectancy", 0.0) or 0.0),
+                                "avg_win": float(quality.get("avg_win", 0.0) or 0.0),
+                                "avg_loss": float(quality.get("avg_loss", 0.0) or 0.0),
                             }
                         }
             except Exception:
@@ -7534,9 +8262,22 @@ def pretrain_and_persist_model(
 
             model = score_model
 
+        feature_identity = _feature_identity_meta(
+            feature_meta,
+            feature_preset=(feature_selection_effective.get("feature_preset") if isinstance(feature_selection_effective, dict) else feature_preset),
+            side_filter=side_filter,
+            requested_features=(feature_selection_effective.get("requested_features") if isinstance(feature_selection_effective, dict) else None),
+            feature_selection=feature_selection_effective,
+        )
         if isinstance(accuracy_info, dict):
             accuracy_info["side_filter"] = side_filter
             accuracy_info["sample_summary"] = sample_summary
+            accuracy_info["feature_selection"] = feature_selection_effective
+            accuracy_info["feature_identity"] = feature_identity
+            accuracy_info["feature_hash"] = feature_identity.get("feature_hash")
+            accuracy_info["enforce_t1"] = bool(enforce_t1)
+            if isinstance(strategy_preset, dict):
+                accuracy_info["strategy_preset"] = strategy_preset
 
         if not model:
             return None, {
@@ -7565,10 +8306,16 @@ def pretrain_and_persist_model(
             "profit_threshold": used_profit_threshold,
             "profit_lookahead": int(profit_lookahead or 0),
             "side_filter": side_filter,
+            "enforce_t1": bool(enforce_t1),
+            "strategy_preset": (strategy_preset if isinstance(strategy_preset, dict) else None),
             "rank_mode": rm,
             "rolling_sample_mode": (str(rolling_sample_mode or "").strip().lower() if rolling_sample_mode is not None else None),
             "rolling_stride": (int(rolling_stride) if rolling_stride is not None else None),
             "only_features": (list(feature_meta) if feature_meta else None),
+            "feature_preset": (feature_selection_effective.get("feature_preset") if isinstance(feature_selection_effective, dict) else None),
+            "feature_hash": feature_identity.get("feature_hash"),
+            "feature_identity": feature_identity,
+            "feature_selection": feature_selection_effective,
             "portfolio_min_score": (float(portfolio_min_score) if portfolio_min_score is not None else None),
             "portfolio_top_n": (int(portfolio_top_n) if portfolio_top_n is not None else None),
         }
@@ -7590,8 +8337,12 @@ def pretrain_and_persist_model(
             "frequency": frequency,
             "data_src": data_src,
             "feature_count": len(feature_meta),
+            "feature_hash": feature_identity.get("feature_hash"),
+            "feature_identity": feature_identity,
+            "strategy_preset": (strategy_preset if isinstance(strategy_preset, dict) else None),
             "sample_count": len(samples),
             "accuracy": accuracy_info,
+            "feature_selection": feature_selection_effective,
             "codes": meta["codes"],
             "per_code_sample_count": per_code_sample_count,
             "trained_at": trained_at,

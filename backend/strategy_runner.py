@@ -19,8 +19,13 @@ from backend.chan_service import (
     predict_proba_1,
     stragety_feature,
     extract_state_features_from_cur_lv,
+    build_chan_state_feature,
     get_stock_name,
-    normalize_code
+    normalize_code,
+    _add_sample_semantic_features,
+    _normalize_side_filter,
+    _side_filter_allows,
+    json_safe_value,
 )
 from backend.storage import StorageManager, StrategyRun
 from backend.vector_backtest import VectorBacktester
@@ -36,6 +41,123 @@ def get_worker_storage():
     if _worker_storage is None:
         _worker_storage = StorageManager()
     return _worker_storage
+
+def _none_like(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return str(value).strip().lower() in ("", "null", "none", "nan")
+    return False
+
+def _finite_float_or_none(value):
+    if _none_like(value):
+        return None
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(out):
+        return None
+    return float(out)
+
+def _optional_float_param(params: Dict[str, Any], key: str, min_value: Optional[float] = None, max_value: Optional[float] = None):
+    out = _finite_float_or_none((params or {}).get(key))
+    if out is None:
+        return None
+    if min_value is not None and out < float(min_value):
+        out = float(min_value)
+    if max_value is not None and out > float(max_value):
+        out = float(max_value)
+    return out
+
+def _optional_int_param(params: Dict[str, Any], key: str, default: int = 0, min_value: int = 0, max_value: Optional[int] = None) -> int:
+    raw = (params or {}).get(key, default)
+    if _none_like(raw):
+        out = int(default)
+    else:
+        try:
+            out = int(float(raw))
+        except Exception:
+            out = int(default)
+    if out < int(min_value):
+        out = int(min_value)
+    if max_value is not None and out > int(max_value):
+        out = int(max_value)
+    return int(out)
+
+def _strategy_trading_metrics(accuracy_info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    trading = (accuracy_info or {}).get("trading") if isinstance(accuracy_info, dict) else None
+    if not isinstance(trading, dict):
+        return {}
+    source = None
+    raw = None
+    for name in ("topk_vector", "topk", "top10", "threshold"):
+        cand = trading.get(name)
+        if isinstance(cand, dict):
+            source = name
+            raw = cand
+            break
+    if not isinstance(raw, dict):
+        return {}
+    pf = None
+    try:
+        pf_raw = raw.get("profit_factor")
+        if bool(raw.get("profit_factor_is_infinite", False)):
+            pf = float("inf")
+        elif pf_raw is not None and np.isinf(float(pf_raw)):
+            pf = float("inf") if float(pf_raw) > 0 else float("-inf")
+        else:
+            pf = _finite_float_or_none(pf_raw)
+    except Exception:
+        pf = _finite_float_or_none(raw.get("profit_factor"))
+    avg_return = _finite_float_or_none(raw.get("avg_bar_return"))
+    if avg_return is None:
+        avg_return = _finite_float_or_none(raw.get("avg_net_profit"))
+    if avg_return is None:
+        avg_return = _finite_float_or_none(raw.get("expectancy"))
+    trade_count = _optional_int_param(raw, "trade_count", default=0, min_value=0)
+    if trade_count <= 0:
+        trade_count = _optional_int_param(raw, "topk_n", default=0, min_value=0)
+    max_drawdown = _finite_float_or_none(raw.get("max_drawdown"))
+    return {
+        "source": source,
+        "profit_factor": pf,
+        "profit_factor_is_infinite": bool(raw.get("profit_factor_is_infinite", False)),
+        "topk_avg_return": avg_return,
+        "topk_trade_count": int(trade_count),
+        "topk_max_drawdown": max_drawdown,
+        "win_rate": _finite_float_or_none(raw.get("win_rate")),
+        "expectancy": _finite_float_or_none(raw.get("expectancy")),
+        "avg_win": _finite_float_or_none(raw.get("avg_win")),
+        "avg_loss": _finite_float_or_none(raw.get("avg_loss")),
+    }
+
+def _profit_filter_check(
+    accuracy_info: Optional[Dict[str, Any]],
+    min_profit_factor: Optional[float],
+    min_topk_avg_return: Optional[float],
+    min_topk_trade_count: int,
+    max_topk_drawdown: Optional[float],
+):
+    metrics = _strategy_trading_metrics(accuracy_info)
+    failures = []
+    if min_profit_factor is not None:
+        pf = metrics.get("profit_factor")
+        if pf is None or float(pf) < float(min_profit_factor):
+            failures.append(f"profit_factor<{float(min_profit_factor):.4g}")
+    if min_topk_avg_return is not None:
+        ar = metrics.get("topk_avg_return")
+        if ar is None or float(ar) < float(min_topk_avg_return):
+            failures.append(f"topk_avg_return<{float(min_topk_avg_return):.4g}")
+    if int(min_topk_trade_count or 0) > 0:
+        tc = int(metrics.get("topk_trade_count") or 0)
+        if tc < int(min_topk_trade_count):
+            failures.append(f"topk_trades<{int(min_topk_trade_count)}")
+    if max_topk_drawdown is not None:
+        dd = metrics.get("topk_max_drawdown")
+        if dd is None or float(dd) > float(max_topk_drawdown):
+            failures.append(f"topk_drawdown>{float(max_topk_drawdown):.4g}")
+    return len(failures) == 0, metrics, failures
 
 def get_hs300_stocks() -> List[str]:
     try:
@@ -66,6 +188,10 @@ def _process_single_stock_strategy(
     min_accuracy: float,
     min_recent_accuracy: Optional[float],
     recent_accuracy_years: float,
+    min_profit_factor: Optional[float],
+    min_topk_avg_return: Optional[float],
+    min_topk_trade_count: int,
+    max_topk_drawdown: Optional[float],
     require_signal: bool,
     signal_lookback: int,
     signal_direction: str,
@@ -79,6 +205,11 @@ def _process_single_stock_strategy(
     profit_threshold: Optional[float],
     auto_profit_quantile: float,
     profit_lookahead: int,
+    trade_cost: float,
+    enforce_t1: bool,
+    only_features: Optional[Any],
+    feature_preset: Optional[str],
+    side_filter: str,
     autype,
     need_predictions: bool = False,
 ):
@@ -102,6 +233,7 @@ def _process_single_stock_strategy(
                     used_autype = AUTYPE.HFQ
         except Exception:
             used_autype = AUTYPE.HFQ
+        side_filter = _normalize_side_filter(side_filter, default="buy")
         
         # Fetch Data
         kl_list = fetch_stock_data(
@@ -177,6 +309,10 @@ def _process_single_stock_strategy(
                     "min_accuracy": float(min_accuracy),
                     "min_recent_accuracy": float(min_recent_accuracy) if min_recent_accuracy is not None else None,
                     "recent_accuracy_years": float(recent_accuracy_years),
+                    "min_profit_factor": float(min_profit_factor) if min_profit_factor is not None else None,
+                    "min_topk_avg_return": float(min_topk_avg_return) if min_topk_avg_return is not None else None,
+                    "min_topk_trade_count": int(min_topk_trade_count or 0),
+                    "max_topk_drawdown": float(max_topk_drawdown) if max_topk_drawdown is not None else None,
                     "require_signal": require_signal,
                     "signal_lookback": signal_lookback,
                     "signal_direction": signal_direction,
@@ -190,6 +326,11 @@ def _process_single_stock_strategy(
                     "profit_threshold": float(profit_threshold) if profit_threshold is not None else None,
                     "auto_profit_quantile": float(auto_profit_quantile),
                     "profit_lookahead": int(profit_lookahead),
+                    "trade_cost": float(trade_cost or 0.0),
+                    "enforce_t1": bool(enforce_t1),
+                    "only_features": only_features,
+                    "feature_preset": feature_preset,
+                    "side_filter": side_filter,
                     "data_start_time": data_start_time,
                     "data_end_time": data_end_time
                 }
@@ -260,14 +401,26 @@ def _process_single_stock_strategy(
                 continue
             last_bsp = bsp_list[0]
             state_feat = extract_state_features_from_cur_lv(cur_lv_chan, last_klu)
-            if last_bsp.klu.idx not in bsp_dict and cur_lv_chan[-2].idx == last_bsp.klu.klc.idx:
+            chan_state_feat = build_chan_state_feature(cur_lv_chan, last_klu, last_bsp)
+            if _side_filter_allows(last_bsp.is_buy, side_filter) and last_bsp.klu.idx not in bsp_dict and cur_lv_chan[-2].idx == last_bsp.klu.klc.idx:
                 bsp_count += 1
+                feat_copy = copy.deepcopy(last_bsp.features)
+                try:
+                    _add_sample_semantic_features(feat_copy, bool(last_bsp.is_buy), last_bsp, "event_bsp")
+                except Exception:
+                    pass
+                try:
+                    if chan_state_feat:
+                        feat_copy.add_feat(chan_state_feat)
+                except Exception:
+                    pass
                 bsp_dict[last_bsp.klu.idx] = {
-                    "feature": copy.deepcopy(last_bsp.features),
+                    "feature": feat_copy,
                     "is_buy": last_bsp.is_buy,
                     "open_time": last_klu.time,
                     "bsp_obj": last_bsp,
                     "decision_klu": last_klu,
+                    "sample_kind": "event_bsp",
                 }
                 try:
                     if state_feat:
@@ -309,9 +462,14 @@ def _process_single_stock_strategy(
             "profit_threshold": profit_threshold,
             "auto_profit_quantile": auto_profit_quantile,
             "profit_lookahead": profit_lookahead,
+            "trade_cost": float(trade_cost or 0.0),
+            "enforce_t1": bool(enforce_t1),
             "use_atr_label": bool(use_atr_label),
             "atr_period": int(atr_period),
             "atr_mult": float(atr_mult),
+            "only_features": only_features,
+            "feature_preset": feature_preset,
+            "side_filter": side_filter,
         }
         if int(min_test_count) > 0:
             backtest_kwargs["min_test"] = int(min_test_count)
@@ -352,9 +510,14 @@ def _process_single_stock_strategy(
                     "profit_threshold": profit_threshold,
                     "auto_profit_quantile": auto_profit_quantile,
                     "profit_lookahead": profit_lookahead,
+                    "trade_cost": float(trade_cost or 0.0),
+                    "enforce_t1": bool(enforce_t1),
                     "use_atr_label": bool(use_atr_label),
                     "atr_period": int(atr_period),
                     "atr_mult": float(atr_mult),
+                    "only_features": only_features,
+                    "feature_preset": feature_preset,
+                    "side_filter": side_filter,
                 }
                 if int(min_test_count) > 0:
                     recent_kwargs["min_test"] = int(min_test_count)
@@ -366,7 +529,27 @@ def _process_single_stock_strategy(
         except Exception:
             recent_accuracy = None
 
-        if current_accuracy >= float(min_accuracy):
+        profit_ok, trading_metrics, profit_failures = _profit_filter_check(
+            accuracy_info,
+            min_profit_factor=min_profit_factor,
+            min_topk_avg_return=min_topk_avg_return,
+            min_topk_trade_count=min_topk_trade_count,
+            max_topk_drawdown=max_topk_drawdown,
+        )
+        if trading_metrics:
+            try:
+                method += (
+                    f" {trading_metrics.get('source')}"
+                    f" pf={trading_metrics.get('profit_factor')}"
+                    f" avg={trading_metrics.get('topk_avg_return')}"
+                    f" trades={trading_metrics.get('topk_trade_count')}"
+                )
+            except Exception:
+                pass
+        if not profit_ok:
+            method = (method + f" profit_filtered={','.join(profit_failures)}") if method else f"profit_filtered={','.join(profit_failures)}"
+
+        if current_accuracy >= float(min_accuracy) and profit_ok:
             has_signal = False
             latest_signal_date = ""
             latest_signal_type = ""
@@ -375,6 +558,8 @@ def _process_single_stock_strategy(
             if require_signal:
                 last_idx = last_klu.idx
                 for bsp in latest_bsp_list:
+                    if not _side_filter_allows(bool(bsp.is_buy), side_filter):
+                        continue
                     if signal_direction == 'buy' and not bsp.is_buy:
                         continue
                     if signal_direction == 'sell' and bsp.is_buy:
@@ -394,13 +579,21 @@ def _process_single_stock_strategy(
             else:
                 has_signal = True
                 if latest_bsp_list:
-                    selected_bsp = latest_bsp_list[0]
-                    latest_signal_date = selected_bsp.klu.time.to_str()
-                    latest_signal_type = selected_bsp.type2str()
-                    if selected_bsp.is_buy:
-                        latest_signal_type += " (Buy)"
-                    else:
-                        latest_signal_type += " (Sell)"
+                    for bsp in latest_bsp_list:
+                        if not _side_filter_allows(bool(bsp.is_buy), side_filter):
+                            continue
+                        if signal_direction == 'buy' and not bsp.is_buy:
+                            continue
+                        if signal_direction == 'sell' and bsp.is_buy:
+                            continue
+                        selected_bsp = bsp
+                        latest_signal_date = selected_bsp.klu.time.to_str()
+                        latest_signal_type = selected_bsp.type2str()
+                        if selected_bsp.is_buy:
+                            latest_signal_type += " (Buy)"
+                        else:
+                            latest_signal_type += " (Sell)"
+                        break
 
             signal_score = None
             if has_signal and selected_bsp is not None and bst and feature_meta:
@@ -418,6 +611,10 @@ def _process_single_stock_strategy(
                             state_feat2 = extract_state_features_from_cur_lv(cur_lv_chan, last_klu)
                             if state_feat2:
                                 feat_obj.add_feat(state_feat2)
+                            chan_state_feat2 = build_chan_state_feature(cur_lv_chan, last_klu, selected_bsp)
+                            if chan_state_feat2:
+                                feat_obj.add_feat(chan_state_feat2)
+                            _add_sample_semantic_features(feat_obj, bool(selected_bsp.is_buy), selected_bsp, "event_bsp")
                         except Exception:
                             pass
                         feat_obj.add_feat(stragety_feature(last_klu, enable_rolling_lookback=enable_rolling_lookback))
@@ -444,11 +641,18 @@ def _process_single_stock_strategy(
                     "accuracy": current_accuracy,
                     "recent_accuracy": recent_accuracy,
                     "signal_score": signal_score,
+                    "profit_factor": trading_metrics.get("profit_factor") if trading_metrics else None,
+                    "profit_factor_is_infinite": trading_metrics.get("profit_factor_is_infinite") if trading_metrics else False,
+                    "topk_avg_return": trading_metrics.get("topk_avg_return") if trading_metrics else None,
+                    "topk_trade_count": trading_metrics.get("topk_trade_count") if trading_metrics else None,
+                    "topk_max_drawdown": trading_metrics.get("topk_max_drawdown") if trading_metrics else None,
+                    "trading_metrics": trading_metrics,
                     "latest_date": latest_signal_date if require_signal else last_klu.time.to_str(),
                     "signal_type": latest_signal_type
                 }
         
         # Save to cache
+        result = json_safe_value(result) if result is not None else None
         try:
             if key_hash and storage:
                 storage.save_strategy_cache(
@@ -466,6 +670,7 @@ def _process_single_stock_strategy(
             pass
 
         info = accuracy_info if isinstance(accuracy_info, dict) else {}
+        info = json_safe_value(info) if isinstance(info, dict) else {}
         info["daily_oc"] = daily_oc
         return code, result, len(bsp_dict), current_accuracy, method, info
 
@@ -571,10 +776,23 @@ class StrategyRunner:
                 recent_accuracy_years = 1.0
             if recent_accuracy_years <= 0:
                 recent_accuracy_years = 1.0
+            min_profit_factor = _optional_float_param(params, "min_profit_factor", min_value=0.0)
+            min_topk_avg_return = _optional_float_param(params, "min_topk_avg_return")
+            min_topk_trade_count = _optional_int_param(params, "min_topk_trade_count", default=0, min_value=0, max_value=1000000)
+            max_topk_drawdown = _optional_float_param(params, "max_topk_drawdown", min_value=0.0)
             custom_chan_config = params.get('chan_config') or {}
             require_signal = params.get('require_signal', False)
             signal_lookback = int(params.get('signal_lookback', 5))
             signal_direction = params.get('signal_direction', 'buy')
+            side_filter = _normalize_side_filter(params.get("side_filter", "buy"), default="buy")
+            only_features = params.get("only_features", None)
+            if isinstance(only_features, str) and not str(only_features).strip():
+                only_features = None
+            feature_preset = params.get("feature_preset", None)
+            if isinstance(feature_preset, str) and not str(feature_preset).strip():
+                feature_preset = None
+            if str(model_type or "").strip().lower() in ("lr", "logreg", "logistic", "logistic_regression") and only_features is None and feature_preset is None:
+                feature_preset = "lr_default"
             min_signal_score = params.get('min_signal_score', None)
             try:
                 if min_signal_score is not None:
@@ -670,6 +888,18 @@ class StrategyRunner:
                 profit_lookahead = 0
             if profit_lookahead > 250:
                 profit_lookahead = 250
+            trade_cost = params.get('trade_cost', 0.0)
+            try:
+                trade_cost = float(trade_cost)
+            except Exception:
+                trade_cost = 0.0
+            if trade_cost < 0:
+                trade_cost = 0.0
+            enforce_t1_raw = params.get('enforce_t1', False)
+            if isinstance(enforce_t1_raw, str):
+                enforce_t1 = str(enforce_t1_raw).strip().lower() in ("1", "true", "yes", "y", "on")
+            else:
+                enforce_t1 = bool(enforce_t1_raw)
             pool_id = params.get('pool_id')
             enable_rolling_lookback = params.get('enable_rolling_lookback', True)
             
@@ -854,6 +1084,10 @@ class StrategyRunner:
                             min_accuracy,
                             min_recent_accuracy,
                             recent_accuracy_years,
+                            min_profit_factor,
+                            min_topk_avg_return,
+                            min_topk_trade_count,
+                            max_topk_drawdown,
                             require_signal,
                             signal_lookback,
                             signal_direction,
@@ -867,6 +1101,11 @@ class StrategyRunner:
                             profit_threshold,
                             auto_profit_quantile,
                             profit_lookahead,
+                            trade_cost,
+                            enforce_t1,
+                            only_features,
+                            feature_preset,
+                            side_filter,
                             raw_autype,
                             bool(portfolio_top_n),
                         )
@@ -934,7 +1173,7 @@ class StrategyRunner:
 
             if self._is_run_canceled(run_id):
                 try:
-                    self._update_progress(run_id, processed, len(stocks), "canceled", json.dumps(results), len(results))
+                    self._update_progress(run_id, processed, len(stocks), "canceled", json.dumps(json_safe_value(results), ensure_ascii=False, allow_nan=False), len(results))
                 except Exception:
                     pass
                 return
@@ -942,7 +1181,7 @@ class StrategyRunner:
             # Portfolio Backtest
             if self._is_run_canceled(run_id):
                 try:
-                    self._update_progress(run_id, processed, len(stocks), "canceled", json.dumps(results), len(results))
+                    self._update_progress(run_id, processed, len(stocks), "canceled", json.dumps(json_safe_value(results), ensure_ascii=False, allow_nan=False), len(results))
                 except Exception:
                     pass
                 return
@@ -982,7 +1221,7 @@ class StrategyRunner:
                         candidates,
                         begin_time,
                         end_date,
-                        trade_cost=0.0,
+                        trade_cost=float(trade_cost or 0.0),
                         top_n=int(portfolio_top_n),
                         daily_oc_by_code=daily_oc_by_code,
                         sell_mode="baseline",
@@ -1016,7 +1255,7 @@ class StrategyRunner:
                     traceback.print_exc()
 
             # Completed
-            self._update_progress(run_id, processed, len(stocks), "completed", json.dumps(results), len(results))
+            self._update_progress(run_id, processed, len(stocks), "completed", json.dumps(json_safe_value(results), ensure_ascii=False, allow_nan=False), len(results))
             
         except Exception as e:
             traceback.print_exc()

@@ -1341,6 +1341,7 @@ def _calc_code_candidates(
     pretrained_model_key: Optional[str] = None,
     rank_transform_enabled: Optional[bool] = True,
     only_features: Optional[Any] = None,
+    feature_preset: Optional[str] = None,
     decision_min: Optional[int] = None,
     stop_loss: float = -0.03,
     enforce_t1: bool = True,
@@ -1480,6 +1481,7 @@ def _calc_code_candidates(
             enforce_t1=bool(enforce_t1),
             fixed_test_start_ts=fixed_ts,
             side_filter=side_filter,
+            feature_preset=feature_preset,
         )
         if isinstance(acc, dict):
             preds = list(acc.get("predictions") or [])
@@ -1625,6 +1627,7 @@ class WolfpackBacktester:
         rank_mode: Optional[str] = None,
         lookback_days: Optional[int] = None,
         only_features: Optional[str] = None,
+        feature_preset: Optional[str] = None,
         side_filter: str = "buy",
     ) -> Dict[str, Any]:
         pool_id = str(pool_id or "").strip() or None
@@ -1920,6 +1923,7 @@ class WolfpackBacktester:
                     str(pretrained_model_key or "").strip() or None,
                     bool(used_rank_transform_enabled),
                     only_features,
+                    feature_preset,
                     decision_min_for_oc,
                     float(stop_loss),
                     bool(enforce_t1),
@@ -2016,6 +2020,7 @@ class WolfpackBacktester:
                 "rank_transform_enabled": bool(used_rank_transform_enabled),
                 "lookback_days": int(used_lookback_days or 0),
                 "only_features": only_features,
+                "feature_preset": feature_preset,
                 "side_filter": side_filter,
             },
             "portfolio": portfolio,

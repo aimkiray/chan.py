@@ -1,6 +1,8 @@
 import os
 import datetime
+import logging
 import threading
+import time
 from bisect import bisect_left, bisect_right
 from typing import Iterable, Optional, List, Dict
 from dotenv import load_dotenv
@@ -35,6 +37,9 @@ class CClickHouseAPI(CCommonStockApi):
     _hfq_factor_cache = {}
     _table_exists_cache = {}
     _min_daily_date_cache = {}
+    _last_init_error = ""
+    _last_init_error_ts = 0.0
+    _last_init_log_ts = 0.0
 
     def __init__(self, code, k_type, begin_date, end_date, autype, asset_type="STOCK"):
         super(CClickHouseAPI, self).__init__(code, k_type, begin_date, end_date, autype, asset_type)
@@ -48,25 +53,94 @@ class CClickHouseAPI(CCommonStockApi):
                 return
             load_dotenv()
             host = os.getenv("DB_HOST", "localhost")
-            port = int(os.getenv("DB_PORT", 9000))
+            try:
+                port = int(os.getenv("DB_PORT", 9000))
+            except Exception:
+                port = 9000
             user = os.getenv("DB_USER", "default")
             password = os.getenv("DB_PASSWORD", "")
             database = os.getenv("DB_NAME", "stock_data")
+            try:
+                retry_sec = float(os.getenv("MLCHAN_CLICKHOUSE_INIT_RETRY_SEC", "15") or 15)
+            except Exception:
+                retry_sec = 15.0
+            now_ts = time.monotonic()
+            if cls._last_init_error_ts > 0 and now_ts - cls._last_init_error_ts < max(0.0, retry_sec):
+                return
 
             raw_client = None
+            probe_client = None
+            driver_loggers = [
+                logging.getLogger("clickhouse_driver"),
+                logging.getLogger("clickhouse_driver.connection"),
+            ]
+            logger_disabled = [lg.disabled for lg in driver_loggers]
             try:
-                raw_client = Client(host=host, port=port, user=user, password=password, database=database)
-                locked_client = _LockedClickHouseClient(raw_client, cls._client_lock)
-                locked_client.execute("SELECT 1")
-                cls._client = locked_client
-            except Exception as e:
-                print(f"ClickHouse init failed: {e}")
                 try:
+                    connect_timeout = float(os.getenv("DB_CONNECT_TIMEOUT", "3") or 3)
+                except Exception:
+                    connect_timeout = 3.0
+                try:
+                    init_timeout = float(os.getenv("MLCHAN_CLICKHOUSE_INIT_TIMEOUT", str(connect_timeout)) or connect_timeout)
+                except Exception:
+                    init_timeout = connect_timeout
+                try:
+                    send_receive_timeout = float(os.getenv("DB_SEND_RECEIVE_TIMEOUT", "300") or 300)
+                except Exception:
+                    send_receive_timeout = 300.0
+                for lg in driver_loggers:
+                    lg.disabled = True
+                probe_client = Client(
+                    host=host,
+                    port=port,
+                    user=user,
+                    password=password,
+                    database=database,
+                    connect_timeout=connect_timeout,
+                    send_receive_timeout=max(1.0, init_timeout),
+                )
+                probe_client.execute("SELECT 1")
+                probe_client.disconnect()
+                probe_client = None
+
+                raw_client = Client(
+                    host=host,
+                    port=port,
+                    user=user,
+                    password=password,
+                    database=database,
+                    connect_timeout=connect_timeout,
+                    send_receive_timeout=send_receive_timeout,
+                )
+                locked_client = _LockedClickHouseClient(raw_client, cls._client_lock)
+                cls._client = locked_client
+                cls._last_init_error = ""
+                cls._last_init_error_ts = 0.0
+            except Exception as e:
+                cls._last_init_error = f"{type(e).__name__}: {e}"
+                cls._last_init_error_ts = time.monotonic()
+                try:
+                    log_interval = float(os.getenv("MLCHAN_CLICKHOUSE_INIT_LOG_INTERVAL_SEC", "60") or 60)
+                except Exception:
+                    log_interval = 60.0
+                if cls._last_init_log_ts <= 0 or cls._last_init_error_ts - cls._last_init_log_ts >= max(0.0, log_interval):
+                    print(
+                        f"ClickHouse unavailable at {host}:{port}/{database}: {cls._last_init_error}. "
+                        "Backend will keep running and retry on later DB requests. "
+                        "clickhouse_driver requires the native TCP port, usually 9000; HTTP port 8123 will not work here."
+                    )
+                    cls._last_init_log_ts = cls._last_init_error_ts
+                try:
+                    if probe_client is not None:
+                        probe_client.disconnect()
                     if raw_client is not None:
                         raw_client.disconnect()
                 except Exception:
                     pass
                 cls._client = None
+            finally:
+                for lg, disabled in zip(driver_loggers, logger_disabled):
+                    lg.disabled = disabled
 
     @classmethod
     def do_close(cls):
@@ -136,6 +210,78 @@ class CClickHouseAPI(CCommonStockApi):
             cls._table_exists_cache.clear()
         cls._table_exists_cache[cache_key] = exists
         return exists
+
+    @classmethod
+    def _infer_asset_type_from_code(cls, normalized_code: str) -> str:
+        code = str(normalized_code or "").strip().lower().replace(".", "")
+        market = code[:2] if len(code) >= 8 and code[:2] in ("sh", "sz", "bj") else ""
+        code6 = code[2:8] if market else code[-6:]
+        if len(code6) != 6 or not code6.isdigit():
+            return "STOCK"
+
+        if market == "sh" and (code6.startswith("000") or code6 == "999999"):
+            return "INDEX"
+        if market == "sz" and code6.startswith("399"):
+            return "INDEX"
+        if market == "bj" and code6.startswith("899"):
+            return "INDEX"
+        if not market and code6.startswith("399"):
+            return "INDEX"
+
+        if market == "sh" and code6.startswith(("51", "52", "56", "58")):
+            return "ETF"
+        if market == "sz" and code6.startswith(("15", "16")):
+            return "ETF"
+        if not market and code6.startswith(("51", "52", "56", "58", "15", "16")):
+            return "ETF"
+
+        return "STOCK"
+
+    @classmethod
+    def _asset_route_from_type(cls, asset_type: str, normalized_code: str = "") -> Dict[str, object]:
+        asset = str(asset_type or "STOCK").strip().upper()
+        if asset in ("AUTO", "DETECT"):
+            asset = cls._infer_asset_type_from_code(normalized_code)
+        elif asset in ("ETF", "FUND", "FUNDS"):
+            asset = "ETF"
+        elif asset in ("INDEX", "IDX", "BENCHMARK"):
+            asset = "INDEX"
+        else:
+            asset = "STOCK"
+
+        if asset == "INDEX":
+            return {
+                "asset": "INDEX",
+                "prefix": "index_",
+                "info_table": "index_info",
+                "daily_table": "index_daily",
+                "code_candidates": ["code", "ts_code", "symbol"],
+                "name_candidates": ["name", "index_name", "fullname", "full_name"],
+                "allow_stock_adjust": False,
+            }
+        if asset == "ETF":
+            return {
+                "asset": "ETF",
+                "prefix": "etf_",
+                "info_table": "etf_info",
+                "daily_table": "etf_daily",
+                "code_candidates": ["code", "ts_code", "symbol", "sec_code", "fund_code"],
+                "name_candidates": ["name", "fund_name", "sec_name", "short_name", "fullname", "full_name"],
+                "allow_stock_adjust": False,
+            }
+        return {
+            "asset": "STOCK",
+            "prefix": "stock_",
+            "info_table": "stock_info",
+            "daily_table": "stock_daily",
+            "code_candidates": ["code", "stock_code", "symbol", "ts_code", "sec_code"],
+            "name_candidates": ["name", "stock_name", "sec_name", "short_name"],
+            "allow_stock_adjust": True,
+        }
+
+    def _resolve_asset_route(self, normalized_code: str = "") -> Dict[str, object]:
+        code = normalized_code or str(self.code or "").lower().replace(".", "")
+        return self._asset_route_from_type(self.asset_type, code)
 
     @classmethod
     def _get_min_daily_date(cls, normalized_code: str) -> datetime.date:
@@ -1133,16 +1279,13 @@ class CClickHouseAPI(CCommonStockApi):
         end_dt = self._parse_ymd(end_date) or datetime.date.today()
         if end_dt < begin_dt:
             begin_dt, end_dt = end_dt, begin_dt
-        asset = str(self.asset_type or "").upper()
-        if asset == "INDEX":
-            table = "etf_daily" if self._table_exists("etf_daily") else "index_daily"
-        else:
-            table = "stock_daily"
+        route = self._resolve_asset_route(normalized_code)
+        table = str(route.get("daily_table") or "stock_daily")
 
         cols = self._get_table_columns(table)
         cols_lower = {c.lower(): c for c in cols}
         date_col = self._pick_column(cols_lower, ["date", "trade_date", "dt"])
-        code_col = self._pick_column(cols_lower, ["code", "ts_code", "symbol", "sec_code", "fund_code"])
+        code_col = self._pick_column(cols_lower, list(route.get("code_candidates") or ["code", "ts_code", "symbol"]))
         if not date_col or not code_col:
             return []
         try:
@@ -1321,13 +1464,15 @@ class CClickHouseAPI(CCommonStockApi):
             return []
 
         normalized_code = self.code.lower().replace(".", "")
+        route = self._resolve_asset_route(normalized_code)
+        allow_stock_adjust = bool(route.get("allow_stock_adjust", False))
         factor_trading_dates = []
         factor_by_date = {}
-        if self.autype == AUTYPE.QFQ:
+        if allow_stock_adjust and self.autype == AUTYPE.QFQ:
             factor_trading_dates, factor_by_date = self._get_qfq_factors_by_date(
                 normalized_code=normalized_code, begin_date=begin_date, end_date=end_date
             )
-        elif self.autype == AUTYPE.HFQ:
+        elif allow_stock_adjust and self.autype == AUTYPE.HFQ:
             factor_trading_dates, factor_by_date = self._get_hfq_factors_by_date(
                 normalized_code=normalized_code, begin_date=begin_date, end_date=end_date
             )
@@ -1456,11 +1601,11 @@ class CClickHouseAPI(CCommonStockApi):
             print("ClickHouse client not initialized")
             return []
 
-        asset = str(self.asset_type or "").upper()
-        if asset == "INDEX":
-            prefix = "etf_" if self._table_exists("etf_daily") else "index_"
-        else:
-            prefix = "stock_"
+        normalized_code = self.code.lower().replace(".", "")
+        route = self._resolve_asset_route(normalized_code)
+        asset = str(route.get("asset") or "STOCK")
+        prefix = str(route.get("prefix") or "stock_")
+        allow_stock_adjust = bool(route.get("allow_stock_adjust", False))
 
         table_map = {
             KL_TYPE.K_1M: f"{prefix}1min",
@@ -1476,11 +1621,11 @@ class CClickHouseAPI(CCommonStockApi):
         need_aggregate = False
         use_precomputed_qfq = False
 
-        if self.autype == AUTYPE.HFQ and self.k_type in (KL_TYPE.K_WEEK, KL_TYPE.K_MON):
+        if allow_stock_adjust and self.autype == AUTYPE.HFQ and self.k_type in (KL_TYPE.K_WEEK, KL_TYPE.K_MON):
             need_aggregate = True
             query_k_type = KL_TYPE.K_DAY
             table = table_map.get(query_k_type)
-        elif self.autype == AUTYPE.QFQ and self.k_type in (KL_TYPE.K_WEEK, KL_TYPE.K_MON):
+        elif allow_stock_adjust and self.autype == AUTYPE.QFQ and self.k_type in (KL_TYPE.K_WEEK, KL_TYPE.K_MON):
             direct_table = table_map.get(self.k_type)
             direct_qfq_table = f"{direct_table}_qfq" if direct_table else None
             if direct_qfq_table and self._table_exists(direct_qfq_table):
@@ -1499,22 +1644,17 @@ class CClickHouseAPI(CCommonStockApi):
         else:
             query_k_type = self.k_type
             table = table_map.get(query_k_type)
-            if self.autype == AUTYPE.QFQ and table:
+            if allow_stock_adjust and self.autype == AUTYPE.QFQ and table:
                 qfq_table = f"{table}_qfq"
                 if self._table_exists(qfq_table):
                     table = qfq_table
                     use_precomputed_qfq = True
 
-        if asset == "INDEX" and query_k_type in (KL_TYPE.K_WEEK, KL_TYPE.K_MON) and table and (not self._table_exists(table)):
+        if asset in ("INDEX", "ETF") and query_k_type in (KL_TYPE.K_WEEK, KL_TYPE.K_MON) and table and (not self._table_exists(table)):
             need_aggregate = True
             query_k_type = KL_TYPE.K_DAY
             table = table_map.get(query_k_type)
             use_precomputed_qfq = False
-            if self.autype == AUTYPE.QFQ and table:
-                qfq_table = f"{table}_qfq"
-                if self._table_exists(qfq_table):
-                    table = qfq_table
-                    use_precomputed_qfq = True
 
         if not table:
             raise Exception(f"Unsupported k_type for ClickHouse: {query_k_type}")
@@ -1522,11 +1662,6 @@ class CClickHouseAPI(CCommonStockApi):
         base_table = table_map.get(query_k_type)
 
         is_intraday = query_k_type in [KL_TYPE.K_1M, KL_TYPE.K_5M, KL_TYPE.K_15M, KL_TYPE.K_30M, KL_TYPE.K_60M]
-        
-        # Normalize code: remove dot for ClickHouse query
-        # For indices, we might need to be careful. 
-        # But previous code used normalized_code for index too (sz.399006 -> sz399006)
-        normalized_code = self.code.lower().replace(".", "")
         
         begin_date = self.begin_date if self.begin_date else "1990-01-01"
         end_date = self.end_date if self.end_date else datetime.date.today().strftime("%Y-%m-%d")
@@ -1677,11 +1812,11 @@ class CClickHouseAPI(CCommonStockApi):
 
         factor_trading_dates = []
         factor_by_date = {}
-        if self.autype == AUTYPE.QFQ and not use_precomputed_qfq:
+        if allow_stock_adjust and self.autype == AUTYPE.QFQ and not use_precomputed_qfq:
             factor_trading_dates, factor_by_date = self._get_qfq_factors_by_date(
                 normalized_code=normalized_code, begin_date=begin_date, end_date=end_date
             )
-        elif self.autype == AUTYPE.HFQ:
+        elif allow_stock_adjust and self.autype == AUTYPE.HFQ:
             factor_trading_dates, factor_by_date = self._get_hfq_factors_by_date(
                 normalized_code=normalized_code, begin_date=begin_date, end_date=end_date
             )
@@ -1810,7 +1945,8 @@ class CClickHouseAPI(CCommonStockApi):
             return
             
         normalized_code = self.code.lower().replace(".", "")
-        asset = str(self.asset_type or "").upper()
+        route = self._resolve_asset_route(normalized_code)
+        asset = str(route.get("asset") or "STOCK")
 
         def try_table(table: str, code_candidates: List[str], name_candidates: List[str]) -> Optional[str]:
             if not self._table_exists(table):
@@ -1835,53 +1971,45 @@ class CClickHouseAPI(CCommonStockApi):
             return None
 
         name = None
-        if asset == "INDEX":
+        info_table = str(route.get("info_table") or "")
+        if info_table:
             name = try_table(
-                "etf_info",
-                ["code", "ts_code", "symbol", "sec_code", "fund_code"],
-                ["name", "fund_name", "sec_name", "short_name", "fullname", "full_name"],
+                info_table,
+                list(route.get("code_candidates") or ["code", "ts_code", "symbol"]),
+                list(route.get("name_candidates") or ["name"]),
             )
-            if name is None:
-                name = try_table("index_info", ["code", "ts_code", "symbol"], ["name", "index_name", "fullname", "full_name"])
-        if name is None:
-            name = try_table("stock_info", ["code", "ts_code", "symbol"], ["name", "stock_name", "sec_name", "short_name"])
 
         self.name = name if name is not None else self.code
+        self.is_stock = asset == "STOCK"
 
     @classmethod
-    def list_indices(cls, limit: int = 2000, keyword: str = None):
+    def _list_assets(cls, asset_type: str, limit: int = 2000, keyword: str = None):
         client = cls.get_client()
         if not client:
             return []
-        
-        daily_table = "etf_daily" if cls._table_exists("etf_daily") else "index_daily"
+
+        route = cls._asset_route_from_type(asset_type)
+        daily_table = str(route.get("daily_table") or "")
         if not cls._table_exists(daily_table):
             return []
 
         cols = cls._get_table_columns(daily_table)
-        col_set = set([c.lower() for c in cols])
-        
-        code_col_name = "code"
-        if "code" in col_set:
-            code_col_name = "code"
-        elif "ts_code" in col_set:
-            code_col_name = "ts_code"
-        elif "symbol" in col_set:
-            code_col_name = "symbol"
-        
-        info_table = None
-        if cls._table_exists("etf_info"):
-            info_table = "etf_info"
-        elif cls._table_exists("index_info"):
-            info_table = "index_info"
+        cols_lower = {c.lower(): c for c in cols}
+        code_col_name = cls._pick_column(cols_lower, list(route.get("code_candidates") or ["code", "ts_code", "symbol"]))
+        if not code_col_name:
+            return []
+
+        info_table = str(route.get("info_table") or "")
+        if not cls._table_exists(info_table):
+            info_table = None
 
         info_code_col = None
         info_name_col = None
         if info_table:
             info_cols = cls._get_table_columns(info_table)
             info_lower = {c.lower(): c for c in info_cols}
-            info_code_col = cls._pick_column(info_lower, ["code", "ts_code", "symbol", "sec_code", "fund_code"])
-            info_name_col = cls._pick_column(info_lower, ["name", "fund_name", "sec_name", "short_name", "fullname", "full_name", "index_name"])
+            info_code_col = cls._pick_column(info_lower, list(route.get("code_candidates") or ["code", "ts_code", "symbol"]))
+            info_name_col = cls._pick_column(info_lower, list(route.get("name_candidates") or ["name"]))
             if not info_code_col or not info_name_col:
                 info_table = None
         
@@ -1921,5 +2049,13 @@ class CClickHouseAPI(CCommonStockApi):
                 rows = client.execute(query, params)
                 return [{"code": str(r[0]), "name": str(r[0])} for r in rows]
         except Exception as e:
-            print(f"List indices failed: {e}")
+            print(f"List {route.get('asset', asset_type)} assets failed: {e}")
             return []
+
+    @classmethod
+    def list_indices(cls, limit: int = 2000, keyword: str = None):
+        return cls._list_assets("INDEX", limit=limit, keyword=keyword)
+
+    @classmethod
+    def list_etfs(cls, limit: int = 2000, keyword: str = None):
+        return cls._list_assets("ETF", limit=limit, keyword=keyword)

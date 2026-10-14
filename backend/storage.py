@@ -9,6 +9,13 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 
 Base = declarative_base()
 
+def _json_safe_value(value):
+    try:
+        from backend.chan_service import json_safe_value
+        return json_safe_value(value)
+    except Exception:
+        return value
+
 def _normalize_sim_id(sim_id):
     sid = str(sim_id or "").strip()
     return sid if sid else "default"
@@ -1676,7 +1683,7 @@ class StorageManager:
             record.sample_count = meta.get("sample_count") if isinstance(meta, dict) else None
             record.trained_at = meta.get("trained_at") if isinstance(meta, dict) else None
             acc = meta.get("accuracy") if isinstance(meta, dict) else None
-            record.accuracy_json = json.dumps(acc, ensure_ascii=False) if acc is not None else None
+            record.accuracy_json = json.dumps(_json_safe_value(acc), ensure_ascii=False, allow_nan=False) if acc is not None else None
 
             record.updated_at = now
             if record.created_at is None:
@@ -1844,8 +1851,8 @@ class StorageManager:
             record.message = job.get("message", None)
             record.detail = job.get("detail", None)
 
-            record.request_json = json.dumps(job.get("request", None), ensure_ascii=False) if job.get("request", None) is not None else None
-            record.result_json = json.dumps(job.get("result", None), ensure_ascii=False) if job.get("result", None) is not None else None
+            record.request_json = json.dumps(_json_safe_value(job.get("request", None)), ensure_ascii=False, allow_nan=False) if job.get("request", None) is not None else None
+            record.result_json = json.dumps(_json_safe_value(job.get("result", None)), ensure_ascii=False, allow_nan=False) if job.get("result", None) is not None else None
 
             record.created_at = str(job.get("created_at") or "").strip() or record.created_at
             record.updated_at = str(job.get("updated_at") or "").strip() or record.updated_at
@@ -2142,7 +2149,7 @@ class StorageManager:
             cache.accuracy = float(accuracy)
             cache.bsp_count = int(bsp_count)
             cache.method = str(method)
-            cache.result_json = json.dumps(result) if result else None
+            cache.result_json = json.dumps(_json_safe_value(result), allow_nan=False) if result else None
             cache.updated_at = _dt_to_utc_iso(datetime.datetime.utcnow())
             cache.start_time = str(start_time)
             cache.end_time = str(end_time)
@@ -2172,7 +2179,7 @@ class StorageManager:
                 params_hash=params_hash,
                 params_json=params_json,
                 data_latest_time=data_latest_time,
-                result_json=json.dumps(result_dict),
+                result_json=json.dumps(_json_safe_value(result_dict), allow_nan=False),
                 model=model,
                 signal_type=signal_info.get('type') if signal_info else None,
                 is_buy=1 if signal_info and signal_info.get('is_buy') else 0,

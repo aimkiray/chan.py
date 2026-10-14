@@ -64,7 +64,7 @@
     
     <div class="lg:overflow-hidden lg:h-[calc(100vh-40px)] flex-1 flex flex-col lg:flex-row">
       <!-- Sidebar (Left) - Hidden on Mobile -->
-      <div v-show="showDesktopSidebar" class="hidden lg:flex w-[260px] bg-gray-50 dark:bg-gray-950 border-r border-gray-200 dark:border-gray-800 flex-col p-4 overflow-y-auto transition-all">
+      <div v-show="showDesktopSidebar && activeTab !== 'matrix'" class="hidden lg:flex w-[260px] bg-gray-50 dark:bg-gray-950 border-r border-gray-200 dark:border-gray-800 flex-col p-4 overflow-y-auto transition-all">
           <SidebarContent 
           v-model:code="code"
           v-model:autype="autype"
@@ -113,7 +113,7 @@
       <div class="p-0 flex flex-col lg:overflow-hidden bg-white dark:bg-gray-900 flex-1 relative">
         <!-- Floating Toggle Button for Desktop -->
         <div 
-           v-if="!showDesktopSidebar"
+           v-if="!showDesktopSidebar && activeTab !== 'matrix'"
            class="hidden lg:flex absolute left-0 top-1/2 -translate-y-1/2 z-50 bg-white dark:bg-gray-800 border border-l-0 border-gray-200 dark:border-gray-700 rounded-r shadow-md cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700 items-center justify-center w-6 h-12 transition-colors"
            @click="handleManualOpen"
            :title="t('sidebar.expandSidebar')"
@@ -153,6 +153,7 @@
 
         <!-- Mobile Sidebar (Top) -->
         <div
+          v-if="activeTab !== 'matrix'"
           class="lg:hidden bg-gray-50 dark:bg-gray-950 border-b border-gray-200 dark:border-gray-800 flex-shrink-0 overflow-hidden"
           :class="mobileSidebarCollapsed ? 'h-12 px-4' : 'p-4'"
         >
@@ -371,6 +372,13 @@
              </div>
           </div>
 
+          <!-- Experiment Matrix Tab -->
+          <div v-show="activeTab === 'matrix'" class="h-full w-full flex flex-col lg:overflow-hidden">
+             <div class="lg:h-full lg:overflow-hidden flex-1 box-border bg-white dark:bg-gray-900">
+               <ExperimentMatrixPanel />
+             </div>
+          </div>
+
           <!-- Paper Trade Tab -->
           <div v-show="activeTab === 'paper'" class="h-full w-full flex flex-col lg:overflow-hidden">
              <div class="lg:h-full lg:overflow-hidden flex-1 box-border bg-white dark:bg-gray-900">
@@ -419,6 +427,7 @@ const tabs = computed(() => [
   { name: 'analysis', label: t('app.stockAnalysis'), icon: MemoryChartBar },
   { name: 'intraday', label: t('app.intradayAnalysis'), icon: MemoryClock },
   { name: 'backtest', label: t('portfolio.backtest'), icon: MemoryBriefcase },
+  { name: 'matrix', label: t('app.experimentMatrix'), icon: MemoryChartBar },
   { name: 'paper', label: t('strategy.paperTrade'), icon: MemoryBriefcase },
   { name: 'portfolios', label: t('portfolio.myPortfolios'), icon: MemoryBriefcase },
   { name: 'pretrain', label: t('app.pretrain'), icon: MemoryChartBar },
@@ -579,9 +588,10 @@ const paperParams = ref({
   point_in_time_pool: true,
   use_latest_available_day: true,
   pretrained_model_key: '',
+  require_pretrained_model: true,
   train_on_fly: false,
   rank_mode: 'cross_section',
-  rolling_sample_mode: 'every_bar',
+  rolling_sample_mode: 'bsp',
   rolling_stride: 1,
   risk_filter_enabled: false,
   risk_mode: 'both',
@@ -610,7 +620,7 @@ const paperParams = ref({
 const paperRunForm = ref({
   name: '',
   offset_seconds: 5,
-  auto_resume: true,
+  auto_resume: false,
   notify_enabled: false,
   notify_mode: 'dingtalk',
   dingtalk_webhook: '',
@@ -619,6 +629,22 @@ const paperRunForm = ref({
   sms_token: '',
   start: true
 })
+
+const normalizePaperLiveDefaults = () => {
+  const prm = paperParams.value || {}
+  if (!String(prm.rolling_sample_mode || '').trim() || String(prm.rolling_sample_mode || '').trim() === 'every_bar') {
+    prm.rolling_sample_mode = 'bsp'
+  }
+  prm.require_pretrained_model = true
+  prm.train_on_fly = false
+  paperParams.value = { ...prm }
+
+  const frm = paperRunForm.value || {}
+  if (frm.auto_resume === undefined || frm.auto_resume === null) {
+    frm.auto_resume = false
+  }
+  paperRunForm.value = { ...frm }
+}
 
 const handleRunBacktest = async ({ collapseMobile } = {}) => {
   if (backtestLoading.value) {
@@ -810,6 +836,7 @@ const loadPaperSimFromStorage = (sid) => {
     if (String(paperConfig.value?.data_src || '').toLowerCase() === 'akshare') {
       paperConfig.value.data_src = 'clickhouse'
     }
+    normalizePaperLiveDefaults()
     ensurePaperConfigDateRange()
   } finally {
     paperSimLoading.value = false
@@ -996,6 +1023,7 @@ onMounted(() => {
       Object.assign(paperParams.value, JSON.parse(savedPaperParams))
     } catch (e) { /* ignore */ }
   }
+  normalizePaperLiveDefaults()
 
   const rawInitial = String(paperConfig.value?.sim_id || '').trim() || 'default'
   let initialSimId = rawInitial
@@ -1018,7 +1046,9 @@ onMounted(() => {
   fetchIntradayPretrainedModels({ quiet: true })
 
   // Apply initial sidebar state
-  if (['history', 'help'].includes(activeTab.value)) {
+  if (activeTab.value === 'matrix') {
+    showDesktopSidebar.value = false
+  } else if (['history', 'help'].includes(activeTab.value)) {
     showDesktopSidebar.value = true
   }
 
@@ -1056,7 +1086,9 @@ watch(activeTab, (newVal) => {
   if (newVal) localStorage.setItem('lastActiveTab', newVal)
 
   // Sidebar Visibility Logic
-  if (['history', 'help'].includes(newVal)) {
+  if (newVal === 'matrix') {
+    showDesktopSidebar.value = false
+  } else if (['history', 'help'].includes(newVal)) {
     showDesktopSidebar.value = true
   } else if (userManuallyHidden.value) {
     showDesktopSidebar.value = false

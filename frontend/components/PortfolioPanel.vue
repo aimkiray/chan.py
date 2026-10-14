@@ -150,6 +150,18 @@
           </div>
         </div>
 
+        <div class="mb-2 flex flex-wrap items-center gap-2 text-xs text-gray-500">
+          <span>ClickHouse</span>
+          <span :class="clickhouseHealth?.ok ? 'text-green-600 dark:text-green-400' : 'text-amber-600 dark:text-amber-400'">
+            {{ clickhouseHealth?.ok ? 'OK' : 'Unavailable' }}
+          </span>
+          <span v-if="clickhouseHealth" class="font-mono">
+            {{ clickhouseHealth.host || '-' }}:{{ clickhouseHealth.port || '-' }}/{{ clickhouseHealth.database || '-' }}
+          </span>
+          <span v-if="clickhouseHealth?.last_error" class="text-gray-400 break-all">{{ clickhouseHealth.last_error }}</span>
+          <UButton size="xs" color="gray" variant="ghost" :loading="clickhouseHealthLoading" @click="loadClickHouseHealth">刷新</UButton>
+        </div>
+
         <div v-if="stepError" class="mb-2 text-xs text-red-500 break-all">{{ stepError }}</div>
         <div v-if="stepResult" class="mb-2 text-xs text-gray-500 break-all">
           {{ t('strategy.stepMeta', { day: stepResult.day, ts: stepResult.ts }) }} · {{ formatTs(stepResult.ts) }} · model={{ stepResult.model_key || '-' }} · rank={{ stepResult.rank_mode || '-' }} · {{ t('strategy.marketStatus') }}={{ stepResult.market_open ? t('strategy.marketOpen') : t('strategy.marketClosed') }}
@@ -275,6 +287,36 @@
             <div class="text-xs text-gray-500 break-all">
               day={{ selectionDebug?.signal_day || '-' }} · mode={{ selectionDebug?.signal_day_mode || '-' }} · minProb={{ selectionDebug?.min_prob ?? '-' }} · topN={{ selectionDebug?.top_n ?? '-' }} · effTopN={{ selectionDebug?.effective_top_n ?? '-' }} · scanned={{ selectionDebug?.counts?.scanned ?? '-' }} · today={{ selectionDebug?.counts?.todays_raw ?? '-' }} · pass={{ selectionDebug?.counts?.todays_pass_min_prob ?? '-' }}
               <span v-if="selectionDebug?.decision_delayed"> · delayed={{ selectionDebug?.decision_time || '-' }}</span>
+            </div>
+
+            <div v-if="selectionDebugCandidateAudit.length" class="mt-3">
+              <div class="text-xs text-gray-500 mb-1">候选审计</div>
+              <div class="overflow-x-auto border border-gray-200 dark:border-gray-800 rounded">
+                <table class="w-full text-xs">
+                  <thead class="bg-gray-50 dark:bg-gray-900 text-gray-500">
+                    <tr>
+                      <th class="px-2 py-1 text-left font-medium">Rank</th>
+                      <th class="px-2 py-1 text-left font-medium">Code</th>
+                      <th class="px-2 py-1 text-right font-medium">Prob</th>
+                      <th class="px-2 py-1 text-left font-medium">Status</th>
+                      <th class="px-2 py-1 text-left font-medium">Reason</th>
+                      <th class="px-2 py-1 text-left font-medium">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="c in selectionDebugCandidateAudit" :key="`${c.rank}-${c.code}`" class="border-t border-gray-100 dark:border-gray-800">
+                      <td class="px-2 py-1 font-mono">{{ c.rank ?? '-' }}</td>
+                      <td class="px-2 py-1 font-mono">{{ c.code || '-' }}</td>
+                      <td class="px-2 py-1 text-right font-mono">{{ formatNumber(c.prob, 4) }}</td>
+                      <td class="px-2 py-1">
+                        <span :class="candidateStatusClass(c.status)">{{ c.status || '-' }}</span>
+                      </td>
+                      <td class="px-2 py-1 font-mono text-gray-500">{{ c.filter_reason || '-' }}</td>
+                      <td class="px-2 py-1 font-mono">{{ c.action || '-' }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
 
             <div class="mt-3 grid grid-cols-2 gap-4">
@@ -685,7 +727,7 @@ const wolfpackConfig = ref({
   min_prob: 0.25,
   trade_cost: 0.0002,
   walk_forward_max_folds: 25,
-  rolling_sample_mode: 'every_bar',
+  rolling_sample_mode: 'bsp',
   rolling_stride: 1,
   portfolio_top_n: 2,
   index_filter_enabled: true,
@@ -907,6 +949,8 @@ const stepLoading = ref(false)
 const stepError = ref('')
 const stepResult = ref(null)
 const showSelectionDebug = ref(false)
+const clickhouseHealth = ref(null)
+const clickhouseHealthLoading = ref(false)
 
 watch(stepResult, () => {
   const sr = stepResult.value
@@ -931,6 +975,26 @@ const selectionDebugCandidatesBelow = computed(() => {
   const arr = selectionDebug.value?.candidates_below_min_prob
   return Array.isArray(arr) ? arr : []
 })
+
+const selectionDebugCandidateAudit = computed(() => {
+  const arr = selectionDebug.value?.candidate_audit
+  return Array.isArray(arr) ? arr : []
+})
+
+const loadClickHouseHealth = async () => {
+  clickhouseHealthLoading.value = true
+  try {
+    const res = await axios.get('/api/health/clickhouse')
+    clickhouseHealth.value = res.data || null
+  } catch (e) {
+    clickhouseHealth.value = {
+      ok: false,
+      last_error: String(e?.response?.data?.detail || e?.message || e)
+    }
+  } finally {
+    clickhouseHealthLoading.value = false
+  }
+}
 
 const selectionDebugSellReasonItems = computed(() => {
   const obj = selectionDebug.value?.sell_reason_by_code
@@ -1394,10 +1458,18 @@ const formatPct = (v) => {
   return `${(n * 100).toFixed(2)}%`
 }
 
-const formatNumber = (v) => {
+const formatNumber = (v, digits = 4) => {
   const n = Number(v || 0)
   if (!Number.isFinite(n)) return '-'
-  return n.toFixed(4)
+  return n.toFixed(digits)
+}
+
+const candidateStatusClass = (status) => {
+  const raw = String(status || '').toLowerCase()
+  if (raw === 'accepted') return 'text-green-600 dark:text-green-400 font-mono'
+  if (raw.includes('market') || raw.includes('risk')) return 'text-amber-600 dark:text-amber-400 font-mono'
+  if (raw.includes('low') || raw.includes('not_topn') || raw.includes('missing')) return 'text-gray-500 font-mono'
+  return 'font-mono'
 }
 
 const formatSide = (s) => {
@@ -1668,7 +1740,10 @@ const buildLiveParams = (paperCfg, paperPrm, sid) => {
     ...stripParallelParams(nextPrm),
     sim_id: sid,
     portfolio_id: activePortfolioId.value,
-    enable_rolling_lookback: true
+    enable_rolling_lookback: true,
+    require_pretrained_model: true,
+    train_on_fly: false,
+    rolling_sample_mode: String(nextPrm.rolling_sample_mode || 'bsp') || 'bsp'
   })
 }
 
@@ -1833,7 +1908,10 @@ const runPaperStep = async () => {
       ...stripParallelParams(paperParams),
       sim_id: activeSimId.value,
       portfolio_id: activePortfolioId.value,
-      enable_rolling_lookback: true
+      enable_rolling_lookback: true,
+      require_pretrained_model: true,
+      train_on_fly: false,
+      rolling_sample_mode: String(paperParams.rolling_sample_mode || 'bsp') || 'bsp'
     })
     const res = await axios.post('/api/live/paper_trade_step', payload)
     stepResult.value = res.data || null
@@ -1927,7 +2005,10 @@ const createRun = async () => {
       ...stripParallelParams(paperParams),
       sim_id: sid,
       portfolio_id: activePortfolioId.value,
-      enable_rolling_lookback: true
+      enable_rolling_lookback: true,
+      require_pretrained_model: true,
+      train_on_fly: false,
+      rolling_sample_mode: String(paperParams.rolling_sample_mode || 'bsp') || 'bsp'
     })
     const notifyEnabled = !!props.paperRunForm?.notify_enabled
     const notifyMode = String(props.paperRunForm?.notify_mode || 'dingtalk')
@@ -2364,6 +2445,7 @@ onMounted(() => {
     (m) => {
       if (m === 'paper') {
         initPaper()
+        loadClickHouseHealth()
         loadRuns()
         loadStepLogs()
         loadEquity()
@@ -2374,6 +2456,7 @@ onMounted(() => {
           loadPositions()
           loadStepLogs()
           loadEquity()
+          loadClickHouseHealth()
         }, 15000)
       } else {
         if (liveRefreshTimer) clearInterval(liveRefreshTimer)

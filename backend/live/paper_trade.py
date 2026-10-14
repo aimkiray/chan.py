@@ -9,7 +9,7 @@ from backend.live.common import day_key_from_ts, parse_autype, parse_data_src, p
 from backend.storage import StorageManager
 
 
-def _score_one(code, level, begin, end, data_src, autype, enable_rolling_lookback: bool, profit_lookahead: int, trade_cost: float, min_prob: float, walk_forward_max_folds: int):
+def _score_one(code, level, begin, end, data_src, autype, enable_rolling_lookback: bool, profit_lookahead: int, trade_cost: float, min_prob: float, walk_forward_max_folds: int, only_features=None, feature_preset: str = "lr_default"):
     kl_list = fetch_stock_data(code, level, begin, end, data_src, autype=autype, use_online_latest=bool(data_src.name.lower() == "click_house"))
     if not kl_list or len(kl_list) < 600:
         return code, None
@@ -25,6 +25,7 @@ def _score_one(code, level, begin, end, data_src, autype, enable_rolling_lookbac
         end_time=end,
         enable_rolling_lookback=enable_rolling_lookback,
         autype=autype,
+        side_filter="buy",
     )
     if not bsp_dict:
         return code, None
@@ -32,12 +33,14 @@ def _score_one(code, level, begin, end, data_src, autype, enable_rolling_lookbac
         bsp_dict,
         model_type="lr",
         backtest_mode="walk_forward",
-        only_features=["volatility_250", "bsp3_zs_height"],
+        only_features=only_features,
+        feature_preset=feature_preset,
         rank_transform_enabled=True,
         walk_forward_max_folds=int(walk_forward_max_folds),
         profit_threshold=0.01,
         profit_lookahead=int(profit_lookahead),
         trade_cost=float(trade_cost or 0.0),
+        side_filter="buy",
     )
     preds = []
     if isinstance(acc, dict):
@@ -99,6 +102,10 @@ def run_once(args, storage: StorageManager):
     min_prob = float(args.min_prob)
     trade_cost = float(args.trade_cost)
     wf_folds = int(args.walk_forward_max_folds)
+    only_features = None
+    if str(getattr(args, "only_features", "") or "").strip():
+        only_features = str(args.only_features).strip()
+    feature_preset = str(getattr(args, "feature_preset", "") or "").strip() or "lr_default"
 
     storage.increment_bars_held(1)
     positions = storage.list_positions()
@@ -126,6 +133,8 @@ def run_once(args, storage: StorageManager):
                 trade_cost,
                 min_prob,
                 wf_folds,
+                only_features,
+                feature_preset,
             ): code
             for code in codes
         }
@@ -187,6 +196,8 @@ def main():
     ap.add_argument("--holding_period", type=int, default=3)
     ap.add_argument("--trade_cost", type=float, default=0.0002)
     ap.add_argument("--walk_forward_max_folds", type=int, default=25)
+    ap.add_argument("--only_features", type=str, default="")
+    ap.add_argument("--feature_preset", type=str, default="lr_default")
     ap.add_argument("--max_workers", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--loop", type=int, default=0)
