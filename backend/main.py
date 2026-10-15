@@ -6044,35 +6044,64 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                         px_asof = 0
                     if px_asof <= 0:
                         px_asof = int(now_ts)
+                    oid = int(o.get("id") or 0)
                     if side == "sell":
-                        sell_codes.append((code, px_session, int(px_asof)))
+                        sell_codes.append((code, px_session, int(px_asof), oid))
                     else:
-                        buy_items.append({"code": code, "px_session": px_session, "px_asof": int(px_asof)})
+                        buy_items.append({"code": code, "px_session": px_session, "px_asof": int(px_asof), "order_id": oid})
 
                 if market_open:
                     storage.increment_bars_held(1, sim_id=sim_id, portfolio_id=pid)
                 sell_px = {}
                 sell_only = []
-                for c, sess_name, px_asof in sell_codes:
+                skipped_ids = set()  # orders with no usable price stay pending for a later step
+                for c, sess_name, px_asof, oid in sell_codes:
+                    px = float(_pick_px(c, sess_name, asof_ts=int(px_asof)))
+                    if px <= 0.01:
+                        # Same guard as the main sell path below: pick_kl_bar_asof
+                        # found no bar at/before asof (e.g. asof earlier than every
+                        # fetched bar) or the fetch failed. Keep the order pending —
+                        # never delete the position or book a price-0 executed trade.
+                        if oid:
+                            skipped_ids.add(int(oid))
+                        print(f"[live_step] WARN pending sell {c}: no usable px asof={px_asof} session={sess_name}; order kept pending")
+                        continue
                     sell_only.append(c)
-                    sell_px[c] = float(_pick_px(c, sess_name, asof_ts=int(px_asof)))
+                    sell_px[c] = px
                 if sell_only:
                     storage.delete_positions(sell_only, sim_id=sim_id, portfolio_id=pid)
+                buy_px = {}
                 for bi in buy_items:
-                    if bi.get("code"):
-                        buy_px = float(_pick_px(str(bi["code"]), str(bi.get("px_session") or market_session), asof_ts=int(bi.get("px_asof") or now_ts)))
-                        storage.upsert_position(str(bi["code"]), int(now_ts), float(buy_px), 0, sim_id=sim_id, portfolio_id=pid)
+                    code = str(bi.get("code") or "")
+                    if not code:
+                        continue
+                    px = float(_pick_px(code, str(bi.get("px_session") or market_session), asof_ts=int(bi.get("px_asof") or now_ts)))
+                    if px <= 0.01:
+                        oid = int(bi.get("order_id") or 0)
+                        if oid:
+                            skipped_ids.add(oid)
+                        print(f"[live_step] WARN pending buy {code}: no usable px asof={bi.get('px_asof')} session={bi.get('px_session')}; order kept pending")
+                        continue
+                    buy_px[code] = px
+                    storage.upsert_position(code, int(now_ts), float(px), 0, sim_id=sim_id, portfolio_id=pid)
 
                 trades = []
-                for c, sess_name, _px_asof in sell_codes:
+                for c, sess_name, _px_asof, _oid in sell_codes:
+                    if c not in sell_px:
+                        continue
                     trades.append({"stock_code": c, "side": "sell", "status": "executed", "trade_ts": int(now_ts), "price": float(sell_px.get(c) or 0.0), "meta": {"source": "order", "session": sess_name or market_session}})
                 for bi in buy_items:
                     code = str(bi.get("code") or "")
+                    if not code or code not in buy_px:
+                        continue
                     sess_name = str(bi.get("px_session") or "").strip() or market_session
-                    trades.append({"stock_code": code, "side": "buy", "status": "executed", "trade_ts": int(now_ts), "price": float(_pick_px(code, sess_name, asof_ts=int(bi.get("px_asof") or now_ts))), "meta": {"source": "order", "session": sess_name}})
-                storage.add_live_trades(trades, sim_id=sim_id, portfolio_id=pid)
-                storage.mark_orders_executed([x for x in executed_ids if x], executed_ts=int(now_ts), sim_id=sim_id, portfolio_id=pid)
-                executed_pending = True
+                    trades.append({"stock_code": code, "side": "buy", "status": "executed", "trade_ts": int(now_ts), "price": float(buy_px[code]), "meta": {"source": "order", "session": sess_name}})
+                if trades:
+                    storage.add_live_trades(trades, sim_id=sim_id, portfolio_id=pid)
+                done_ids = [x for x in executed_ids if x and x not in skipped_ids]
+                if done_ids:
+                    storage.mark_orders_executed(done_ids, executed_ts=int(now_ts), sim_id=sim_id, portfolio_id=pid)
+                executed_pending = bool(trades) or bool(done_ids)
 
         positions = storage.list_positions(sim_id=sim_id, portfolio_id=pid)
         pos_map = {p.get("stock_code"): p for p in (positions or []) if p.get("stock_code")}

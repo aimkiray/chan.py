@@ -1,8 +1,16 @@
 import datetime
 import math
+import sys
+from collections import OrderedDict
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from Common.CEnum import AUTYPE, DATA_SRC, KL_TYPE
+
+
+def _warn_fallback(kind: str, raw: str, fallback: str) -> None:
+    # Silent fallback used to swallow parameter typos (e.g. --data_src clikhouse
+    # ran against ClickHouse anyway); warn so the wrong value stays observable.
+    print(f"[live.common] unknown {kind} {raw!r}; falling back to {fallback!r}", file=sys.stderr)
 
 
 def parse_autype(s: str) -> AUTYPE:
@@ -13,6 +21,8 @@ def parse_autype(s: str) -> AUTYPE:
         return AUTYPE.HFQ
     if raw in ["none", "no", "off"]:
         return AUTYPE.NONE
+    if raw:
+        _warn_fallback("autype", raw, "qfq")
     return AUTYPE.QFQ
 
 
@@ -30,6 +40,8 @@ def parse_data_src(s: str) -> DATA_SRC:
         return DATA_SRC.CSV
     if raw == "ccxt":
         return DATA_SRC.CCXT
+    if raw:
+        _warn_fallback("data_src", raw, "clickhouse")
     return DATA_SRC.CLICK_HOUSE
 
 
@@ -45,27 +57,41 @@ def parse_frequency(s: str) -> Tuple[str, KL_TYPE]:
         "1w": KL_TYPE.K_WEEK,
         "1mo": KL_TYPE.K_MON,
     }
+    if raw and raw not in mp:
+        _warn_fallback("frequency", raw, "30m")
     return raw, mp.get(raw, KL_TYPE.K_30M)
 
 
-def day_key_from_ts(ts: int) -> Optional[int]:
+def cn_dt_from_ts(ts: int) -> Optional[datetime.datetime]:
+    """CN civil (UTC+8) datetime for a unix ts; None when ts is invalid.
+
+    Never fabricates "now": an unreadable timestamp must stay visibly absent
+    rather than silently re-anchor downstream day aggregation to today.
+    """
     try:
-        dt = datetime.datetime.fromtimestamp(int(ts))
+        return datetime.datetime.fromtimestamp(int(ts), tz=datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=8)
     except Exception:
+        return None
+
+
+def cn_day_key_from_ts(ts: int) -> Optional[int]:
+    # int() coercion lives inside cn_dt_from_ts's try — don't pre-convert here
+    # or a non-numeric ts escapes before the guard.
+    dt = cn_dt_from_ts(ts)
+    if dt is None:
         return None
     return int(dt.year) * 10000 + int(dt.month) * 100 + int(dt.day)
 
 
-def cn_dt_from_ts(ts: int) -> datetime.datetime:
-    try:
-        return datetime.datetime.fromtimestamp(int(ts), tz=datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=8)
-    except Exception:
-        return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=8)
+def day_key_from_ts(ts: int) -> Optional[int]:
+    """Trading-day key on the CN (UTC+8) calendar.
 
-
-def cn_day_key_from_ts(ts: int) -> Optional[int]:
-    dt = cn_dt_from_ts(int(ts))
-    return int(dt.year) * 10000 + int(dt.month) * 100 + int(dt.day)
+    Same convention as cn_day_key_from_ts — kept under this shorter name for
+    existing callers (paper_trade.py, backend.main) so cur_day and the index
+    risk aggregation share one timezone convention instead of splitting
+    local-tz vs UTC+8 on non-CST hosts.
+    """
+    return cn_day_key_from_ts(ts)
 
 
 def parse_hhmm_to_minutes(v: Optional[str], default_min: int = 10 * 60) -> int:
@@ -111,6 +137,10 @@ def cn_ts_from_day_key_minutes(day_key: int, minute_of_day: int) -> Optional[int
 
 
 def pick_kl_bar_asof(kl_list, asof_ts: int):
+    """Latest bar whose start ts <= asof_ts; None when asof_ts is earlier than
+    every bar. Falling back to the last bar would inject future data into the
+    decision (all callers degrade via getattr defaults / falsy checks).
+    asof_ts=0 keeps the historical "latest bar" behaviour."""
     if not kl_list:
         return None
     try:
@@ -128,12 +158,12 @@ def pick_kl_bar_asof(kl_list, asof_ts: int):
         if t and int(ts) > int(t):
             continue
         picked = k
-    if picked is None:
-        picked = kl_list[-1]
     return picked
 
 
 def pick_kl_bar_asof_with_prev(kl_list, asof_ts: int):
+    """(bar, prev_bar) variant of pick_kl_bar_asof — (None, None) when asof_ts
+    predates every bar instead of returning a future bar."""
     if not kl_list:
         return None, None
     try:
@@ -154,8 +184,7 @@ def pick_kl_bar_asof_with_prev(kl_list, asof_ts: int):
         picked = k
         picked_i = i
     if picked is None:
-        picked = kl_list[-1]
-        picked_i = len(kl_list) - 1
+        return None, None
     prev = kl_list[picked_i - 1] if picked_i > 0 else None
     return picked, prev
 
@@ -191,6 +220,11 @@ def daily_oc_from_kl_list(kl_list, decision_min: Optional[int] = None) -> Dict[i
             continue
         if o <= 0.0:
             o = c
+        # Bar ts is the bar START (ClickHouseAPI._bucket_start): a 30m bar
+        # stamped 10:00 closes ~10:29. "bar_min < decision_min" keeps only bars
+        # fully completed before the decision minute — "<=" would pick the bar
+        # starting AT decision time and leak ~one bar of future close into
+        # decision_px (e.g. 10:00 decision priced with ~10:30 close).
         dd = by_day.get(int(dk))
         if dd is None:
             by_day[int(dk)] = {
@@ -198,8 +232,8 @@ def daily_oc_from_kl_list(kl_list, decision_min: Optional[int] = None) -> Dict[i
                 "close": float(c),
                 "ts_first": int(ts),
                 "ts_last": int(ts),
-                "decision_ts": int(ts) if (decision_min is not None and bar_min is not None and int(bar_min) <= int(decision_min)) else 0,
-                "decision_px": float(c) if (decision_min is not None and bar_min is not None and int(bar_min) <= int(decision_min)) else None,
+                "decision_ts": int(ts) if (decision_min is not None and bar_min is not None and int(bar_min) < int(decision_min)) else 0,
+                "decision_px": float(c) if (decision_min is not None and bar_min is not None and int(bar_min) < int(decision_min)) else None,
             }
             continue
         if int(ts) <= int(dd.get("ts_first") or 0):
@@ -208,7 +242,7 @@ def daily_oc_from_kl_list(kl_list, decision_min: Optional[int] = None) -> Dict[i
         if int(ts) >= int(dd.get("ts_last") or 0):
             dd["ts_last"] = int(ts)
             dd["close"] = float(c)
-        if decision_min is not None and bar_min is not None and int(bar_min) <= int(decision_min):
+        if decision_min is not None and bar_min is not None and int(bar_min) < int(decision_min):
             if int(ts) >= int(dd.get("decision_ts") or 0):
                 dd["decision_ts"] = int(ts)
                 dd["decision_px"] = float(c)
@@ -231,7 +265,12 @@ def daily_oc_from_kl_list(kl_list, decision_min: Optional[int] = None) -> Dict[i
     return out
 
 
-def compute_volatility_250(kl_list) -> float:
+def range_ratio_250(kl_list) -> float:
+    """(max(high) - min(low)) / min(low) over the last <=250 bars.
+
+    A range ratio, not a statistical volatility — on 30m bars 250 bars cover
+    ~31 trading days. Renamed from compute_volatility_250 (which misdescribed
+    the metric); the alias below keeps existing callers working."""
     if not kl_list:
         return 0.0
     last = list(kl_list)[-250:]
@@ -255,19 +294,32 @@ def compute_volatility_250(kl_list) -> float:
     return float((high_250 - low_250) / low_250)
 
 
-_INDEX_RISK_CACHE: Dict[tuple, dict] = {}
+def compute_volatility_250(kl_list) -> float:
+    """Deprecated alias of range_ratio_250 (backend.main still imports this
+    name); the metric is a range ratio, not a volatility."""
+    return range_ratio_250(kl_list)
+
+
+# Bounded LRU: insertion-ordered, hits refresh position, evictions drop the
+# oldest single key instead of clearing the whole cache (which caused a
+# thundering-herd reload every 65th distinct key).
+_INDEX_RISK_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+_INDEX_RISK_CACHE_MAX = 64
 
 
 def _tr(high: float, low: float, prev_close: float) -> float:
     return float(max(high - low, abs(high - prev_close), abs(low - prev_close)))
 
 
-def _cn_day_key_from_ts(ts: int) -> Optional[int]:
-    try:
-        dt = datetime.datetime.fromtimestamp(int(ts))
-    except Exception:
-        return None
-    return int(dt.year) * 10000 + int(dt.month) * 100 + int(dt.day)
+def _cn_expect_today_bar(now_ts: int) -> bool:
+    """True when the CN calendar at now_ts is inside/after a regular weekday
+    session (>= 09:30 CN) — i.e. today's daily bar ought to exist already, so a
+    cached index-risk row lacking today_open is stale rather than legitimately
+    empty."""
+    dt = cn_dt_from_ts(now_ts or 0)
+    if dt is None or dt.weekday() >= 5:
+        return False
+    return int(dt.hour) * 60 + int(dt.minute) >= 9 * 60 + 30
 
 
 def intraday_plunge_risk(
@@ -352,7 +404,7 @@ def index_risk_from_daily_kl(
             ts = 0
         if ts <= 0:
             continue
-        dk = _cn_day_key_from_ts(ts)
+        dk = cn_day_key_from_ts(ts)
         if dk is None:
             continue
         try:
@@ -406,7 +458,7 @@ def index_risk_from_daily_kl(
             "mode": str(mode or ""),
         }
 
-    now_dk = _cn_day_key_from_ts(int(now_ts or 0)) or 0
+    now_dk = cn_day_key_from_ts(now_ts or 0) or 0
     today_rec = None
     if now_dk:
         for it in reversed(items):
@@ -571,8 +623,29 @@ def get_cached_index_risk(
     ck = tuple(cache_key or ())
     cached = _INDEX_RISK_CACHE.get(ck)
     if isinstance(cached, dict):
-        return cached
-    kl_list = loader() if loader is not None else None
+        # Staleness guard: an entry computed before today's first bar exists has
+        # today_open=None, which disables gap_open_pct protection for the rest
+        # of the day if served blindly (the caller's cache key is day-grained).
+        # Once the CN session is actually underway, drop through and reload.
+        stale = (
+            gap_down_threshold is not None
+            and cached.get("today_open") is None
+            and _cn_expect_today_bar(now_ts or 0)
+        )
+        if not stale:
+            _INDEX_RISK_CACHE.move_to_end(ck)
+            # Return a copy so callers mutating the dict don't poison the cache.
+            return dict(cached)
+    kl_list = None
+    load_error = None
+    if loader is not None:
+        try:
+            kl_list = loader()
+        except Exception as exc:
+            # Explicit failure path: without this the exception propagated as a
+            # 500 for the whole step, bypassing risk_data_fail_mode entirely.
+            load_error = exc
+            print(f"[live.common] index risk loader failed: {exc}", file=sys.stderr)
     out = index_risk_from_daily_kl(
         kl_list,
         now_ts=now_ts,
@@ -585,7 +658,15 @@ def get_cached_index_risk(
         ma_window=int(ma_window or 20),
         mode=mode,
     )
-    if len(_INDEX_RISK_CACHE) > 64:
-        _INDEX_RISK_CACHE.clear()
+    if load_error is not None:
+        # Surface the failure in the risk payload (data_missing still fires via
+        # the caller's prev_close/ma20 check) and don't cache it, so a transient
+        # loader error recovers on the next call instead of poisoning the day.
+        out = dict(out or {})
+        out["load_error"] = str(load_error)
+        out.setdefault("reason", "data_load_error")
+        return out
+    while len(_INDEX_RISK_CACHE) >= _INDEX_RISK_CACHE_MAX:
+        _INDEX_RISK_CACHE.popitem(last=False)
     _INDEX_RISK_CACHE[ck] = dict(out or {})
     return out

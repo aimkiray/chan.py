@@ -3,10 +3,17 @@ import asyncio
 import datetime
 import os
 import sys
+import tempfile
 
 # This smoke test exercises the train_on_fly path with stubbed model loading;
 # allow it without requiring a real pre-trained bundle in the default env.
 os.environ.setdefault("MLCHAN_LIVE_REQUIRE_PRETRAINED_MODEL", "0")
+
+# Redirect backend.main's module-level StorageManager() to a throwaway sqlite
+# file BEFORE importing it — otherwise the import itself opens and
+# WAL/schema-ensures the repo's real analysis.db.
+_SMOKE_TMP = tempfile.mkdtemp(prefix="mlchan_smoke_live_step_")
+os.environ.setdefault("MLCHAN_ANALYSIS_DB", os.path.join(_SMOKE_TMP, "analysis.db"))
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
@@ -162,6 +169,22 @@ class K:
 
 
 def main():
+    import atexit
+    import shutil
+
+    # Dispose the import-time storage engine (holds the throwaway db handle —
+    # open sqlite files block rmtree on Windows) and remove _SMOKE_TMP.
+    _orig_module_storage = m.storage
+
+    def _cleanup_tmp_storage():
+        try:
+            _orig_module_storage.engine.dispose()
+        except Exception:
+            pass
+        shutil.rmtree(_SMOKE_TMP, ignore_errors=True)
+
+    atexit.register(_cleanup_tmp_storage)
+
     st = DummyStorage()
     m.storage = st
 

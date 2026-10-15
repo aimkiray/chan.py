@@ -2,11 +2,19 @@ import os
 import sys
 import types
 import asyncio
+import tempfile
 
 # Enable live-run autostart for _on_startup_live_runs and allow the
 # stubbed-bundle / on-the-fly paths without a real pre-trained bundle.
 os.environ.setdefault("MLCHAN_LIVE_AUTOSTART", "1")
 os.environ.setdefault("MLCHAN_LIVE_REQUIRE_PRETRAINED_MODEL", "0")
+
+# Redirect backend.main's module-level StorageManager() to a throwaway sqlite
+# file BEFORE importing it — the import itself opens and WAL/schema-ensures the
+# configured analysis.db, which would otherwise rewrite the repo's real DB even
+# though every test write below goes through the substituted DummyStorage.
+_SMOKE_TMP = tempfile.mkdtemp(prefix="mlchan_smoke_autorun_")
+os.environ.setdefault("MLCHAN_ANALYSIS_DB", os.path.join(_SMOKE_TMP, "analysis.db"))
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
@@ -35,20 +43,24 @@ def main():
     import atexit
     import datetime
     import shutil
-    import tempfile
     import DataAPI.ClickHouseAPI as ch
 
     # Isolate live-run/step/order writes from the real analysis.db: point the
     # module-level storage at a DummyStorage backed by a throwaway sqlite file.
-    _tmp_dir = tempfile.mkdtemp(prefix="mlchan_smoke_autorun_")
+    # _SMOKE_TMP already holds the import-time MLCHAN_ANALYSIS_DB redirect, so
+    # one cleanup removes both throwaway DBs (dispose engines first — open
+    # sqlite handles block rmtree on Windows).
+    _tmp_dir = _SMOKE_TMP
     _tmp_storage = DummyStorage(db_path=os.path.join(_tmp_dir, "smoke_test_autorun.db"))
+    _orig_module_storage = m.storage
     m.storage = _tmp_storage
 
     def _cleanup_tmp_storage():
-        try:
-            _tmp_storage.engine.dispose()
-        except Exception:
-            pass
+        for st in (_tmp_storage, _orig_module_storage):
+            try:
+                st.engine.dispose()
+            except Exception:
+                pass
         shutil.rmtree(_tmp_dir, ignore_errors=True)
 
     atexit.register(_cleanup_tmp_storage)
