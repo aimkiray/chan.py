@@ -24,7 +24,7 @@
     <div v-if="signal">
       <div class="mb-4">
         <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ t('analysis.latestSignal') }}</div>
-        <UBadge :color="signal.is_buy ? 'green' : 'red'" variant="solid" size="lg" class="text-base">
+        <UBadge :color="signal.is_buy ? 'red' : 'green'" variant="solid" size="lg" class="text-base">
           {{ signal.is_buy ? `[${t('analysis.buy')} (BUY)]` : `[${t('analysis.sell')} (SELL)]` }}
         </UBadge>
       </div>
@@ -55,11 +55,11 @@
             </div>
             <div class="grid grid-cols-2 gap-2">
                <div class="flex flex-col">
-                  <span class="text-[10px] text-gray-400">Pretrained ({{ ((accuracy.ensemble_weight_pretrained || 0) * 100).toFixed(0) }}%)</span>
+                  <span class="text-[10px] text-gray-400">{{ t('analysis.pretrained') }} ({{ ((accuracy.ensemble_weight_pretrained || 0) * 100).toFixed(0) }}%)</span>
                   <span class="font-medium" :class="getScoreColor(accuracy.pretrained_score)">{{ ((accuracy.pretrained_score || 0) * 100).toFixed(1) }}%</span>
                </div>
                <div class="flex flex-col text-right">
-                  <span class="text-[10px] text-gray-400">Online ({{ ((accuracy.ensemble_weight_online || 0) * 100).toFixed(0) }}%)</span>
+                  <span class="text-[10px] text-gray-400">{{ t('analysis.online') }} ({{ ((accuracy.ensemble_weight_online || 0) * 100).toFixed(0) }}%)</span>
                   <span class="font-medium" :class="getScoreColor(accuracy.online_score)">{{ ((accuracy.online_score || 0) * 100).toFixed(1) }}%</span>
                </div>
             </div>
@@ -82,7 +82,7 @@
       </div>
       
       <div v-if="signalDesc" class="mt-4 bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 p-3 rounded text-sm leading-relaxed border border-blue-100 dark:border-blue-800">
-        <i class="mr-1 font-bold">P.S.</i> {{ signalDesc }}
+        <i class="mr-1 font-bold">{{ t('analysis.ps') }}</i> {{ signalDesc }}
       </div>
       
       <div class="mt-6">
@@ -175,9 +175,9 @@
 
       <div v-if="accuracy.method || accuracy.train_count || accuracy.val_count || accuracy.test_count" class="mt-2 text-center">
         <span v-if="accuracy.method" class="mr-2">{{ accuracy.method }}</span>
-        <span v-if="accuracy.train_count !== undefined" class="mr-2">train={{ accuracy.train_count }}</span>
-        <span v-if="accuracy.val_count !== undefined" class="mr-2">val={{ accuracy.val_count }}</span>
-        <span v-if="accuracy.test_count !== undefined">test={{ accuracy.test_count }}</span>
+        <span v-if="accuracy.train_count !== undefined" class="mr-2">{{ t('analysis.splitTrain') }}={{ accuracy.train_count }}</span>
+        <span v-if="accuracy.val_count !== undefined" class="mr-2">{{ t('analysis.splitVal') }}={{ accuracy.val_count }}</span>
+        <span v-if="accuracy.test_count !== undefined">{{ t('analysis.splitTest') }}={{ accuracy.test_count }}</span>
       </div>
 
       <div v-if="rankDebugEnabled" class="mt-2 text-center">
@@ -235,10 +235,10 @@
           <table class="w-full text-[11px] border border-gray-100 dark:border-gray-800">
             <thead class="bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-300">
               <tr>
-                <th class="p-1 text-left">bin</th>
-                <th class="p-1 text-left">n</th>
-                <th class="p-1 text-left">avg</th>
-                <th class="p-1 text-left">win</th>
+                <th class="p-1 text-left">{{ t('analysis.colBin') }}</th>
+                <th class="p-1 text-left">{{ t('analysis.colCount') }}</th>
+                <th class="p-1 text-left">{{ t('analysis.colAvg') }}</th>
+                <th class="p-1 text-left">{{ t('analysis.colWin') }}</th>
               </tr>
             </thead>
             <tbody>
@@ -320,6 +320,7 @@
 
 <script setup>
 import { computed, ref } from 'vue'
+import { useI18n } from '../composables/useI18n'
 
 const { t, formatTime: formatTimeI18n } = useI18n()
 
@@ -584,7 +585,7 @@ const signalDesc = computed(() => {
   if (!props.signal) return ''
   const type = props.signal.type
   const isBuy = props.signal.is_buy
-  const lowerType = type.toLowerCase()
+  const lowerType = String(type || '').toLowerCase()
   
   // Try to match specific types to translation keys
   // Keys in translation: 1, 2, 3, 2s, 2p, 1p, 3a, 3b
@@ -620,8 +621,8 @@ const signalDesc = computed(() => {
 
 const formatSignalType = (type, isBuy) => {
   if (!type) return '--'
-  
-  const lowerType = type.toLowerCase()
+
+  const lowerType = String(type || '').toLowerCase()
   if (lowerType.includes('1buy')) return isBuy ? t('analysis.signalType.buy1') : t('analysis.signalType.sell1')
   if (lowerType.includes('2buy')) return isBuy ? t('analysis.signalType.buy2') : t('analysis.signalType.sell2')
   if (lowerType.includes('3buy')) return isBuy ? t('analysis.signalType.buy3') : t('analysis.signalType.sell3')
@@ -637,7 +638,7 @@ const formatSignalType = (type, isBuy) => {
   if (lowerType.includes('l2sell')) return t('analysis.signalType.sellL2')
   if (lowerType.includes('l3sell')) return t('analysis.signalType.sellL3')
   
-  return type.toUpperCase()
+  return String(type).toUpperCase()
 }
 
 const getScoreStatus = (score) => {

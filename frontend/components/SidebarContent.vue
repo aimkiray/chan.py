@@ -371,6 +371,10 @@
                       <span v-if="poolMetaLabel">{{ poolMetaLabel }}</span>
                   </div>
               </div>
+              <div v-if="stockPoolLoadFailed" class="mt-1 flex items-center justify-between gap-2 text-xs text-red-500">
+                  <span>{{ t('portfolio.loadFailed') }}</span>
+                  <UButton size="2xs" color="red" variant="link" :loading="searchingStockPools" @click="initStockPools">{{ t('history.refresh') }}</UButton>
+              </div>
           </div>
 
         <!-- Codes -->
@@ -549,6 +553,10 @@
               <label class="text-xs text-gray-500">{{ t('strategy.poolId') }}</label>
             </div>
             <USelectMenu v-model="proxyPaperConfig.pool_id" :searchable="searchStockPools" :searchable-placeholder="t('common.typeToSearch')" :loading="searchingStockPools" :options="poolOptions" value-attribute="value" option-attribute="label" class="w-full" />
+            <div v-if="stockPoolLoadFailed" class="mt-1 flex items-center justify-between gap-2 text-xs text-red-500">
+              <span>{{ t('portfolio.loadFailed') }}</span>
+              <UButton size="2xs" color="red" variant="link" :loading="searchingStockPools" @click="initStockPools">{{ t('history.refresh') }}</UButton>
+            </div>
           </div>
 
           <div class="space-y-2">
@@ -721,6 +729,10 @@
                    <label class="text-xs text-gray-500">{{ t('strategy.riskIndexCode') }}</label>
                  </div>
                  <USelectMenu v-model="proxyPaperParams.risk_index_code" :searchable="searchIndices" :searchable-placeholder="t('common.typeToSearch')" :loading="searchingIndices" :options="indexOptions" value-attribute="value" option-attribute="label" class="w-full" />
+                 <div v-if="indexLoadFailed" class="mt-1 flex items-center justify-between gap-2 text-xs text-red-500">
+                   <span>{{ t('portfolio.loadFailed') }}</span>
+                   <UButton size="2xs" color="red" variant="link" :loading="searchingIndices" @click="initIndexOptions">{{ t('history.refresh') }}</UButton>
+                 </div>
               </div>
               <div>
                 <div class="flex items-center gap-1 mb-2">
@@ -791,6 +803,10 @@
                       <label class="text-xs text-gray-500">{{ t('strategy.indexCode') }}</label>
                     </div>
                     <USelectMenu v-model="computedPaperIndexCode" :searchable="searchIndices" :searchable-placeholder="t('common.typeToSearch')" :loading="searchingIndices" :options="indexOptions" value-attribute="value" option-attribute="label" class="w-full" />
+                    <div v-if="indexLoadFailed" class="mt-1 flex items-center justify-between gap-2 text-xs text-red-500">
+                      <span>{{ t('portfolio.loadFailed') }}</span>
+                      <UButton size="2xs" color="red" variant="link" :loading="searchingIndices" @click="initIndexOptions">{{ t('history.refresh') }}</UButton>
+                    </div>
                  </div>
                  <div>
                     <div class="flex items-center gap-1 mb-2">
@@ -886,6 +902,10 @@
               <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.scope') }}</label>
             </div>
             <USelectMenu v-model="proxyStrategyForm.pool_id" :searchable="searchStockPools" :searchable-placeholder="t('common.typeToSearch')" :loading="searchingStockPools" :options="poolOptions" value-attribute="value" option-attribute="label" class="w-full" />
+            <div v-if="stockPoolLoadFailed" class="mt-1 flex items-center justify-between gap-2 text-xs text-red-500">
+              <span>{{ t('portfolio.loadFailed') }}</span>
+              <UButton size="2xs" color="red" variant="link" :loading="searchingStockPools" @click="initStockPools">{{ t('history.refresh') }}</UButton>
+            </div>
           </div>
 
           <!-- Manual Codes -->
@@ -903,6 +923,10 @@
                 <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('strategy.indexCode') }}</label>
              </div>
              <USelectMenu v-model="computedIndexCode" :searchable="searchIndices" :searchable-placeholder="t('common.typeToSearch')" :loading="searchingIndices" :options="indexOptions" value-attribute="value" option-attribute="label" class="w-full" />
+             <div v-if="indexLoadFailed" class="mt-1 flex items-center justify-between gap-2 text-xs text-red-500">
+               <span>{{ t('portfolio.loadFailed') }}</span>
+               <UButton size="2xs" color="red" variant="link" :loading="searchingIndices" @click="initIndexOptions">{{ t('history.refresh') }}</UButton>
+             </div>
           </div>
 
           <!-- Model -->
@@ -1090,6 +1114,7 @@ import { computed, ref, onMounted, watch } from 'vue'
 import axios from 'axios'
 import { MemoryBook, MemoryChevronDown, MemoryChevronLeft } from '@pictogrammers/memory'
 import { useI18n } from '../composables/useI18n'
+import { useStockPoolOptions, useIndexOptions, DEFAULT_POOL_ID } from '../composables/useMarketOptions'
 
 const { t } = useI18n()
 const toast = useToast()
@@ -1143,6 +1168,22 @@ const tocStructure = [
   {
     id: 'pretrain',
     labelKey: 'help.pretrain.title'
+  },
+  {
+    id: 'intraday',
+    labelKey: 'help.intraday.title'
+  },
+  {
+    id: 'live',
+    labelKey: 'help.live.title'
+  },
+  {
+    id: 'portfolio',
+    labelKey: 'help.portfolio.title'
+  },
+  {
+    id: 'history',
+    labelKey: 'help.history.title'
   }
 ]
 
@@ -1666,186 +1707,58 @@ const presets = computed(() => [
   }
 ])
 
+const STRATEGY_FORM_PRESET_KEYS = [
+  'min_accuracy', 'min_recent_accuracy', 'recent_accuracy_years', 'min_signal_score',
+  'min_bsp_count', 'min_test_count', 'high_vol_atr_pct_min', 'amp_whitelist_days',
+  'amp_whitelist_top_frac', 'use_atr_label', 'atr_period', 'atr_mult',
+  'portfolio_top_n', 'holding_period', 'profit_threshold', 'auto_profit_quantile',
+  'profit_lookahead', 'model', 'data_length_years', 'enable_rolling_lookback'
+]
+const CHAN_CONFIG_PRESET_KEYS = [
+  'bi_strict', 'require_signal', 'signal_direction', 'signal_lookback', 'bs_type',
+  'macd_algo', 'min_zs_cnt', 'bsp2_follow_1', 'bsp3_follow_1', 'gap_as_kl',
+  'bi_allow_sub_peak'
+]
+
 const applyPreset = () => {
     if (selectedPreset.value === 'custom') return
     const p = (presets.value || []).find(x => x.value === selectedPreset.value)
-    if (p && p.config) {
-        if (p.config.min_accuracy !== undefined) proxyStrategyForm.value.min_accuracy = p.config.min_accuracy
-        if (p.config.min_recent_accuracy !== undefined) proxyStrategyForm.value.min_recent_accuracy = p.config.min_recent_accuracy
-        if (p.config.recent_accuracy_years !== undefined) proxyStrategyForm.value.recent_accuracy_years = p.config.recent_accuracy_years
-        if (p.config.min_signal_score !== undefined) proxyStrategyForm.value.min_signal_score = p.config.min_signal_score
-        if (p.config.min_bsp_count !== undefined) proxyStrategyForm.value.min_bsp_count = p.config.min_bsp_count
-        if (p.config.min_test_count !== undefined) proxyStrategyForm.value.min_test_count = p.config.min_test_count
-        if (p.config.high_vol_atr_pct_min !== undefined) proxyStrategyForm.value.high_vol_atr_pct_min = p.config.high_vol_atr_pct_min
-        if (p.config.amp_whitelist_days !== undefined) proxyStrategyForm.value.amp_whitelist_days = p.config.amp_whitelist_days
-        if (p.config.amp_whitelist_top_frac !== undefined) proxyStrategyForm.value.amp_whitelist_top_frac = p.config.amp_whitelist_top_frac
-        if (p.config.use_atr_label !== undefined) proxyStrategyForm.value.use_atr_label = p.config.use_atr_label
-        if (p.config.atr_period !== undefined) proxyStrategyForm.value.atr_period = p.config.atr_period
-        if (p.config.atr_mult !== undefined) proxyStrategyForm.value.atr_mult = p.config.atr_mult
-        if (p.config.portfolio_top_n !== undefined) proxyStrategyForm.value.portfolio_top_n = p.config.portfolio_top_n
-        if (p.config.holding_period !== undefined) proxyStrategyForm.value.holding_period = p.config.holding_period
-        if (p.config.profit_threshold !== undefined) proxyStrategyForm.value.profit_threshold = p.config.profit_threshold
-        if (p.config.auto_profit_quantile !== undefined) proxyStrategyForm.value.auto_profit_quantile = p.config.auto_profit_quantile
-        if (p.config.profit_lookahead !== undefined) proxyStrategyForm.value.profit_lookahead = p.config.profit_lookahead
-        if (p.config.model !== undefined) proxyStrategyForm.value.model = p.config.model
-        if (p.config.data_length_years !== undefined) proxyStrategyForm.value.data_length_years = p.config.data_length_years
-        if (p.config.enable_rolling_lookback !== undefined) proxyStrategyForm.value.enable_rolling_lookback = p.config.enable_rolling_lookback
-        if (p.config.bi_strict !== undefined) proxyStrategyChanConfig.value.bi_strict = p.config.bi_strict
-        if (p.config.require_signal !== undefined) proxyStrategyChanConfig.value.require_signal = p.config.require_signal
-        if (p.config.signal_direction !== undefined) proxyStrategyChanConfig.value.signal_direction = p.config.signal_direction
-        if (p.config.signal_lookback !== undefined) proxyStrategyChanConfig.value.signal_lookback = p.config.signal_lookback
-        if (p.config.bs_type !== undefined) proxyStrategyChanConfig.value.bs_type = p.config.bs_type
-        if (p.config.macd_algo !== undefined) proxyStrategyChanConfig.value.macd_algo = p.config.macd_algo
-        if (p.config.min_zs_cnt !== undefined) proxyStrategyChanConfig.value.min_zs_cnt = p.config.min_zs_cnt
-        if (p.config.bsp2_follow_1 !== undefined) proxyStrategyChanConfig.value.bsp2_follow_1 = p.config.bsp2_follow_1
-        if (p.config.bsp3_follow_1 !== undefined) proxyStrategyChanConfig.value.bsp3_follow_1 = p.config.bsp3_follow_1
-        if (p.config.gap_as_kl !== undefined) proxyStrategyChanConfig.value.gap_as_kl = p.config.gap_as_kl
-        if (p.config.bi_allow_sub_peak !== undefined) proxyStrategyChanConfig.value.bi_allow_sub_peak = p.config.bi_allow_sub_peak
+    if (!p || !p.config) return
+    // Emit a single new object per v-model instead of mutating prop fields
+    const nextForm = { ...(proxyStrategyForm.value || {}) }
+    const nextChan = { ...(proxyStrategyChanConfig.value || {}) }
+    for (const k of STRATEGY_FORM_PRESET_KEYS) {
+        if (p.config[k] !== undefined) nextForm[k] = p.config[k]
     }
+    for (const k of CHAN_CONFIG_PRESET_KEYS) {
+        if (p.config[k] !== undefined) nextChan[k] = p.config[k]
+    }
+    proxyStrategyForm.value = nextForm
+    proxyStrategyChanConfig.value = nextChan
 }
 
-// Fetch pools logic moved from StrategyPanel? 
-// No, let's just hardcode HS300 for now or fetch it if needed.
-// StrategyPanel does fetchPools. Let's just use a simple list or assume parent handles it.
-// Actually, for simplicity, let's use a hardcoded list or fetch it here.
-const poolOptions = ref([{label: 'HS300', value: 'hs300'}])
+// Stock-pool and index option lists (with localStorage caching) are shared
+// with PortfolioPanel via composables/useMarketOptions.
+const {
+  poolOptions,
+  searchingStockPools,
+  stockPoolLoadFailed,
+  searchStockPools,
+  ensureStockPoolOption,
+  loadStockPools
+} = useStockPoolOptions()
+
+const {
+  indexOptions,
+  searchingIndices,
+  indexLoadFailed,
+  searchIndices,
+  ensureIndexOption,
+  loadIndexOptions
+} = useIndexOptions()
 
 const poolMembersLoading = ref(false)
 const poolMetaLabel = ref('')
-
-const searchingStockPools = ref(false)
-const STOCK_POOLS_CACHE_KEY = 'mlchan_stock_pools_cache_v1'
-const STOCK_POOLS_CACHE_MAX = 200
-
-const loadStockPoolsCache = () => {
-  try {
-    if (typeof window === 'undefined') return []
-    const raw = localStorage.getItem(STOCK_POOLS_CACHE_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    const cleaned = parsed
-      .map(x => ({
-        value: String(x?.value || x?.pool_id || '').trim(),
-        label: String(x?.label || '').trim(),
-        name: String(x?.name || '').trim()
-      }))
-      .filter(x => x.value)
-      .map(x => ({
-        value: x.value,
-        name: x.name || x.value,
-        label: x.label || `${x.name || x.value} (${x.value})`
-      }))
-    return cleaned.slice(0, STOCK_POOLS_CACHE_MAX)
-  } catch (e) {
-    return []
-  }
-}
-
-const persistStockPoolsCache = (items) => {
-  try {
-    if (typeof window === 'undefined') return
-    const arr = (items || [])
-      .map(x => ({
-        value: String(x?.value || '').trim(),
-        label: String(x?.label || '').trim(),
-        name: String(x?.name || '').trim()
-      }))
-      .filter(x => x.value)
-    localStorage.setItem(STOCK_POOLS_CACHE_KEY, JSON.stringify(arr.slice(0, STOCK_POOLS_CACHE_MAX)))
-  } catch (e) {
-  }
-}
-
-const ensureStockPoolOption = (poolId) => {
-  const cur = String(poolId || '').trim()
-  if (!cur) return
-  if ((poolOptions.value || []).find(x => x.value === cur)) return
-  poolOptions.value = [{ label: `${cur} (${cur})`, value: cur, name: cur }, ...(poolOptions.value || [])].slice(0, STOCK_POOLS_CACHE_MAX)
-  persistStockPoolsCache(poolOptions.value)
-}
-
-const searchStockPools = async (query) => {
-  const q = String(query || '').trim()
-  if (!q) return poolOptions.value
-  searchingStockPools.value = true
-  try {
-    const res = await axios.get('/api/stock_pools', { params: { limit: 100, keyword: q } })
-    const items = (res.data?.items || []).map(p => ({
-      label: `${p.pool_name} (${p.stock_count})`,
-      value: p.pool_id,
-      name: p.pool_name
-    }))
-    const merged = [...items, ...(poolOptions.value || [])]
-    const seen = new Set()
-    const uniq = []
-    for (const it of merged) {
-      const v = String(it?.value || '').trim()
-      if (!v || seen.has(v)) continue
-      seen.add(v)
-      uniq.push(it)
-    }
-    poolOptions.value = uniq.slice(0, STOCK_POOLS_CACHE_MAX)
-    persistStockPoolsCache(poolOptions.value)
-    return items
-  } catch (e) {
-    return []
-  } finally {
-    searchingStockPools.value = false
-  }
-}
-
-const indexOptions = ref([])
-const INDEX_OPTIONS_CACHE_KEY = 'mlchan_index_options_cache_v1'
-const INDEX_OPTIONS_CACHE_MAX = 200
-
-const loadIndexOptionsCache = () => {
-  try {
-    if (typeof window === 'undefined') return []
-    const raw = localStorage.getItem(INDEX_OPTIONS_CACHE_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    const cleaned = parsed
-      .map(x => ({
-        value: String(x?.value || x?.code || '').trim(),
-        label: String(x?.label || '').trim(),
-        name: String(x?.name || '').trim()
-      }))
-      .filter(x => x.value)
-      .map(x => ({
-        value: x.value,
-        name: x.name || x.value,
-        label: x.label || `${x.name || x.value} (${x.value})`
-      }))
-    return cleaned.slice(0, INDEX_OPTIONS_CACHE_MAX)
-  } catch (e) {
-    return []
-  }
-}
-
-const persistIndexOptionsCache = (items) => {
-  try {
-    if (typeof window === 'undefined') return
-    const arr = (items || [])
-      .map(x => ({
-        value: String(x?.value || '').trim(),
-        label: String(x?.label || '').trim(),
-        name: String(x?.name || '').trim()
-      }))
-      .filter(x => x.value)
-    localStorage.setItem(INDEX_OPTIONS_CACHE_KEY, JSON.stringify(arr.slice(0, INDEX_OPTIONS_CACHE_MAX)))
-  } catch (e) {
-  }
-}
-
-const ensureIndexOption = (code) => {
-  const cur = String(code || '').trim()
-  if (!cur) return
-  if ((indexOptions.value || []).find(x => x.value === cur)) return
-  indexOptions.value = [{ label: `${cur} (${cur})`, value: cur, name: cur }, ...(indexOptions.value || [])].slice(0, INDEX_OPTIONS_CACHE_MAX)
-  persistIndexOptionsCache(indexOptions.value)
-}
 
 const frequencyOptions = computed(() => [
   { label: t('periods.1d'), value: '1d' },
@@ -1882,22 +1795,24 @@ const rollingSampleModeOptions = computed(() => [
 ])
 
 const fillCodesFromPool = async () => {
-    if (!proxyPretrainConfig.value.selectedPoolId) return
+    const cfg = proxyPretrainConfig.value
+    if (!cfg?.selectedPoolId) return
     poolMembersLoading.value = true
     poolMetaLabel.value = ''
     try {
-        const res = await axios.get(`/api/stock_pools/${encodeURIComponent(proxyPretrainConfig.value.selectedPoolId)}/members`, {
+        const res = await axios.get(`/api/stock_pools/${encodeURIComponent(cfg.selectedPoolId)}/members`, {
             params: { limit: 10000 }
         })
         const codes = res.data?.codes || []
         if (codes.length > 0) {
-            if (proxyPretrainConfig.value.overwriteCodes) {
-                proxyPretrainConfig.value.codesText = codes.join(',')
+            let nextCodesText
+            if (cfg.overwriteCodes) {
+                nextCodesText = codes.join(',')
             } else {
-                const existing = proxyPretrainConfig.value.codesText ? proxyPretrainConfig.value.codesText.split(',').map(s => s.trim()).filter(Boolean) : []
-                const combined = Array.from(new Set([...existing, ...codes]))
-                proxyPretrainConfig.value.codesText = combined.join(',')
+                const existing = cfg.codesText ? cfg.codesText.split(',').map(s => s.trim()).filter(Boolean) : []
+                nextCodesText = Array.from(new Set([...existing, ...codes])).join(',')
             }
+            proxyPretrainConfig.value = { ...cfg, codesText: nextCodesText }
             poolMetaLabel.value = t('pretrain.poolLoaded').replace('{n}', String(codes.length))
         } else {
             poolMetaLabel.value = t('pretrain.poolEmpty')
@@ -1910,103 +1825,64 @@ const fillCodesFromPool = async () => {
     }
 }
 
-onMounted(async () => {
-    // We can fetch pools here too if we want dynamic list
-    // But for now let's keep it simple.
-    // If StrategyPanel fetches it, maybe app.vue should fetch and pass down?
-    // Let's self-fetch for independence
-    const cachedPools = loadStockPoolsCache()
-    if (cachedPools.length > 0) {
-      poolOptions.value = cachedPools
-      ensureStockPoolOption('index:IDX399673')
-      ensureStockPoolOption(proxyStrategyForm.value?.pool_id)
-      ensureStockPoolOption(proxyPaperConfig.value?.pool_id)
-      ensureStockPoolOption(proxyPretrainConfig.value?.selectedPoolId)
-    }
-    try {
-        if (poolOptions.value.length === 0) {
-          searchingStockPools.value = true
+// Initial stock-pool load (cache -> API). Callable again from the retry entry
+// shown next to pool selects when the request fails.
+const initStockPools = async () => {
+    const { ok } = await loadStockPools()
+    ensureStockPoolOption(DEFAULT_POOL_ID)
+    ensureStockPoolOption(proxyStrategyForm.value?.pool_id)
+    ensureStockPoolOption(proxyPaperConfig.value?.pool_id)
+    ensureStockPoolOption(proxyPretrainConfig.value?.selectedPoolId)
+    if (ok && poolOptions.value.length > 0) {
+        // Default to first option if not set (emit new objects, no prop mutation)
+        if (!proxyStrategyForm.value?.pool_id) {
+            proxyStrategyForm.value = { ...(proxyStrategyForm.value || {}), pool_id: poolOptions.value[0].value }
         }
-        const res = await axios.get('/api/stock_pools')
-        if (res.data && res.data.items) {
-            poolOptions.value = res.data.items.map(p => ({
-                label: `${p.pool_name} (${p.stock_count})`,
-                value: p.pool_id,
-                name: p.pool_name
-            }))
-            if (!poolOptions.value.find(x => x.value === 'index:IDX399673')) {
-              poolOptions.value.unshift({ label: '创业板50 (50)', value: 'index:IDX399673', name: '创业板50' })
-            }
-            persistStockPoolsCache(poolOptions.value)
-            // Default to first option if not set
-            if (!proxyStrategyForm.value.pool_id && poolOptions.value.length > 0) {
-                proxyStrategyForm.value.pool_id = poolOptions.value[0].value
-            }
-            if (!proxyPaperConfig.value?.pool_id) {
-              proxyPaperConfig.value.pool_id = poolOptions.value.find(x => x.value === 'index:IDX399673')?.value || poolOptions.value[0].value
-            }
+        if (!proxyPaperConfig.value?.pool_id) {
+            const fallback = poolOptions.value.find(x => x.value === DEFAULT_POOL_ID)?.value || poolOptions.value[0].value
+            proxyPaperConfig.value = { ...(proxyPaperConfig.value || {}), pool_id: fallback }
         }
-    } catch (e) {
-        // ignore
-    } finally {
-        searchingStockPools.value = false
     }
+}
 
-    // Load persisted index code
-    const savedIndex = localStorage.getItem('mlchan_sidebar_index_code')
-    // We must use savedIndex directly for the initial query because the computed prop update 
-    // might not have propagated back from parent yet.
+// Initial index-option load (cache short-circuits; otherwise fetch a small
+// page around the persisted/current code). Callable again for retry.
+const initIndexOptions = async () => {
+    const savedIndex = typeof localStorage !== 'undefined' ? localStorage.getItem('mlchan_sidebar_index_code') : ''
+    // Apply the saved code before the initial query — the computed prop update
+    // might not have propagated back from the parent yet.
     if (savedIndex) {
         computedIndexCode.value = savedIndex
     }
-
-    const cached = loadIndexOptionsCache()
-    if (cached.length > 0) {
-        indexOptions.value = cached
+    const currentCode = savedIndex || computedIndexCode.value || '399006'
+    const { items, fromCache } = await loadIndexOptions({ keyword: currentCode })
+    if (fromCache) {
         ensureIndexOption(computedIndexCode.value)
         ensureIndexOption(proxyPaperParams.value?.risk_index_code)
         return
     }
-
-    try {
-        const currentCode = savedIndex || computedIndexCode.value || '399006'
-        if (indexOptions.value.length === 0) {
-            searchingIndices.value = true
-        }
-
-        const res = await axios.get('/api/indices', { params: { limit: 50, keyword: currentCode } })
-        if (res.data && res.data.items) {
-            const items = res.data.items.map(c => {
-                const code = typeof c === 'string' ? c : (c.code || '')
-                const name = typeof c === 'string' ? c : (c.name || code)
-                return { label: `${name} (${code})`, value: code, name: name }
-            })
-            indexOptions.value = items
-            persistIndexOptionsCache(items)
-
-            const curVal = String(computedIndexCode.value || '').trim()
-            if (curVal && !items.find(x => x.value === curVal)) {
-                const curDigits = curVal.replace(/\D/g, '')
-                const match = (curDigits ? items.find(x => String(x.value || '').replace(/\D/g, '') === curDigits) : null)
-                    || (curDigits ? items.find(x => String(x.value || '').replace(/\D/g, '').endsWith(curDigits)) : null)
-                    || items[0]
-                if (match && match.value) {
-                    computedIndexCode.value = match.value
-                }
-            }
-
-            if (!currentCode && !computedIndexCode.value && items.length > 0) {
-                 computedIndexCode.value = items[0].value
+    if (items.length > 0) {
+        const curVal = String(computedIndexCode.value || '').trim()
+        if (curVal && !items.find(x => x.value === curVal)) {
+            const curDigits = curVal.replace(/\D/g, '')
+            const match = (curDigits ? items.find(x => String(x.value || '').replace(/\D/g, '') === curDigits) : null)
+                || (curDigits ? items.find(x => String(x.value || '').replace(/\D/g, '').endsWith(curDigits)) : null)
+                || items[0]
+            if (match && match.value) {
+                computedIndexCode.value = match.value
             }
         }
-    } catch (e) {
-        // ignore
-    } finally {
-        searchingIndices.value = false
+
+        if (!currentCode && !computedIndexCode.value) {
+             computedIndexCode.value = items[0].value
+        }
     }
-})
+}
 
-const searchingIndices = ref(false)
+onMounted(async () => {
+    await initStockPools()
+    await initIndexOptions()
+})
 
 const computedIndexCode = computed({
     get: () => proxyStrategyForm.value.index_code,
@@ -2024,38 +1900,6 @@ const computedPaperIndexCode = computed({
     }
 })
 
-const searchIndices = async (query) => {
-    if (!query) return indexOptions.value
-    searchingIndices.value = true
-    try {
-        const res = await axios.get('/api/indices', { params: { limit: 100, keyword: query } })
-        if (res.data && res.data.items) {
-            const items = res.data.items.map(c => {
-                const code = typeof c === 'string' ? c : (c.code || '')
-                const name = typeof c === 'string' ? c : (c.name || code)
-                return { label: `${name} (${code})`, value: code, name: name }
-            })
-            const merged = [...items, ...(indexOptions.value || [])]
-            const seen = new Set()
-            const uniq = []
-            for (const it of merged) {
-              const v = String(it?.value || '').trim()
-              if (!v || seen.has(v)) continue
-              seen.add(v)
-              uniq.push(it)
-            }
-            indexOptions.value = uniq.slice(0, INDEX_OPTIONS_CACHE_MAX)
-            persistIndexOptionsCache(indexOptions.value)
-            return items
-        }
-        return []
-    } catch (e) {
-        return []
-    } finally {
-        searchingIndices.value = false
-    }
-}
-
 watch(() => proxyStrategyForm.value.index_code, (val) => {
     if (val) localStorage.setItem('mlchan_sidebar_index_code', val)
     ensureIndexOption(val)
@@ -2070,12 +1914,11 @@ watch(() => proxyPaperParams.value?.index_code, (val) => {
 }, { deep: true })
 
 
-watch(() => proxyPretrainConfig.value.selectedPoolId, (newId) => {
+watch(() => proxyPretrainConfig.value?.selectedPoolId, (newId) => {
     const pool = poolOptions.value.find(p => p.value === newId)
-    if (pool) {
-        proxyPretrainConfig.value.poolName = pool.name
-    } else {
-        proxyPretrainConfig.value.poolName = ''
+    const nextName = pool ? pool.name : ''
+    if ((proxyPretrainConfig.value?.poolName || '') !== nextName) {
+        proxyPretrainConfig.value = { ...(proxyPretrainConfig.value || {}), poolName: nextName }
     }
 })
 

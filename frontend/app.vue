@@ -207,7 +207,7 @@
           <div v-if="loading && mobileSidebarCollapsed" class="absolute inset-0 bg-white/70 dark:bg-gray-900/70 z-50 flex items-center justify-center">
             <div class="flex flex-col items-center">
               <UIcon name="i-heroicons-arrow-path" class="animate-spin w-8 h-8 text-blue-500" />
-              <span class="mt-2 text-sm text-gray-500">正在分析...</span>
+              <span class="mt-2 text-sm text-gray-500">{{ t('sidebar.analyzing') }}</span>
             </div>
           </div>
           
@@ -317,7 +317,7 @@
           <!-- Pretrain Tab -->
           <div v-show="activeTab === 'pretrain'" class="h-full w-full flex flex-col lg:overflow-hidden">
              <div class="lg:h-full lg:overflow-hidden p-2 box-border bg-white dark:bg-gray-900 flex-1">
-                <PretrainPanel ref="pretrainPanelRef" :config="pretrainConfig" :defaultDataSrc="dataSrc" :defaultModel="model" />
+                <PretrainPanel ref="pretrainPanelRef" :config="pretrainConfig" />
              </div>
           </div>
 
@@ -558,7 +558,8 @@ const backtestPanelRef = ref(null)
 const paperPanelRef = ref(null)
 const sidebarBacktestLoading = ref(false)
 const backtestLoading = computed(() => {
-  const live = backtestPanelRef.value?.wolfpackLoading?.value
+  // defineExpose'd refs are auto-unwrapped on the component instance (proxyRefs)
+  const live = !!backtestPanelRef.value?.wolfpackLoading
   return !!(sidebarBacktestLoading.value || live)
 })
 const paperConfig = ref({
@@ -931,7 +932,7 @@ onMounted(() => {
   }
 
   const savedLang = localStorage.getItem('lastLang')
-  if (savedLang) {
+  if (savedLang === 'zh' || savedLang === 'en') {
     lang.value = savedLang
   }
 
@@ -991,6 +992,13 @@ onMounted(() => {
   const savedIntradayBlend = localStorage.getItem('intradayBlendModels')
   if (savedIntradayBlend) {
     intradayBlendModels.value = savedIntradayBlend !== 'false'
+  }
+
+  const savedStrategyForm = localStorage.getItem('strategyForm')
+  if (savedStrategyForm) {
+    try {
+      Object.assign(strategyForm.value, JSON.parse(savedStrategyForm))
+    } catch (e) { /* ignore */ }
   }
 
   const savedStrategyChanConfig = localStorage.getItem('strategyChanConfig')
@@ -1073,17 +1081,42 @@ watch(
   { deep: true }
 )
 
-// Watch changes and save to localStorage
-watch(code, (newVal) => {
-  if (!isInitialized.value) return
-  if (newVal) {
-    localStorage.setItem('lastStockCode', newVal)
-  }
-})
+// Persist simple settings to localStorage — one generated watcher per field.
+// `allowFalsy` also writes falsy values (booleans, empty strings);
+// `serialize` customizes the stored representation; `deep` watches objects.
+const persistSetting = (source, key, { serialize = (v) => v, allowFalsy = false, deep = false } = {}) => {
+  watch(source, (v) => {
+    if (!isInitialized.value) return
+    if (!allowFalsy && !v) return
+    try {
+      localStorage.setItem(key, serialize(v))
+    } catch (e) { /* storage unavailable */ }
+  }, deep ? { deep: true } : undefined)
+}
+
+persistSetting(code, 'lastStockCode')
+persistSetting(activeTab, 'lastActiveTab')
+persistSetting(lang, 'lastLang')
+persistSetting(model, 'lastModel')
+persistSetting(intradayFreq, 'lastIntradayFreq')
+persistSetting(dataSrc, 'lastDataSrc')
+persistSetting(dataLengthYears, 'lastDataLengthYears')
+persistSetting(triggerStep, 'lastTriggerStep', { allowFalsy: true })
+persistSetting(biStrict, 'lastBiStrict', { allowFalsy: true })
+persistSetting(autype, 'lastAutype', { allowFalsy: true, serialize: (v) => String(v) })
+persistSetting(enableRollingLookback, 'lastEnableRollingLookback', { allowFalsy: true })
+persistSetting(rankTransformEnabled, 'lastRankTransformEnabled', { allowFalsy: true })
+persistSetting(onlyFeatures, 'lastOnlyFeatures', { allowFalsy: true, serialize: (v) => String(v ?? '') })
+persistSetting(intradayPretrainedChoice, 'intradayPretrainedChoice', { allowFalsy: true, serialize: (v) => v || 'auto' })
+persistSetting(intradayBlendModels, 'intradayBlendModels', { allowFalsy: true, serialize: (v) => (v ? 'true' : 'false') })
+persistSetting(dailyPretrainedChoice, 'dailyPretrainedChoice', { allowFalsy: true, serialize: (v) => v || 'auto' })
+persistSetting(dailyBlendModels, 'dailyBlendModels', { allowFalsy: true, serialize: (v) => (v ? 'true' : 'false') })
+persistSetting(strategyForm, 'strategyForm', { allowFalsy: true, deep: true, serialize: (v) => JSON.stringify(v) })
+persistSetting(strategyChanConfig, 'strategyChanConfig', { allowFalsy: true, deep: true, serialize: (v) => JSON.stringify(v) })
+persistSetting(pretrainConfig, 'pretrainConfig', { allowFalsy: true, deep: true, serialize: (v) => JSON.stringify(v) })
 
 watch(activeTab, (newVal) => {
   if (!isInitialized.value) return
-  if (newVal) localStorage.setItem('lastActiveTab', newVal)
 
   // Sidebar Visibility Logic
   if (newVal === 'matrix') {
@@ -1095,7 +1128,7 @@ watch(activeTab, (newVal) => {
   } else {
     showDesktopSidebar.value = true
   }
-  
+
   // Refresh pretrained models list when entering analysis/intraday tabs
   if (newVal === 'intraday' || newVal === 'analysis') {
      fetchIntradayPretrainedModels({ quiet: true })
@@ -1108,108 +1141,14 @@ watch(activeTab, (newVal) => {
   })
 })
 
-watch(lang, (newVal) => {
-  if (!isInitialized.value) return
-  if (newVal) localStorage.setItem('lastLang', newVal)
-})
-
 watch(model, (newVal) => {
   if (!isInitialized.value) return
-  if (newVal) {
-    localStorage.setItem('lastModel', newVal)
-  }
   const mk = String(newVal || '').trim().toLowerCase()
   if (['logistic_regression', 'logreg', 'lr'].includes(mk)) {
     rankTransformEnabled.value = true
     onlyFeatures.value = 'volatility_250,bsp3_zs_height'
   }
 })
-
-watch(intradayFreq, (newVal) => {
-  if (!isInitialized.value) return
-  if (newVal) {
-    localStorage.setItem('lastIntradayFreq', newVal)
-  }
-})
-
-watch(dataSrc, (newVal) => {
-  if (!isInitialized.value) return
-  if (newVal) {
-    localStorage.setItem('lastDataSrc', newVal)
-  }
-})
-
-watch(dataLengthYears, (newVal) => {
-  if (!isInitialized.value) return
-  if (newVal) {
-    localStorage.setItem('lastDataLengthYears', newVal)
-  }
-})
-
-watch(triggerStep, (newVal) => {
-  if (!isInitialized.value) return
-  localStorage.setItem('lastTriggerStep', newVal)
-})
-
-watch(biStrict, (newVal) => {
-  if (!isInitialized.value) return
-  localStorage.setItem('lastBiStrict', newVal)
-})
-
-watch(autype, (newVal) => {
-  if (!isInitialized.value) return
-  localStorage.setItem('lastAutype', String(newVal))
-})
-
-watch(enableRollingLookback, (newVal) => {
-  if (!isInitialized.value) return
-  localStorage.setItem('lastEnableRollingLookback', newVal)
-})
-
-watch(rankTransformEnabled, (newVal) => {
-  if (!isInitialized.value) return
-  localStorage.setItem('lastRankTransformEnabled', newVal)
-})
-
-watch(onlyFeatures, (newVal) => {
-  if (!isInitialized.value) return
-  localStorage.setItem('lastOnlyFeatures', String(newVal ?? ''))
-})
-
-watch(intradayPretrainedChoice, (newVal) => {
-  if (!isInitialized.value) return
-  localStorage.setItem('intradayPretrainedChoice', newVal || 'auto')
-})
-
-watch(intradayBlendModels, (newVal) => {
-  if (!isInitialized.value) return
-  localStorage.setItem('intradayBlendModels', newVal ? 'true' : 'false')
-})
-
-watch(dailyPretrainedChoice, (newVal) => {
-  if (!isInitialized.value) return
-  localStorage.setItem('dailyPretrainedChoice', newVal || 'auto')
-})
-
-watch(dailyBlendModels, (newVal) => {
-  if (!isInitialized.value) return
-  localStorage.setItem('dailyBlendModels', newVal ? 'true' : 'false')
-})
-
-watch(strategyForm, (newVal) => {
-  if (!isInitialized.value) return
-  localStorage.setItem('strategyForm', JSON.stringify(newVal))
-}, { deep: true })
-
-watch(strategyChanConfig, (newVal) => {
-  if (!isInitialized.value) return
-  localStorage.setItem('strategyChanConfig', JSON.stringify(newVal))
-}, { deep: true })
-
-watch(pretrainConfig, (newVal) => {
-  if (!isInitialized.value) return
-  localStorage.setItem('pretrainConfig', JSON.stringify(newVal))
-}, { deep: true })
 
 watch(paperConfig, (newVal) => {
   if (!isInitialized.value) return
@@ -1327,91 +1266,107 @@ const getPretrainedAvailability = ({ isIntraday }) => {
   return { requested: true, available: ok }
 }
 
-  const analyze = async (isPrediction = false, silent = false, forceRefresh = false) => {
-    const isAnalysisTab = activeTab.value === 'analysis'
-    const separatePrediction = isAnalysisTab && isPrediction
+// Build the /api/analyze payload. Shared by the first pass and the background
+// prediction pass so they can't drift apart again.
+const buildAnalyzeParams = ({ isIntraday, doPredict, forceRefresh = false }) => {
+  const startDate = String(strategyForm.value.start_date || '').trim() || null
+  const endDate = String(strategyForm.value.end_date || '').trim() || null
 
-    loading.value = true
-    
-    try {
-      const isIntraday = activeTab.value === 'intraday'
-      const frequency = isIntraday ? intradayFreq.value : '1d'
-      
-      const firstPassPrediction = separatePrediction ? false : isPrediction
+  const profitThresholdRaw = strategyForm.value.profit_threshold
+  let profitThreshold = null
+  if (profitThresholdRaw !== '' && profitThresholdRaw !== undefined && profitThresholdRaw !== null) {
+    const v = Number(profitThresholdRaw)
+    profitThreshold = Number.isFinite(v) ? Math.max(0, v) : null
+  }
 
-      const pretrainedAvail = getPretrainedAvailability({ isIntraday })
-      if (!silent && pretrainedAvail.requested && !pretrainedAvail.available) {
-        toast.add({
-          title: t('app.pretrainedUnavailableTitle'),
-          description: t('app.pretrainedUnavailableDesc'),
-          color: 'orange'
-        })
-      }
+  const autoQRaw = Number(strategyForm.value.auto_profit_quantile)
+  const autoQ = Number.isFinite(autoQRaw) ? autoQRaw : 0.7
 
-      const startDateRaw = strategyForm.value.start_date
-      const endDateRaw = strategyForm.value.end_date
-      const startDate = String(startDateRaw || '').trim() || null
-      const endDate = String(endDateRaw || '').trim() || null
+  const lookaheadRaw = Number(strategyForm.value.profit_lookahead)
+  const lookahead = Number.isFinite(lookaheadRaw) ? Math.max(0, Math.floor(lookaheadRaw)) : 5
 
-      const profitThresholdRaw = strategyForm.value.profit_threshold
-      let profitThreshold = null
-      if (profitThresholdRaw !== '' && profitThresholdRaw !== undefined && profitThresholdRaw !== null) {
-        const v = Number(profitThresholdRaw)
-        profitThreshold = Number.isFinite(v) ? Math.max(0, v) : null
-      }
+  const shouldForceRefresh = !!forceRefresh || !!strategyForm.value.force_refresh
+  const onlyFeaturesRaw = String(onlyFeatures.value ?? '').trim()
+  const modelKey = String(model.value || '').trim().toLowerCase()
+  const useWolfpackLR = ['logistic_regression', 'logreg', 'lr'].includes(modelKey)
+  const wolfpackOnlyFeatures = ['volatility_250', 'bsp3_zs_height']
 
-      const autoQRaw = Number(strategyForm.value.auto_profit_quantile)
-      const autoQ = Number.isFinite(autoQRaw) ? autoQRaw : 0.7
+  return {
+    code: code.value,
+    frequency: isIntraday ? intradayFreq.value : '1d',
+    do_predict: doPredict,
+    autype: autype.value,
+    trigger_step: triggerStep.value,
+    bi_strict: biStrict.value,
+    enable_rolling_lookback: enableRollingLookback.value,
+    rank_transform_enabled: useWolfpackLR ? true : rankTransformEnabled.value,
+    only_features: useWolfpackLR ? wolfpackOnlyFeatures : (onlyFeaturesRaw ? onlyFeaturesRaw : null),
+    start_date: startDate,
+    end_date: endDate,
+    profit_threshold: profitThreshold,
+    auto_profit_quantile: autoQ,
+    profit_lookahead: lookahead,
+    backtest_mode: useWolfpackLR ? 'walk_forward' : undefined,
+    data_src: dataSrc.value,
+    model: model.value,
+    force_refresh: shouldForceRefresh,
+    data_length_years: dataLengthYears.value,
+    use_pretrained: isIntraday
+        ? (intradayBlendModels.value ? (intradayPretrainedChoice.value === 'none' ? false : true) : false)
+        : (dailyBlendModels.value ? (dailyPretrainedChoice.value === 'none' ? false : true) : false),
+    pretrained_model_key:
+      isIntraday
+        ? (intradayBlendModels.value && intradayPretrainedChoice.value && !['auto', 'none'].includes(intradayPretrainedChoice.value) ? intradayPretrainedChoice.value : undefined)
+        : (dailyBlendModels.value && dailyPretrainedChoice.value && !['auto', 'none'].includes(dailyPretrainedChoice.value) ? dailyPretrainedChoice.value : undefined),
+    blend_models:
+      isIntraday
+        ? (intradayBlendModels.value && intradayPretrainedChoice.value !== 'none' ? true : undefined)
+        : (dailyBlendModels.value && dailyPretrainedChoice.value !== 'none' ? true : undefined)
+  }
+}
 
-      const lookaheadRaw = Number(strategyForm.value.profit_lookahead)
-      const lookahead = Number.isFinite(lookaheadRaw) ? Math.max(0, Math.floor(lookaheadRaw)) : 5
+// Request dedup/cancellation: each analyze() call aborts the previous in-flight
+// request and carries a sequence token, so a stale response can neither
+// overwrite newer state nor flip `loading` off early.
+let analyzeSeq = 0
+let analyzeAbort = null
+const isAbortError = (e) => e?.code === 'ERR_CANCELED' || !!axios.isCancel?.(e)
 
-      const shouldForceRefresh = !!forceRefresh || !!strategyForm.value.force_refresh
-      const onlyFeaturesRaw = String(onlyFeatures.value ?? '').trim()
-      const modelKey = String(model.value || '').trim().toLowerCase()
-      const useWolfpackLR = ['logistic_regression', 'logreg', 'lr'].includes(modelKey)
-      const wolfpackOnlyFeatures = ['volatility_250', 'bsp3_zs_height']
+const analyze = async (isPrediction = false, silent = false, forceRefresh = false) => {
+  analyzeAbort?.abort()
+  const controller = new AbortController()
+  analyzeAbort = controller
+  const seq = ++analyzeSeq
+  const isStale = () => seq !== analyzeSeq
 
-      const params = {
-        code: code.value,
-        frequency: frequency,
-        do_predict: firstPassPrediction,
-        autype: autype.value,
-        trigger_step: triggerStep.value,
-        bi_strict: biStrict.value,
-        enable_rolling_lookback: enableRollingLookback.value,
-        rank_transform_enabled: useWolfpackLR ? true : rankTransformEnabled.value,
-        only_features: useWolfpackLR ? wolfpackOnlyFeatures : (onlyFeaturesRaw ? onlyFeaturesRaw : null),
-        start_date: startDate,
-        end_date: endDate,
-        profit_threshold: profitThreshold,
-        auto_profit_quantile: autoQ,
-        profit_lookahead: lookahead,
-        backtest_mode: useWolfpackLR ? 'walk_forward' : undefined,
-        data_src: dataSrc.value,
-        model: model.value,
-        force_refresh: shouldForceRefresh,
-        data_length_years: dataLengthYears.value,
-        use_pretrained: isIntraday
-            ? (intradayBlendModels.value ? (intradayPretrainedChoice.value === 'none' ? false : true) : false)
-            : (dailyBlendModels.value ? (dailyPretrainedChoice.value === 'none' ? false : true) : false),
-        pretrained_model_key:
-          isIntraday 
-            ? (intradayBlendModels.value && intradayPretrainedChoice.value && !['auto', 'none'].includes(intradayPretrainedChoice.value) ? intradayPretrainedChoice.value : undefined)
-            : (dailyBlendModels.value && dailyPretrainedChoice.value && !['auto', 'none'].includes(dailyPretrainedChoice.value) ? dailyPretrainedChoice.value : undefined),
-        blend_models:
-          isIntraday 
-            ? (intradayBlendModels.value && intradayPretrainedChoice.value !== 'none' ? true : undefined)
-            : (dailyBlendModels.value && dailyPretrainedChoice.value !== 'none' ? true : undefined)
-      }
+  const isAnalysisTab = activeTab.value === 'analysis'
+  const separatePrediction = isAnalysisTab && isPrediction
 
-    const response = await axios.post('/api/analyze', params)
-    
+  loading.value = true
+  let runSecondPass = false
+
+  try {
+    const isIntraday = activeTab.value === 'intraday'
+    const firstPassPrediction = separatePrediction ? false : isPrediction
+
+    const pretrainedAvail = getPretrainedAvailability({ isIntraday })
+    if (!silent && pretrainedAvail.requested && !pretrainedAvail.available) {
+      toast.add({
+        title: t('app.pretrainedUnavailableTitle'),
+        description: t('app.pretrainedUnavailableDesc'),
+        color: 'orange'
+      })
+    }
+
+    const params = buildAnalyzeParams({ isIntraday, doPredict: firstPassPrediction, forceRefresh })
+    const response = await axios.post('/api/analyze', params, { signal: controller.signal })
+    if (isStale()) return
+
     if (response.data.status === 'success') {
       const res = response.data
       const data = res.data
       stockName.value = res.stock_name || ''
-      
+
       if (isIntraday) {
         intradaySignal.value = res.signal
         intradayAccuracy.value = res.accuracy
@@ -1421,6 +1376,7 @@ const getPretrainedAvailability = ({ isIntraday }) => {
         hasRunIntraday.value = true
         await nextTick()
 
+        if (isStale()) return
         if (intradayChartRef.value) {
           intradayChartRef.value.updateChart(data)
         }
@@ -1433,77 +1389,62 @@ const getPretrainedAvailability = ({ isIntraday }) => {
         hasRunAnalysis.value = true
         await nextTick()
 
+        if (isStale()) return
         if (chartRef.value) {
           chartRef.value.updateChart(data)
         }
       }
+      runSecondPass = separatePrediction
     } else {
       let errorMsg = response.data.message || 'Analysis failed'
       if (response.data.status === 'error' && response.data.detail) {
           errorMsg = response.data.detail
       }
       if (!silent) toast.add({ title: t('app.error'), description: errorMsg, color: 'red' })
-      loading.value = false
-      return
     }
   } catch (e) {
+    if (isStale() || isAbortError(e)) return
     console.error(e)
     let errorMsg = e.message || 'Network error'
-    
+
     // Check for response details
     if (e.response && e.response.data && e.response.data.detail) {
         errorMsg = e.response.data.detail
     }
-    
+
     // Customize for 404
     if (e.response && e.response.status === 404) {
         errorMsg = t('app.stockNotFound')
     }
 
     if (!silent) toast.add({ title: t('app.error'), description: errorMsg, color: 'red' })
-    loading.value = false
-    return
+  } finally {
+    // Only the latest call may clear the loading flag.
+    if (!isStale()) loading.value = false
   }
 
-  // First pass done. Turn off loading.
-  loading.value = false
+  if (!runSecondPass || isStale()) return
 
-  // Second pass: Background Prediction if needed
-   if (separatePrediction) {
-       try {
-           const onlyFeaturesRaw = String(onlyFeatures.value ?? '').trim()
-           const modelKey = String(model.value || '').trim().toLowerCase()
-           const useWolfpackLR = ['logistic_regression', 'logreg', 'lr'].includes(modelKey)
-           const wolfpackOnlyFeatures = ['volatility_250', 'bsp3_zs_height']
-           const params = {
-               code: code.value,
-               frequency: '1d',
-               do_predict: true,
-               autype: autype.value,
-               trigger_step: triggerStep.value,
-               bi_strict: biStrict.value,
-               enable_rolling_lookback: enableRollingLookback.value,
-               rank_transform_enabled: useWolfpackLR ? true : rankTransformEnabled.value,
-               only_features: useWolfpackLR ? wolfpackOnlyFeatures : (onlyFeaturesRaw ? onlyFeaturesRaw : null),
-               backtest_mode: useWolfpackLR ? 'walk_forward' : undefined,
-               profit_threshold: strategyForm.value.profit_threshold,
-               auto_profit_quantile: strategyForm.value.auto_profit_quantile,
-               profit_lookahead: strategyForm.value.profit_lookahead,
-               data_src: dataSrc.value,
-               model: model.value
-           }
-          
-          const response = await axios.post('/api/analyze', params)
-          
-          if (response.data.status === 'success') {
-              const res = response.data
-              // Update only signal and accuracy for Analysis Tab
-              signal.value = res.signal
-              accuracy.value = res.accuracy
-          }
-      } catch (e) {
-          console.error("Background prediction failed", e)
-      }
+  // Second pass: background prediction (daily analysis tab only).
+  try {
+    const params = buildAnalyzeParams({ isIntraday: false, doPredict: true, forceRefresh: false })
+    const response = await axios.post('/api/analyze', params, { signal: controller.signal })
+    if (isStale()) return
+
+    if (response.data.status === 'success') {
+        const res = response.data
+        // Update only signal and accuracy for Analysis Tab
+        signal.value = res.signal
+        accuracy.value = res.accuracy
+    } else {
+        const errorMsg = response.data.detail || response.data.message || 'Prediction failed'
+        if (!silent) toast.add({ title: t('app.error'), description: errorMsg, color: 'orange' })
+    }
+  } catch (e) {
+    if (isStale() || isAbortError(e)) return
+    console.error('Background prediction failed', e)
+    const errorMsg = e?.response?.data?.detail || e?.message || 'Prediction failed'
+    if (!silent) toast.add({ title: t('app.error'), description: errorMsg, color: 'orange' })
   }
 }
 

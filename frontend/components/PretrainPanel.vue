@@ -1,5 +1,5 @@
 <template>
-  <div class="h-full flex flex-col">
+  <div class="h-full flex flex-col" ref="panelRoot">
     <div class="flex-1 min-h-0 p-3 flex flex-col">
       <div class="grid grid-cols-1 gap-3 h-full">
         <UCard :ui="{ body: { base: 'flex-1 min-h-0 flex flex-col', padding: 'p-3' } }" class="shadow-none border border-gray-200 dark:border-gray-800 flex flex-col min-h-0 h-full">
@@ -506,7 +506,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import axios from 'axios'
 import { useI18n } from '../composables/useI18n'
 
@@ -524,27 +524,24 @@ const formatAxiosError = (e) => {
 }
 
 const props = defineProps({
-  defaultDataSrc: {
-    type: String,
-    default: 'clickhouse'
-  },
-  defaultModel: {
-    type: String,
-    default: 'xgboost'
-  },
   config: {
     type: Object,
     default: () => ({})
   }
 })
 
-const loading = ref(false)
-const result = ref(null)
-
 const jobId = ref('')
 let jobPollTimer = null
 let listPollTimer = null
 let lastModelsFetchAt = 0
+
+// Panel stays mounted under v-show in app.vue — track real visibility so the
+// list polling pauses while the tab is hidden. Starts false when IO is
+// available; its initial callback sets the real value and triggers the first
+// refresh, so a never-visited panel makes no requests at all.
+const panelRoot = ref(null)
+const panelVisible = ref(typeof IntersectionObserver === 'undefined')
+let panelVisObserver = null
 
 const listLoading = ref(false)
 const jobItems = ref([])
@@ -669,11 +666,35 @@ const dataLengthShort = (row) => {
 
 
 
+const hasActiveJob = () => {
+  // a submitted job still polling, or any running/queued job in the list
+  if (jobId.value) return true
+  if ((jobItems.value || []).some((j) => ['running', 'queued'].includes(String(j?.status || '')))) return true
+  if (selectedJob.value && ['running', 'queued'].includes(String(selectedJob.value?.status || ''))) return true
+  return false
+}
+
+const shouldPollLists = () => {
+  if (typeof document !== 'undefined' && document.hidden) return false
+  return panelVisible.value || hasActiveJob()
+}
+
 onMounted(() => {
-  refreshLists()
+  if (panelVisible.value) refreshLists()
   listPollTimer = setInterval(() => {
+    if (!shouldPollLists()) return
     refreshLists({ quiet: true })
   }, 2000)
+  if (typeof IntersectionObserver !== 'undefined' && panelRoot.value) {
+    panelVisObserver = new IntersectionObserver((entries) => {
+      const e = entries && entries[0]
+      const wasVisible = panelVisible.value
+      panelVisible.value = e ? !!e.isIntersecting : true
+      // refresh once when the panel comes back into view
+      if (panelVisible.value && !wasVisible) refreshLists({ quiet: true })
+    })
+    panelVisObserver.observe(panelRoot.value)
+  }
 })
 
 onBeforeUnmount(() => {
@@ -684,6 +705,10 @@ onBeforeUnmount(() => {
   if (listPollTimer) {
     clearInterval(listPollTimer)
     listPollTimer = null
+  }
+  if (panelVisObserver) {
+    panelVisObserver.disconnect()
+    panelVisObserver = null
   }
 })
 
@@ -728,7 +753,10 @@ const refreshLists = async ({ quiet, forceModels } = {}) => {
       if (cur) selectedJob.value = { ...selectedJob.value, ...cur }
     }
   } catch (e) {
-    console.error(e)
+    // silent for background polling; surface errors on manual refresh
+    if (!quiet) {
+      toast.add({ title: t('pretrain.failed'), description: formatAxiosError(e), color: 'red' })
+    }
   } finally {
     listLoading.value = false
   }
@@ -1047,8 +1075,6 @@ const pollPretrainJob = async () => {
 
     if (job.status === 'success') {
       stopJobPolling()
-      loading.value = false
-      result.value = job.result || { status: 'success' }
       selectedJob.value = { kind: 'job', job_id: jobId.value, id: String(jobId.value).slice(0, 8), ...job }
       const mk = job?.result?.model_key
       if (mk) {
@@ -1066,9 +1092,7 @@ const pollPretrainJob = async () => {
       toast.add({ title: t('pretrain.success'), color: 'green' })
     } else if (job.status === 'error') {
       stopJobPolling()
-      loading.value = false
       const detail = job.detail || t('pretrain.failed')
-      result.value = { status: 'error', detail }
       selectedJob.value = { kind: 'job', job_id: jobId.value, id: String(jobId.value).slice(0, 8), ...job }
       detailResult.value = { status: 'error', detail }
       await refreshLists({ quiet: true })
@@ -1085,70 +1109,58 @@ const runPretrain = async () => {
     return
   }
 
-  loading.value = true
-  result.value = null
   stopJobPolling()
   jobId.value = ''
+
+  const body = {
+    codes: codes.value,
+    frequency: props.config.frequency,
+    data_src: props.config.dataSrc,
+    model: props.config.model,
+    data_length_mode: props.config.dataLengthMode === 'years' ? 'default' : 'max',
+    data_length_years: props.config.dataLengthMode === 'years' ? Number(props.config.dataLengthYears) : null,
+    force_refresh: !!props.config.forceRefresh,
+    autype: props.config.autype || 'hfq',
+    pool_name: props.config.poolName || null,
+    rank_mode: props.config.rankMode || 'sample',
+    rolling_sample_mode: props.config.rollingSampleMode ? String(props.config.rollingSampleMode) : null,
+    rolling_stride: props.config.rollingStride !== '' && props.config.rollingStride !== null && props.config.rollingStride !== undefined ? Number(props.config.rollingStride) : null,
+    only_features: props.config.onlyFeatures ? String(props.config.onlyFeatures).split(',').map(s => s.trim()).filter(Boolean) : null
+  }
+
+  const startJob = async (payload) => {
+    const startRes = await axios.post('/api/pretrain_jobs', payload)
+    const id = startRes.data?.job_id
+    if (!id) throw new Error('missing job_id')
+    jobId.value = id
+    await refreshLists({ quiet: true })
+    await pollPretrainJob()
+    jobPollTimer = setInterval(pollPretrainJob, 1000)
+  }
+
   try {
-    const body = {
-      codes: codes.value,
-      frequency: props.config.frequency,
-      data_src: props.config.dataSrc,
-      model: props.config.model,
-      data_length_mode: props.config.dataLengthMode === 'years' ? 'default' : 'max',
-      data_length_years: props.config.dataLengthMode === 'years' ? Number(props.config.dataLengthYears) : null,
-      force_refresh: !!props.config.forceRefresh,
-      autype: props.config.autype || 'hfq',
-      pool_name: props.config.poolName || null,
-      rank_mode: props.config.rankMode || 'sample',
-      rolling_sample_mode: props.config.rollingSampleMode ? String(props.config.rollingSampleMode) : null,
-      rolling_stride: props.config.rollingStride !== '' && props.config.rollingStride !== null && props.config.rollingStride !== undefined ? Number(props.config.rollingStride) : null,
-      only_features: props.config.onlyFeatures ? String(props.config.onlyFeatures).split(',').map(s => s.trim()).filter(Boolean) : null
-    }
-
     try {
-      const start = async (payload) => {
-        const startRes = await axios.post('/api/pretrain_jobs', payload)
-        const id = startRes.data?.job_id
-        if (!id) throw new Error('missing job_id')
-        jobId.value = id
-        await refreshLists({ quiet: true })
-        // Don't auto-open item
-        // await openItem({ kind: 'job', job_id: id, id: String(id).slice(0, 8), status: 'queued', progress: 0, stage: 'queued' })
-        await pollPretrainJob()
-        jobPollTimer = setInterval(pollPretrainJob, 1000)
-      }
-
-      try {
-        await start(body)
-        return
-      } catch (e) {
-        const status = e?.response?.status
-        const detail = String(e?.response?.data?.detail || '')
-        if (status === 409 && detail.includes('duplicate pretrain') && !body.force_refresh) {
-          await start({ ...body, force_refresh: true })
-          return
-        }
-        throw e
-      }
+      await startJob(body)
     } catch (e) {
       const status = e?.response?.status
-      if (status !== 404) {
+      const detail = String(e?.response?.data?.detail || '')
+      if (status === 409 && detail.includes('duplicate pretrain') && !body.force_refresh) {
+        await startJob({ ...body, force_refresh: true })
+      } else if (status === 404) {
+        // legacy fallback for older backends without /api/pretrain_jobs
+        const res = await axios.post('/api/pretrain', body)
+        if (res.data?.status === 'success') {
+          toast.add({ title: t('pretrain.success'), color: 'green' })
+        } else {
+          toast.add({ title: t('pretrain.failed'), description: String(res.data?.detail || res.data?.error || ''), color: 'red' })
+        }
+      } else {
         throw e
       }
     }
-
-    const res = await axios.post('/api/pretrain', body)
-    result.value = res.data
-    if (res.data?.status === 'success') toast.add({ title: t('pretrain.success'), color: 'green' })
-    else toast.add({ title: t('pretrain.failed'), color: 'red' })
   } catch (e) {
-    console.error(e)
     const detail = e?.response?.data?.detail || e?.message || ''
-    result.value = { status: 'error', detail }
-    toast.add({ title: t('pretrain.failed'), description: detail, color: 'red' })
-  } finally {
-    if (!jobId.value) loading.value = false
+    toast.add({ title: t('pretrain.failed'), description: String(detail), color: 'red' })
   }
 }
 

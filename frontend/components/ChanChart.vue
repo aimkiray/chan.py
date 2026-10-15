@@ -33,6 +33,17 @@ const { t, currentLang } = useI18n()
 const chartDom = ref(null)
 let myChart = null
 let lastData = null
+let resizeObserver = null
+
+// Escape values interpolated into tooltip HTML (backend-provided strings like
+// data.dates are a trust boundary — ECharts renders tooltip markup as HTML).
+const _esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;'
+}[c]))
 
 const props = defineProps({
   loading: Boolean
@@ -50,20 +61,16 @@ watch(currentLang, () => {
 })
 
 onMounted(() => {
-    console.log('ChanChart mounted')
     if (chartDom.value) {
-      const resizeObserver = new ResizeObserver(entries => {
+      resizeObserver = new ResizeObserver(entries => {
         for (let entry of entries) {
-          console.log('ResizeObserver:', entry.contentRect.width, entry.contentRect.height)
           if (entry.contentRect.width > 0 && entry.contentRect.height > 0) {
             if (!myChart) {
-              console.log('Initializing chart from ResizeObserver')
               myChart = echarts.init(chartDom.value)
               if (props.loading) {
                 myChart.showLoading()
               }
               if (lastData) {
-                  console.log('Rendering pending data from ResizeObserver')
                   renderChart(lastData)
               }
             } else {
@@ -75,41 +82,38 @@ onMounted(() => {
       resizeObserver.observe(chartDom.value)
     }
   })
-  
+
   onUnmounted(() => {
-    // window.removeEventListener('resize', resizeChart) // No longer needed with ResizeObserver
-    if (myChart) myChart.dispose()
+    if (resizeObserver) {
+      resizeObserver.disconnect()
+      resizeObserver = null
+    }
+    if (myChart) {
+      myChart.dispose()
+      myChart = null
+    }
   })
-  
-  const resizeChart = () => {
-    if (myChart) myChart.resize()
-  }
-  
+
   const renderChart = (data) => {
-    console.log('renderChart called', data)
     lastData = data
-    
+
     if (!myChart) {
         // Try init again if dimensions are ready
         if (chartDom.value && chartDom.value.clientWidth > 0) {
-            console.log('Initializing chart from renderChart', chartDom.value.clientWidth, chartDom.value.clientHeight)
             myChart = echarts.init(chartDom.value)
             if (props.loading) {
               myChart.showLoading()
             }
         } else {
-            console.warn('Chart container not ready or has 0 dimensions')
             return // Still not ready
         }
-    } else {
-        console.log('Chart already initialized')
     }
     
     const dates = data.dates
   const klines = data.klines // [open, close, low, high]
   const volumes = data.volumes
 
-  // Calculate start percentage for dataZoom to show max 300 bars
+  // Calculate start percentage for dataZoom to show at most maxBars bars
   const totalBars = dates.length
   const maxBars = 200
   let startPercent = 0
@@ -234,6 +238,7 @@ onMounted(() => {
           name: 'K-Line',
           type: 'candlestick',
           data: klines,
+          sampling: 'lttb',
           itemStyle: {
               color: '#ef4444',
               color0: '#10b981',
@@ -246,9 +251,6 @@ onMounted(() => {
           type: 'bar',
           xAxisIndex: 1,
           yAxisIndex: 1,
-          large: false,
-          progressive: 0,
-          progressiveThreshold: 0,
           data: volumeBars
       },
       {
@@ -298,6 +300,7 @@ onMounted(() => {
               type: 'line',
               data: values,
               smooth: true,
+              sampling: 'lttb',
               symbol: 'none',
               lineStyle: {
                   width: 1,
@@ -311,8 +314,14 @@ onMounted(() => {
   const formatBigNumber = (v) => {
       const n = Number(v)
       if (!Number.isFinite(n)) return ''
-      if (n >= 100000000) return (n / 100000000).toFixed(2) + '亿'
-      if (n >= 10000) return (n / 10000).toFixed(2) + '万'
+      // zh uses 亿/万 divisors; en uses B/M — unit labels come from i18n keys
+      if (currentLang.value === 'zh') {
+          if (n >= 100000000) return (n / 100000000).toFixed(2) + t('chart.unitYi')
+          if (n >= 10000) return (n / 10000).toFixed(2) + t('chart.unitWan')
+      } else {
+          if (n >= 1000000000) return (n / 1000000000).toFixed(2) + t('chart.unitYi')
+          if (n >= 1000000) return (n / 1000000).toFixed(2) + t('chart.unitWan')
+      }
       return n.toFixed(2)
   }
 
@@ -338,7 +347,8 @@ onMounted(() => {
 
             const k = list.find((p) => p?.seriesName === 'K-Line')
             const idx = Number.isFinite(k?.dataIndex) ? k.dataIndex : -1
-            const dateLabel = String(list[0]?.axisValueLabel || list[0]?.axisValue || '')
+            // axisValueLabel comes from backend data.dates — escape before HTML insertion
+            const dateLabel = _esc(list[0]?.axisValueLabel || list[0]?.axisValue || '')
 
             const fmt2 = (v) => {
               const n = Number(v)
@@ -432,9 +442,9 @@ onMounted(() => {
             let gridHtml = `<div class="mt-1" style="display:grid;grid-template-columns:14px auto auto;column-gap:8px;row-gap:2px;align-items:center;">`
             
             allItems.forEach(item => {
-                const display = item.displayVal || fmt2(item.val)
-                gridHtml += `<div>${item.marker}</div>` + 
-                            `<div style="text-align:left;">${item.label}</div>` + 
+                const display = _esc(item.displayVal || fmt2(item.val))
+                gridHtml += `<div>${item.marker || ''}</div>` +
+                            `<div style="text-align:left;">${_esc(item.label)}</div>` +
                             `<div style="text-align:right;font-family:monospace;font-weight:bold;">${display}</div>`
             })
             

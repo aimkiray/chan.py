@@ -1,5 +1,5 @@
 <template>
-  <div class="h-full flex flex-col gap-4">
+  <div class="h-full flex flex-col gap-4" ref="panelRoot">
     <div v-if="!fixedMode" class="flex items-center gap-2 border-b border-gray-200 dark:border-gray-800 px-4 pt-4 pb-2">
       <UButton
         size="sm"
@@ -99,7 +99,7 @@
           </div>
         </div>
         <div v-else class="flex-1 flex items-center justify-center text-gray-400">
-          {{ t('pretrain.selectToView') }}
+          {{ t('portfolio.selectToView') }}
         </div>
       </div>
     </div>
@@ -109,12 +109,12 @@
         <div v-if="lastBacktestToShow" class="mb-4">
           <div class="flex items-center justify-between gap-2 mb-2">
             <div class="text-xs text-gray-500">
-              上一次回测结果
+              {{ t('portfolio.lastBacktestResult') }}
               <span v-if="lastBacktestToShow?.meta?.time" class="text-gray-400">· {{ lastBacktestToShow.meta.time }}</span>
               <span v-if="lastBacktestToShow?.meta?.kind" class="text-gray-400">· {{ lastBacktestToShow.meta.kind }}</span>
             </div>
             <UButton size="xs" color="gray" variant="soft" @click="showLastBacktest = !showLastBacktest">
-              {{ showLastBacktest ? '收起' : '展开' }}
+              {{ showLastBacktest ? t('portfolio.collapse') : t('portfolio.expand') }}
             </UButton>
           </div>
           <div v-if="showLastBacktest">
@@ -142,7 +142,7 @@
             <div v-if="lastBacktestTradeRows.length" class="mt-3">
               <UCard>
                 <template #header>
-                  <div class="text-xs text-gray-500">最近交易（回测）</div>
+                  <div class="text-xs text-gray-500">{{ t('portfolio.recentBacktestTrades') }}</div>
                 </template>
                 <UTable :rows="lastBacktestTradeRows" :columns="lastBacktestTradeColumns" class="w-full" :ui="{ th: { base: 'sticky top-0 bg-gray-50 dark:bg-gray-900 z-10' } }" />
               </UCard>
@@ -159,7 +159,7 @@
             {{ clickhouseHealth.host || '-' }}:{{ clickhouseHealth.port || '-' }}/{{ clickhouseHealth.database || '-' }}
           </span>
           <span v-if="clickhouseHealth?.last_error" class="text-gray-400 break-all">{{ clickhouseHealth.last_error }}</span>
-          <UButton size="xs" color="gray" variant="ghost" :loading="clickhouseHealthLoading" @click="loadClickHouseHealth">刷新</UButton>
+          <UButton size="xs" color="gray" variant="ghost" :loading="clickhouseHealthLoading" @click="loadClickHouseHealth">{{ t('strategy.refresh') }}</UButton>
         </div>
 
         <div v-if="stepError" class="mb-2 text-xs text-red-500 break-all">{{ stepError }}</div>
@@ -173,14 +173,14 @@
         <div v-if="shouldShowNoPickReason" class="mb-4">
           <UCard>
             <template #header>
-              <div class="text-xs text-gray-500">本次未选出符合条件的股票（原因）</div>
+              <div class="text-xs text-gray-500">{{ t('portfolio.noPickTitle') }}</div>
             </template>
             <div class="text-xs text-gray-600 dark:text-gray-300 space-y-1">
               <div v-for="(line, idx) in noPickReasonLines" :key="idx" class="font-mono break-all">{{ line }}</div>
               <div v-if="!noPickReasonLines.length" class="text-gray-400">-</div>
             </div>
             <div v-if="noPickTop10.length" class="mt-3">
-              <div class="text-xs text-gray-500 mb-1">Top10 候选</div>
+              <div class="text-xs text-gray-500 mb-1">{{ t('portfolio.top10Candidates') }}</div>
               <div v-for="c in noPickTop10" :key="c.code" class="text-xs font-mono">
                 {{ c.rank }}. {{ c.code }} · {{ Number(c.prob).toFixed(4) }} · {{ c.pass_min_prob ? 'pass' : 'fail' }}
                 <span v-if="c.action" class="text-gray-500"> · {{ c.action }}</span>
@@ -278,9 +278,9 @@
 
         <div v-if="stepResult?.selection_debug" class="mt-4">
           <div class="flex items-center justify-between gap-2 mb-2">
-            <div class="text-xs text-gray-500">选股调试</div>
+            <div class="text-xs text-gray-500">{{ t('portfolio.selectionDebug') }}</div>
             <UButton size="xs" color="gray" variant="soft" @click="showSelectionDebug = !showSelectionDebug">
-              {{ showSelectionDebug ? '收起' : '展开' }}
+              {{ showSelectionDebug ? t('portfolio.collapse') : t('portfolio.expand') }}
             </UButton>
           </div>
           <UCard v-if="showSelectionDebug">
@@ -290,7 +290,7 @@
             </div>
 
             <div v-if="selectionDebugCandidateAudit.length" class="mt-3">
-              <div class="text-xs text-gray-500 mb-1">候选审计</div>
+              <div class="text-xs text-gray-500 mb-1">{{ t('portfolio.candidateAudit') }}</div>
               <div class="overflow-x-auto border border-gray-200 dark:border-gray-800 rounded">
                 <table class="w-full text-xs">
                   <thead class="bg-gray-50 dark:bg-gray-900 text-gray-500">
@@ -321,7 +321,7 @@
 
             <div class="mt-3 grid grid-cols-2 gap-4">
               <div>
-                <div class="text-xs text-gray-500 mb-1">Top候选</div>
+                <div class="text-xs text-gray-500 mb-1">{{ t('portfolio.topCandidates') }}</div>
                 <div v-for="c in selectionDebugCandidatesTop" :key="c.code" class="text-xs font-mono">
                   {{ c.rank }}. {{ c.code }} · {{ Number(c.prob).toFixed(4) }} · {{ c.pass_min_prob ? 'pass' : 'fail' }}
                   <span v-if="c.selected" class="text-green-600"> · selected</span>
@@ -330,7 +330,7 @@
                 <div v-if="!selectionDebugCandidatesTop.length" class="text-xs text-gray-400">-</div>
               </div>
               <div>
-                <div class="text-xs text-gray-500 mb-1">低于minProb(最高若干)</div>
+                <div class="text-xs text-gray-500 mb-1">{{ t('portfolio.belowMinProb') }}</div>
                 <div v-for="c in selectionDebugCandidatesBelow" :key="c.code" class="text-xs font-mono">
                   {{ c.rank }}. {{ c.code }} · {{ Number(c.prob).toFixed(4) }}
                 </div>
@@ -339,14 +339,14 @@
             </div>
 
             <div v-if="selectionDebugSellReasonItems.length" class="mt-3">
-              <div class="text-xs text-gray-500 mb-1">计划卖出原因</div>
+              <div class="text-xs text-gray-500 mb-1">{{ t('portfolio.plannedSellReasons') }}</div>
               <div v-for="[k, v] in selectionDebugSellReasonItems" :key="k" class="text-xs font-mono">
                 {{ k }} · {{ v }}
               </div>
             </div>
 
             <div v-if="selectionDebugBuyReasonItems.length" class="mt-3">
-              <div class="text-xs text-gray-500 mb-1">计划买入原因</div>
+              <div class="text-xs text-gray-500 mb-1">{{ t('portfolio.plannedBuyReasons') }}</div>
               <div v-for="[k, v] in selectionDebugBuyReasonItems" :key="k" class="text-xs font-mono">
                 {{ k }} · {{ v }}
               </div>
@@ -357,6 +357,7 @@
         <div class="mt-3 space-y-3">
           <div>
             <div class="text-xs text-gray-500 mb-2">{{ t('strategy.positions') }}</div>
+            <div v-if="positionsError" class="mb-2 text-xs text-red-500 break-all">{{ positionsError }}</div>
             <UTable :rows="positions" :columns="positionColumns" class="w-full" :ui="{ th: { base: 'sticky top-0 bg-gray-50 dark:bg-gray-900 z-10' } }" />
           </div>
 
@@ -372,6 +373,7 @@
                 {{ t('strategy.pageInfo', { page: tradePage, pages: tradeTotalPages, total: tradeTotal }) }}
               </div>
             </div>
+            <div v-if="tradesError" class="mb-2 text-xs text-red-500 break-all">{{ tradesError }}</div>
             <UTable :rows="tradeHistory" :columns="tradeColumns" class="w-full" :ui="{ th: { base: 'sticky top-0 bg-gray-50 dark:bg-gray-900 z-10' } }" />
             <div v-if="tradeTotalPages > 1" class="mt-2 flex items-center justify-end gap-2 border-t border-gray-100 dark:border-gray-800 pt-2">
               <UButton
@@ -604,8 +606,12 @@ import { ref, onMounted, onBeforeUnmount, nextTick, watch, computed } from 'vue'
 import axios from 'axios'
 import * as echarts from 'echarts'
 import { useI18n } from '../composables/useI18n'
+import { stripParallelParams } from '../composables/useMarketOptions'
 
-const { t } = useI18n()
+const { t, formatTime } = useI18n()
+const toast = useToast()
+
+const errDetail = (e) => String(e?.response?.data?.detail || e?.message || e)
 
 const formatIsoDate = (d) => {
   try {
@@ -620,12 +626,8 @@ const formatIsoDate = (d) => {
   }
 }
 
-const defaultEndDate = formatIsoDate(new Date())
-const defaultStartDate = (() => {
-  const d = new Date()
-  d.setFullYear(d.getFullYear() - 3)
-  return formatIsoDate(d)
-})()
+// NOTE: backtest/paper config is supplied via props (paperConfig/paperParams
+// from SidebarContent); no local option selectors exist in this panel.
 
 const props = defineProps({
   initialMode: { type: String, default: 'portfolio' },
@@ -690,12 +692,6 @@ const runParamsText = computed(() => {
 
 // Backtest
 const backtestKind = ref('wolfpack')
-const backtestConfig = ref({
-  start_date: defaultStartDate,
-  end_date: defaultEndDate,
-  model_key: ''
-})
-const backtestLoading = ref(false)
 const vectorBacktestResult = ref(null)
 const wolfpackBacktestResult = ref(null)
 const backtestConfirmed = ref(false)
@@ -711,238 +707,32 @@ const currentBacktestResult = computed(() => {
 
 const chartContainer = ref(null)
 const equityChartContainer = ref(null)
+const panelRoot = ref(null)
+// Panels stay mounted under v-show in app.vue, so track real visibility via
+// IntersectionObserver to pause paper-mode polling while the tab is hidden.
+// Start false when IO is available — its initial callback sets the real value
+// (this avoids an eager fetch burst for panels mounted hidden).
+const panelVisible = ref(typeof IntersectionObserver === 'undefined')
 let chartInstance = null
 let equityChartInstance = null
 let liveRefreshTimer = null
+let deferredRefreshTimer = null
+let panelVisObserver = null
 
-const wolfpackConfig = ref({
-  pool_id: 'index:IDX399673',
-  start_date: defaultStartDate,
-  end_date: defaultEndDate,
-  frequency: '30m',
-  data_src: 'clickhouse',
-  autype: 'qfq',
-  enable_rolling_lookback: true,
-  holding_period: 3,
-  min_prob: 0.25,
-  trade_cost: 0.0002,
-  walk_forward_max_folds: 25,
-  rolling_sample_mode: 'bsp',
-  rolling_stride: 1,
-  portfolio_top_n: 2,
-  index_filter_enabled: true,
-  index_code: '399006',
-  index_ma_window: 20,
-  stop_loss: -0.03,
-  enforce_t1: true,
-  sell_mode: 'baseline',
-  t1_decision_time: '10:00',
-  t1_gap_strong_threshold: 0.03,
-  t1_gap_weak_threshold: -0.02,
-  t1_gap_very_strong_threshold: 0.05,
-  risk_filter_enabled: true,
-  risk_mode: 'both',
-  risk_drop_threshold: -0.03,
-  risk_flat_drop_threshold: -0.05,
-  risk_atr_window: 14,
-  risk_atr_pct_threshold: 0.04,
-  risk_flat_atr_pct_threshold: 0.06,
-  risk_gap_down_threshold: -0.015,
-  risk_intraday_enabled: true,
-  risk_intraday_bear_threshold: -0.015,
-  risk_intraday_bull_threshold: -0.03,
-  risk_trend_ma_window: 20,
-  risk_data_fail_mode: 'reduce',
-  risk_intraday_data_fail_mode: 'reduce'
-})
+const isPanelActive = () => {
+  if (typeof document !== 'undefined' && document.hidden) return false
+  return panelVisible.value
+}
+
+const refreshPaperData = () => {
+  loadRuns()
+  loadPositions()
+  loadStepLogs()
+  loadEquity()
+  loadClickHouseHealth()
+}
+
 const wolfpackLoading = ref(false)
-
-const wolfpackFrequencyOptions = computed(() => ([
-  { label: t('periods.30m'), value: '30m' },
-  { label: t('periods.60m'), value: '60m' },
-  { label: t('periods.15m'), value: '15m' },
-  { label: t('periods.5m'), value: '5m' },
-  { label: t('periods.1m'), value: '1m' },
-  { label: t('periods.1d'), value: '1d' }
-]))
-const wolfpackDataSrcOptions = computed(() => ([
-  { label: t('app.dataSrcOptions.clickhouse'), value: 'clickhouse' },
-  { label: t('app.dataSrcOptions.baostock'), value: 'baostock' }
-]))
-const wolfpackAutypeOptions = computed(() => ([
-  { label: t('sidebar.autypeQfq'), value: 'qfq' },
-  { label: t('sidebar.autypeHfq'), value: 'hfq' },
-  { label: 'None', value: 'none' }
-]))
-const riskModeOptions = computed(() => ([
-  { label: t('strategy.riskModeDrop'), value: 'drop' },
-  { label: t('strategy.riskModeAtr'), value: 'atr' },
-  { label: t('strategy.riskModeBoth'), value: 'both' }
-]))
-const riskFailModeOptions = computed(() => ([
-  { label: t('strategy.failModePass'), value: 'pass' },
-  { label: t('strategy.failModeReduce'), value: 'reduce' },
-  { label: t('strategy.failModeFlat'), value: 'flat' }
-]))
-const rollingSampleModeOptions = computed(() => ([
-  { label: t('strategy.rollingModeEveryBar'), value: 'every_bar' },
-  { label: t('strategy.rollingModeBsp'), value: 'bsp' }
-]))
-const sellModeOptions = computed(() => ([
-  { label: t('strategy.sellModeBaseline'), value: 'baseline' },
-  { label: t('strategy.sellModeDelayed'), value: 'delayed' },
-  { label: t('strategy.sellModeGapRoll'), value: 't1_gap_roll' }
-]))
-
-const poolOptions = ref([{ label: '创业板50 (50)', value: 'index:IDX399673' }])
-const indexOptions = ref([])
-const INDEX_OPTIONS_CACHE_KEY = 'mlchan_index_options_cache_v1'
-const INDEX_OPTIONS_CACHE_MAX = 200
-
-const loadIndexOptionsCache = () => {
-  try {
-    if (typeof window === 'undefined') return []
-    const raw = localStorage.getItem(INDEX_OPTIONS_CACHE_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    const cleaned = parsed
-      .map(x => ({
-        value: String(x?.value || x?.code || '').trim(),
-        label: String(x?.label || '').trim(),
-        name: String(x?.name || '').trim()
-      }))
-      .filter(x => x.value)
-      .map(x => ({
-        value: x.value,
-        name: x.name || x.value,
-        label: x.label || `${x.name || x.value} (${x.value})`
-      }))
-    return cleaned.slice(0, INDEX_OPTIONS_CACHE_MAX)
-  } catch (e) {
-    return []
-  }
-}
-
-const persistIndexOptionsCache = (items) => {
-  try {
-    if (typeof window === 'undefined') return
-    const arr = (items || [])
-      .map(x => ({
-        value: String(x?.value || '').trim(),
-        label: String(x?.label || '').trim(),
-        name: String(x?.name || '').trim()
-      }))
-      .filter(x => x.value)
-    localStorage.setItem(INDEX_OPTIONS_CACHE_KEY, JSON.stringify(arr.slice(0, INDEX_OPTIONS_CACHE_MAX)))
-  } catch (e) {
-  }
-}
-
-const ensureIndexOption = (code) => {
-  const cur = String(code || '').trim()
-  if (!cur) return
-  if ((indexOptions.value || []).find(x => x.value === cur)) return
-  indexOptions.value = [{ label: `${cur} (${cur})`, value: cur, name: cur }, ...(indexOptions.value || [])].slice(0, INDEX_OPTIONS_CACHE_MAX)
-  persistIndexOptionsCache(indexOptions.value)
-}
-
-onMounted(async () => {
-    fetchPortfolios()
-    
-    const savedIndex = localStorage.getItem('mlchan_wolfpack_index_code')
-    if (savedIndex) {
-        wolfpackConfig.value.index_code = savedIndex
-    }
-
-    const cached = loadIndexOptionsCache()
-    if (cached.length > 0) {
-        indexOptions.value = cached
-        ensureIndexOption(wolfpackConfig.value.index_code)
-        return
-    }
-
-    try {
-        const cur = savedIndex || String(wolfpackConfig.value.index_code || '').trim() || '399006'
-        
-        if (indexOptions.value.length === 0) {
-            searchingIndices.value = true
-        }
-        
-        const res = await axios.get('/api/indices', { params: { limit: 50, keyword: cur } })
-        if (res.data && res.data.items) {
-            const items = res.data.items.map(c => {
-                const code = typeof c === 'string' ? c : (c.code || '')
-                const name = typeof c === 'string' ? c : (c.name || code)
-                return { label: `${name} (${code})`, value: code, name: name }
-            })
-            indexOptions.value = items
-            persistIndexOptionsCache(items)
-            const curVal = String(cur || '').trim()
-            if (curVal && !items.find(x => x.value === curVal)) {
-                const curDigits = curVal.replace(/\D/g, '')
-                const match = (curDigits ? items.find(x => String(x.value || '').replace(/\D/g, '') === curDigits) : null)
-                    || (curDigits ? items.find(x => String(x.value || '').replace(/\D/g, '').endsWith(curDigits)) : null)
-                if (match && match.value) {
-                    wolfpackConfig.value.index_code = match.value
-                }
-            }
-
-            const hasCur = !!(wolfpackConfig.value.index_code && indexOptions.value.find(x => x.value === wolfpackConfig.value.index_code))
-            if (!hasCur && indexOptions.value.length > 0) {
-                if (!wolfpackConfig.value.index_code) {
-                    wolfpackConfig.value.index_code = items[0].value
-                }
-            }
-        }
-    } catch (e) {
-    } finally {
-        searchingIndices.value = false
-    }
-})
-
-const searchingIndices = ref(false)
-const searchIndices = async (query) => {
-    if (!query) return indexOptions.value
-    searchingIndices.value = true
-    try {
-        const res = await axios.get('/api/indices', { params: { limit: 100, keyword: query } })
-        if (res.data && res.data.items) {
-            const items = res.data.items.map(c => {
-                const code = typeof c === 'string' ? c : (c.code || '')
-                const name = typeof c === 'string' ? c : (c.name || code)
-                return { label: `${name} (${code})`, value: code, name: name }
-            })
-            const merged = [...items, ...(indexOptions.value || [])]
-            const seen = new Set()
-            const uniq = []
-            for (const it of merged) {
-              const v = String(it?.value || '').trim()
-              if (!v || seen.has(v)) continue
-              seen.add(v)
-              uniq.push(it)
-            }
-            indexOptions.value = uniq.slice(0, INDEX_OPTIONS_CACHE_MAX)
-            persistIndexOptionsCache(indexOptions.value)
-            return items
-        }
-        return []
-    } catch (e) {
-        return []
-    } finally {
-        searchingIndices.value = false
-    }
-}
-
-watch(() => wolfpackConfig.value.index_code, (val) => {
-    if (val) localStorage.setItem('mlchan_wolfpack_index_code', val)
-    ensureIndexOption(val)
-}, { deep: true })
-
-const backtestKindOptions = computed(() => ([
-  { label: t('portfolio.wolfpackBacktest'), value: 'wolfpack' },
-  { label: t('portfolio.simpleBacktest'), value: 'vector' }
-]))
 
 const paperInitialized = ref(false)
 const stepLoading = ref(false)
@@ -1091,10 +881,10 @@ const noPickReasonLines = computed(() => {
   if (riskLevel) out.push(`risk_level=${riskLevel}`)
   if (riskReason) out.push(`risk_reason=${riskReason}`)
 
-  if (Number(scanned) === 0) out.push('可能原因：股票池为空 / 数据源无数据 / 扫描阶段失败')
-  else if (Number(todaysRaw) === 0) out.push('可能原因：今日（或最近可用交易日）没有产生信号')
-  else if (Number(pass) === 0) out.push('可能原因：候选全部低于 minProb 门槛')
-  else if (String(riskLevel) === 'flat') out.push('可能原因：风控为 flat（清仓/不新开仓）')
+  if (Number(scanned) === 0) out.push(t('portfolio.reasonPoolEmpty'))
+  else if (Number(todaysRaw) === 0) out.push(t('portfolio.reasonNoSignals'))
+  else if (Number(pass) === 0) out.push(t('portfolio.reasonBelowMinProb'))
+  else if (String(riskLevel) === 'flat') out.push(t('portfolio.reasonRiskFlat'))
 
   return out
 })
@@ -1253,10 +1043,10 @@ const formatBacktestTradeRow = (x, idx) => {
   const m = typeof timeBase === 'string' ? timeBase.match(/(\d{2}:\d{2})$/) : null
   const hhmm = m?.[1] || ''
   if (hhmm) {
-    if (hhmm === '09:30') suffix = '(开盘)'
-    else if (hhmm === '15:00') suffix = '(收盘)'
+    if (hhmm === '09:30') suffix = t('portfolio.atOpen')
+    else if (hhmm === '15:00') suffix = t('portfolio.atClose')
   } else {
-    suffix = useClose ? '(收盘)' : '(开盘)'
+    suffix = useClose ? t('portfolio.atClose') : t('portfolio.atOpen')
   }
   const timeLabel = timeBase === '-' ? '-' : (suffix ? `${timeBase} ${suffix}` : timeBase)
   return {
@@ -1334,8 +1124,8 @@ const backtestTradeTables = computed(() => {
     if (!rowsRaw.length) continue
     const next = snaps[i + 1]
     const title = next?.snapshot_date
-      ? `${snap.snapshot_date} (${snap.stock_count || 0}) ~ ${next.snapshot_date} 前`
-      : `${snap.snapshot_date} (${snap.stock_count || 0})`
+      ? t('portfolio.snapshotRange', { from: snap.snapshot_date, n: snap.stock_count || 0, to: next.snapshot_date })
+      : t('portfolio.snapshotTitle', { date: snap.snapshot_date, n: snap.stock_count || 0 })
     out.push({
       key,
       title,
@@ -1410,8 +1200,8 @@ const toggleBacktestMembers = (tb) => {
 
 const backtestMembersButtonText = (tb) => {
   const codes = backtestMembersCodes(tb)
-  if (codes.length) return `成分股(${codes.length})`
-  return isBacktestMembersOpen(tb) ? '收起成分股' : '成分股(0)'
+  if (codes.length) return t('portfolio.constituents', { n: codes.length })
+  return isBacktestMembersOpen(tb) ? t('portfolio.collapseConstituents') : t('portfolio.constituents', { n: 0 })
 }
 
 const backtestTradeColumns = computed(() => ([
@@ -1432,21 +1222,13 @@ const targetByCode = computed(() => {
   return m
 })
 
+// Unix-seconds → display string, delegated to useI18n.formatTime so locale and
+// timezone follow the selected language instead of hardcoded zh-CN/Shanghai.
 const formatTs = (ts) => {
   const n = Number(ts || 0)
   if (!Number.isFinite(n) || n <= 0) return '-'
   try {
-    const dt = new Date(n * 1000)
-    return new Intl.DateTimeFormat('zh-CN', {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: false,
-      timeZone: 'Asia/Shanghai'
-    }).format(dt).replace(/\//g, '-')
+    return formatTime(new Date(n * 1000).toISOString(), { withYear: true, withSeconds: true }) || String(ts)
   } catch (e) {
     return String(ts)
   }
@@ -1525,7 +1307,7 @@ const fetchPortfolios = async () => {
     const res = await axios.get('/api/portfolios')
     portfolios.value = res.data
   } catch (e) {
-    console.error(e)
+    toast.add({ title: t('portfolio.loadFailed'), description: errDetail(e), color: 'red' })
   }
 }
 
@@ -1535,7 +1317,7 @@ const selectPortfolio = async (id) => {
     const res = await axios.get(`/api/portfolios/${id}`)
     selectedPortfolio.value = res.data
   } catch (e) {
-    console.error(e)
+    toast.add({ title: t('portfolio.loadFailed'), description: errDetail(e), color: 'red' })
   }
 }
 
@@ -1546,7 +1328,7 @@ const createPortfolio = async () => {
     newPortfolio.value = { name: '', description: '' }
     fetchPortfolios()
   } catch (e) {
-    alert(t('portfolio.createFailed'))
+    toast.add({ title: t('portfolio.createFailed'), description: errDetail(e), color: 'red' })
   }
 }
 
@@ -1560,7 +1342,7 @@ const deletePortfolio = async (id) => {
     }
     fetchPortfolios()
   } catch (e) {
-    alert(t('portfolio.deleteFailed'))
+    toast.add({ title: t('portfolio.deleteFailed'), description: errDetail(e), color: 'red' })
   }
 }
 
@@ -1577,7 +1359,7 @@ const addPosition = async () => {
     newPosition.value = { code: '', name: '', volume: 0, price: 0 }
     selectPortfolio(selectedPortfolioId.value)
   } catch (e) {
-    alert(t('portfolio.addFailed'))
+    toast.add({ title: t('portfolio.addFailed'), description: errDetail(e), color: 'red' })
   }
 }
 
@@ -1597,13 +1379,8 @@ const getColor = (val) => {
   return val > 0 ? 'text-red-500' : (val < 0 ? 'text-green-500' : '')
 }
 
-const stripParallelParams = (obj) => {
-  const out = { ...(obj && typeof obj === 'object' ? obj : {}) }
-  delete out.max_workers
-  delete out.maxWorkers
-  return out
-}
-
+// stripParallelParams is imported from composables/useMarketOptions (shared
+// with SidebarContent).
 const buildWolfpackBacktestPayload = (paperCfg, paperPrm) => {
   const cfg = paperCfg && typeof paperCfg === 'object' ? paperCfg : {}
   const prm = paperPrm && typeof paperPrm === 'object' ? paperPrm : {}
@@ -1670,13 +1447,13 @@ const runWolfpackBacktest = async () => {
   try {
     const cfg = buildWolfpackBacktestPayload(props.paperConfig, props.paperParams)
     if (cfg.start_date && cfg.end_date && String(cfg.start_date) > String(cfg.end_date)) {
-      alert(t('portfolio.dateRangeInvalid'))
+      toast.add({ title: t('portfolio.dateRangeInvalid'), color: 'red' })
       return
     }
     const res = await axios.post('/api/backtest/wolfpack', cfg)
     const data = res.data || {}
     if (String(data.status || '') !== 'success') {
-      alert(String(data.detail || data.error || t('portfolio.backtestFailed')))
+      toast.add({ title: t('portfolio.backtestFailed'), description: String(data.detail || data.error || ''), color: 'red' })
       return
     }
     const pf = data.portfolio || {}
@@ -1718,8 +1495,7 @@ const runWolfpackBacktest = async () => {
       renderChart()
     })
   } catch (e) {
-    alert(t('portfolio.backtestFailed'))
-    console.error(e)
+    toast.add({ title: t('portfolio.backtestFailed'), description: errDetail(e), color: 'red' })
   } finally {
     wolfpackLoading.value = false
   }
@@ -1794,15 +1570,17 @@ const runPaperFromBacktest = async ({ train_on_fly } = {}) => {
     emit('applyRunParams', params)
     emit('openPaper', { sim_id: sid, run_id: String(res.data?.item?.run_id || '').trim() })
   } catch (e) {
-    alert(String(e?.response?.data?.detail || e?.message || e))
+    toast.add({ title: t('app.error'), description: errDetail(e), color: 'red' })
   } finally {
     paperRunFromBacktestLoading.value = false
   }
 }
 
+const tradesError = ref('')
+const positionsError = ref('')
+
 const loadTrades = async () => {
   try {
-    const cfg = props.paperConfig || {}
     const res = await axios.get('/api/live/trades', { params: { page: tradePage.value, page_size: tradePageSize.value, sim_id: activeSimId.value, portfolio_id: activePortfolioId.value } })
 
     const items = Array.isArray(res.data?.items) ? res.data.items : []
@@ -1824,7 +1602,9 @@ const loadTrades = async () => {
         price_text: Number.isFinite(px) ? px.toFixed(4) : '-'
       }
     })
+    tradesError.value = ''
   } catch (e) {
+    tradesError.value = errDetail(e)
   } finally {
     tradePageInput.value = String(tradePage.value)
   }
@@ -1877,8 +1657,10 @@ const loadPositions = async () => {
         }
       })
 
+    positionsError.value = ''
     await loadTrades()
   } catch (e) {
+    positionsError.value = errDetail(e)
   } finally {
     positionsLoading.value = false
   }
@@ -1994,7 +1776,6 @@ const createRun = async () => {
   runsLoading.value = true
   try {
     const hadRunning = (liveRuns.value || []).some(r => String(r?.status || '').toLowerCase() === 'running')
-    const cfg = props.paperConfig || {}
     const baseSid = String(activeSimId.value || '').trim() || 'default'
     const sid = baseSid === 'default'
       ? `sim_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
@@ -2042,11 +1823,10 @@ const createRun = async () => {
     await loadStepLogs()
     await loadEquity()
     if (!!props.paperRunForm?.start && !hadRunning) {
-      setTimeout(() => {
-        loadRuns()
-        loadPositions()
-        loadStepLogs()
-        loadEquity()
+      if (deferredRefreshTimer) clearTimeout(deferredRefreshTimer)
+      deferredRefreshTimer = setTimeout(() => {
+        deferredRefreshTimer = null
+        refreshPaperData()
       }, 1500)
     }
   } catch (e) {
@@ -2119,6 +1899,7 @@ const deleteRun = async (runId) => {
         const res = await axios.get(`/api/live/runs/${rid}`)
         simId = String(res.data?.item?.sim_id || '').trim()
       } catch (e) {
+        // best-effort lookup only — deletion below is what matters
       }
     }
 
@@ -2376,6 +2157,19 @@ defineExpose({
   }
 })
 
+const startPaperPolling = () => {
+  if (liveRefreshTimer) clearInterval(liveRefreshTimer)
+  liveRefreshTimer = setInterval(() => {
+    if (!isPanelActive()) return
+    refreshPaperData()
+  }, 15000)
+}
+
+const stopPaperPolling = () => {
+  if (liveRefreshTimer) clearInterval(liveRefreshTimer)
+  liveRefreshTimer = null
+}
+
 onMounted(() => {
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
@@ -2388,25 +2182,22 @@ onMounted(() => {
   } catch (e) {
   }
   fetchPortfolios()
-  // Fetch stock pool options
-  axios.get('/api/stock_pools').then(res => {
-    if (res.data && res.data.items) {
-      poolOptions.value = res.data.items.map(p => ({
-        label: `${p.pool_name} (${p.stock_count})`,
-        value: p.pool_id
-      }))
-      if (!poolOptions.value.find(x => x.value === 'index:IDX399673')) {
-        poolOptions.value.unshift({ label: '创业板50 (50)', value: 'index:IDX399673' })
-      }
-    }
-  }).catch(() => {})
   if (typeof window !== 'undefined') {
     window.addEventListener('resize', handleResize, { passive: true })
+  }
+  // Panels stay mounted under v-show — track real visibility so polling can pause
+  if (typeof IntersectionObserver !== 'undefined' && panelRoot.value) {
+    panelVisObserver = new IntersectionObserver((entries) => {
+      const e = entries && entries[0]
+      panelVisible.value = e ? !!e.isIntersecting : true
+    })
+    panelVisObserver.observe(panelRoot.value)
   }
   watch(
     tradePage,
     () => {
       if (mode.value !== 'paper') return
+      if (!isPanelActive()) return
       loadTrades()
     },
     { immediate: false }
@@ -2419,6 +2210,7 @@ onMounted(() => {
       tradePage.value = 1
       if (!preserveSelectedRunIdOnce) selectedRunId.value = ''
       preserveSelectedRunIdOnce = false
+      if (!isPanelActive()) return
       loadPositions()
       loadRuns()
       loadStepLogs()
@@ -2433,6 +2225,7 @@ onMounted(() => {
       stepLogPage.value = 1
       tradePage.value = 1
       selectedRunId.value = ''
+      if (!isPanelActive()) return
       loadPositions()
       loadRuns()
       loadStepLogs()
@@ -2440,27 +2233,32 @@ onMounted(() => {
     },
     { immediate: false }
   )
+  // Resume work when the panel becomes visible again after being v-show hidden
+  watch(
+    panelVisible,
+    (visible) => {
+      if (!visible || mode.value !== 'paper') return
+      initPaper()
+      refreshPaperData()
+      nextTick(() => renderEquityChart())
+      startPaperPolling()
+    },
+    { immediate: false }
+  )
   watch(
     mode,
     (m) => {
       if (m === 'paper') {
+        if (!isPanelActive()) {
+          // mounted hidden under v-show — the panelVisible watcher activates it
+          return
+        }
         initPaper()
-        loadClickHouseHealth()
-        loadRuns()
-        loadStepLogs()
-        loadEquity()
+        refreshPaperData()
         nextTick(() => renderEquityChart())
-        if (liveRefreshTimer) clearInterval(liveRefreshTimer)
-        liveRefreshTimer = setInterval(() => {
-          loadRuns()
-          loadPositions()
-          loadStepLogs()
-          loadEquity()
-          loadClickHouseHealth()
-        }, 15000)
+        startPaperPolling()
       } else {
-        if (liveRefreshTimer) clearInterval(liveRefreshTimer)
-        liveRefreshTimer = null
+        stopPaperPolling()
         if (equityChartInstance) {
           equityChartInstance.dispose()
           equityChartInstance = null
@@ -2472,8 +2270,15 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
-  if (liveRefreshTimer) clearInterval(liveRefreshTimer)
-  liveRefreshTimer = null
+  stopPaperPolling()
+  if (deferredRefreshTimer) {
+    clearTimeout(deferredRefreshTimer)
+    deferredRefreshTimer = null
+  }
+  if (panelVisObserver) {
+    panelVisObserver.disconnect()
+    panelVisObserver = null
+  }
   if (typeof window !== 'undefined') {
     window.removeEventListener('resize', handleResize)
   }

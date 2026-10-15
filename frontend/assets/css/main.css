@@ -1,8 +1,11 @@
+/* Google Fonts is fetched at runtime and blocks first paint; the
+   ui-monospace stack in .app-title-pixel below is the declared fallback,
+   so offline/intranet environments degrade gracefully. */
+@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-
-@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
 
 @layer base {
   html, body, #app {

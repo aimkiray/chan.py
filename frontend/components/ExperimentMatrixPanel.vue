@@ -6,11 +6,11 @@
           <div class="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-8 gap-2 flex-1">
             <div>
               <div class="text-xs text-gray-500 mb-1">{{ t('matrix.startDate') }}</div>
-              <UInput v-model="runForm.start_date" size="xs" placeholder="2026-06-20" />
+              <UInput v-model="runForm.start_date" size="xs" type="date" />
             </div>
             <div>
               <div class="text-xs text-gray-500 mb-1">{{ t('matrix.endDate') }}</div>
-              <UInput v-model="runForm.end_date" size="xs" placeholder="2026-07-07" />
+              <UInput v-model="runForm.end_date" size="xs" type="date" />
             </div>
             <div>
               <div class="text-xs text-gray-500 mb-1">{{ t('matrix.maxDates') }}</div>
@@ -228,7 +228,7 @@ import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import axios from 'axios'
 import { useI18n } from '../composables/useI18n'
 
-const { t, formatTime } = useI18n()
+const { t, has } = useI18n()
 const toast = useToast()
 
 const MetricBox = (props) => h(
@@ -299,7 +299,10 @@ const statusColor = (status) => {
 
 const statusLabel = (status) => {
   const s = String(status || '')
-  return t(`matrix.status.${s}`) || s || '-'
+  const key = `matrix.status.${s}`
+  // t() returns the key itself for missing keys, so `|| s` would be dead code;
+  // has() is the reliable guard.
+  return has(key) ? t(key) : (s || '-')
 }
 
 const isActiveJobStatus = (status) => ['queued', 'running', 'evaluating'].includes(String(status || ''))
@@ -329,23 +332,35 @@ const fetchMatrices = async (options = {}) => {
   }
 }
 
+// Out-of-order guard: each openMatrix call gets a sequence token; only the
+// latest request may touch `detail` so a slow response for matrix A can't
+// overwrite the view after the user already selected matrix B. The spinner is
+// owned by the latest non-silent request (openMatrixLoadingSeq) so a silent
+// poll refresh neither freezes nor prematurely clears it.
+let openMatrixSeq = 0
+let openMatrixLoadingSeq = 0
 const openMatrix = async (matrixId, options = {}) => {
   if (!matrixId) return
   const silent = !!options.silent
   const preserveSelection = !!options.preserveSelection
+  const seq = ++openMatrixSeq
   selectedMatrixId.value = matrixId
-  if (!silent) detailLoading.value = true
+  if (!silent) {
+    openMatrixLoadingSeq = seq
+    detailLoading.value = true
+  }
   try {
     const res = await axios.get(`/api/experiments/matrix/${matrixId}`)
+    if (seq !== openMatrixSeq || matrixId !== selectedMatrixId.value) return
     detail.value = res.data || null
     if (!preserveSelection) selectedGroupKey.value = ''
     const firstLookahead = lookaheadOptions.value[0]?.value
     if (!selectedLookahead.value && firstLookahead !== undefined) selectedLookahead.value = firstLookahead
     startPollingIfActive(detail.value)
   } catch (e) {
-    if (!silent) toast.add({ title: t('matrix.loadFailed'), description: axiosError(e), color: 'red' })
+    if (!silent && seq === openMatrixSeq) toast.add({ title: t('matrix.loadFailed'), description: axiosError(e), color: 'red' })
   } finally {
-    if (!silent) detailLoading.value = false
+    if (!silent && seq === openMatrixLoadingSeq) detailLoading.value = false
   }
 }
 
@@ -377,6 +392,13 @@ const createPayload = () => {
 }
 
 const createMatrix = async () => {
+  const dateRe = /^\d{4}-\d{2}-\d{2}$/
+  const sd = String(runForm.value.start_date || '').trim()
+  const ed = String(runForm.value.end_date || '').trim()
+  if ((sd && !dateRe.test(sd)) || (ed && !dateRe.test(ed))) {
+    toast.add({ title: t('matrix.invalidDateFormat'), color: 'red' })
+    return
+  }
   creating.value = true
   try {
     const res = await axios.post('/api/experiments/matrix', createPayload())

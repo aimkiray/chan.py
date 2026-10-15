@@ -49,7 +49,8 @@ export const translations = {
             downloadSuccess: "下载成功",
             downloadError: "下载失败",
             strategy: "策略选股",
-            experimentMatrix: "实验矩阵"
+            experimentMatrix: "实验矩阵",
+            deleteFailed: "删除失败"
         },
         common: {
             buy: "买入",
@@ -112,6 +113,7 @@ export const translations = {
             jobDone: "任务完成",
             jobPartial: "任务部分完成",
             jobFailed: "任务失败",
+            invalidDateFormat: "日期格式应为 YYYY-MM-DD",
             status: {
                 completed: "完成",
                 success: "完成",
@@ -252,7 +254,15 @@ export const translations = {
             winRateAtThreshold: "该阈值胜率",
             avgNetProfit: "平均净收益",
             targetMet: "已达标",
-            targetNotMet: "未达标"
+            targetNotMet: "未达标",
+            ps: "P.S.",
+            splitTrain: "train",
+            splitVal: "val",
+            splitTest: "test",
+            colBin: "分桶",
+            colCount: "样本数",
+            colAvg: "预测均值",
+            colWin: "胜率"
         },
         strategy: {
             title: "策略选股",
@@ -463,7 +473,8 @@ export const translations = {
             pretrainedModelKeyPlaceholder: "留空则自动选择最新的横截面Rank逻辑回归模型",
             trainOnFly: "无预训练则在线训练",
             rankMode: "Rank模式",
-            onlyFeatures: "仅使用特征"
+            onlyFeatures: "仅使用特征",
+            poolLoadFailed: "加载股票池失败"
         },
         portfolio: {
             title: "模拟交易/回测",
@@ -535,7 +546,30 @@ export const translations = {
             simpleBacktest: "简易向量回测 (创业板50)",
             autoPlaceholder: "留空则自动选择",
             add: "添加",
-            cancel: "取消"
+            cancel: "取消",
+            selectToView: "从列表中选择一项查看详情",
+            lastBacktestResult: "上一次回测结果",
+            collapse: "收起",
+            expand: "展开",
+            recentBacktestTrades: "最近交易（回测）",
+            noPickTitle: "本次未选出符合条件的股票（原因）",
+            top10Candidates: "Top10 候选",
+            selectionDebug: "选股调试",
+            candidateAudit: "候选审计",
+            topCandidates: "Top候选",
+            belowMinProb: "低于minProb(最高若干)",
+            plannedSellReasons: "计划卖出原因",
+            plannedBuyReasons: "计划买入原因",
+            reasonPoolEmpty: "可能原因：股票池为空 / 数据源无数据 / 扫描阶段失败",
+            reasonNoSignals: "可能原因：今日（或最近可用交易日）没有产生信号",
+            reasonBelowMinProb: "可能原因：候选全部低于 minProb 门槛",
+            reasonRiskFlat: "可能原因：风控为 flat（清仓/不新开仓）",
+            atOpen: "(开盘)",
+            atClose: "(收盘)",
+            snapshotTitle: "{date} ({n})",
+            snapshotRange: "{from} ({n}) ~ {to} 前",
+            constituents: "成分股({n})",
+            collapseConstituents: "收起成分股"
         },
         signal_desc: {
             buy: {
@@ -588,7 +622,10 @@ export const translations = {
             search: "搜索",
             searchPlaceholder: "输入股票代码筛选",
             batchDelete: "批量删除",
-            batchDeleteConfirm: "确认批量删除所选记录？"
+            batchDeleteConfirm: "确认批量删除所选记录？",
+            loadFailed: "加载历史记录失败",
+            downloadTruncated: "记录过多，仅导出前 {n} 条",
+            batchDeletePartial: "部分记录删除失败"
         },
         pretrain: {
             title: "离线预训练",
@@ -679,7 +716,8 @@ export const translations = {
             deleted: "已删除",
             selectedCount: "已选 {n} 项",
             batchDelete: "批量删除",
-            batchDeleteConfirm: "确定要删除已选项吗？"
+            batchDeleteConfirm: "确定要删除已选项吗？",
+            poolLoadFailed: "加载股票池失败"
         },
         chart: {
             legend: "图例说明",
@@ -693,6 +731,12 @@ export const translations = {
             centerDesc: "价格密集重叠区域。<br/><span class='text-xs text-orange-500'>橙色矩形框。</span>",
             ma: "均线:",
             maDesc: "移动平均线 (如 MA5=5日均线)。",
+            buy: "买点:",
+            buyDesc: "缠论买入信号标记。<br/><span class='text-xs text-red-500'>红色标记=买入。</span>",
+            sell: "卖点:",
+            sellDesc: "缠论卖出信号标记。<br/><span class='text-xs text-green-600'>绿色标记=卖出。</span>",
+            unitYi: "亿",
+            unitWan: "万",
             candleTooltip: {
                 open: "开",
                 high: "高",
@@ -947,7 +991,9 @@ export const translations = {
             downloadSuccess: "Download Successful",
             downloadError: "Download Failed",
             strategy: "Stock Screener",
-            experimentMatrix: "Experiment Matrix"
+            experimentMatrix: "Experiment Matrix",
+            pretrain: "Pretrain",
+            deleteFailed: "Delete failed"
         },
         common: {
             buy: "Buy",
@@ -1010,6 +1056,7 @@ export const translations = {
             jobDone: "Job complete",
             jobPartial: "Job partially complete",
             jobFailed: "Job failed",
+            invalidDateFormat: "Date must be in YYYY-MM-DD format",
             status: {
                 completed: "Completed",
                 success: "Completed",
@@ -1150,7 +1197,15 @@ export const translations = {
             winRateAtThreshold: "Win rate",
             avgNetProfit: "Avg net profit",
             targetMet: "Target met",
-            targetNotMet: "Target not met"
+            targetNotMet: "Target not met",
+            ps: "P.S.",
+            splitTrain: "train",
+            splitVal: "val",
+            splitTest: "test",
+            colBin: "bin",
+            colCount: "n",
+            colAvg: "avg",
+            colWin: "win"
         },
         strategy: {
             title: "Strategy",
@@ -1353,7 +1408,16 @@ export const translations = {
             pretrainedModelKeyPlaceholder: "Leave empty to auto pick latest cross-sectional rank LR model",
             trainOnFly: "Train on fly if no pretrained",
             rankMode: "Rank Mode",
-            onlyFeatures: "Only Features (comma sep)"
+            onlyFeatures: "Only Features (comma sep)",
+            useAtrLabel: "Use ATR Dynamic Label Threshold",
+            atrPeriod: "ATR Period",
+            atrMult: "ATR Multiplier",
+            equity: "Equity",
+            equityCurve: "Equity Curve",
+            runOnce: "Run Once",
+            stepLog: "Rebalance Log",
+            error: "Error",
+            poolLoadFailed: "Failed to load stock pools"
         },
         portfolio: {
             title: "Simulation/Backtest",
@@ -1425,7 +1489,30 @@ export const translations = {
             simpleBacktest: "Simple Vector Backtest (ChiNext 50)",
             autoPlaceholder: "Leave empty for auto",
             add: "Add",
-            cancel: "Cancel"
+            cancel: "Cancel",
+            selectToView: "Select an item to view details",
+            lastBacktestResult: "Last backtest result",
+            collapse: "Collapse",
+            expand: "Expand",
+            recentBacktestTrades: "Recent trades (backtest)",
+            noPickTitle: "No qualifying stocks selected this run (reasons)",
+            top10Candidates: "Top 10 candidates",
+            selectionDebug: "Selection debug",
+            candidateAudit: "Candidate audit",
+            topCandidates: "Top candidates",
+            belowMinProb: "Below minProb (top few)",
+            plannedSellReasons: "Planned sell reasons",
+            plannedBuyReasons: "Planned buy reasons",
+            reasonPoolEmpty: "Possible cause: pool empty / data source has no data / scan stage failed",
+            reasonNoSignals: "Possible cause: no signals generated today (or on the latest trading day)",
+            reasonBelowMinProb: "Possible cause: all candidates below the minProb threshold",
+            reasonRiskFlat: "Possible cause: risk control is flat (close all / no new positions)",
+            atOpen: "(open)",
+            atClose: "(close)",
+            snapshotTitle: "{date} ({n})",
+            snapshotRange: "{from} ({n}) ~ before {to}",
+            constituents: "Constituents ({n})",
+            collapseConstituents: "Collapse constituents"
         },
         signal_desc: {
             buy: {
@@ -1478,7 +1565,10 @@ export const translations = {
             search: "Search",
             searchPlaceholder: "Filter by stock code",
             batchDelete: "Batch Delete",
-            batchDeleteConfirm: "Confirm batch delete selected records?"
+            batchDeleteConfirm: "Confirm batch delete selected records?",
+            loadFailed: "Failed to load history",
+            downloadTruncated: "Too many records; exported the first {n} only",
+            batchDeletePartial: "Some records failed to delete"
         },
         pretrain: {
             title: "Offline Pretraining",
@@ -1555,7 +1645,22 @@ export const translations = {
             deleted: "Deleted",
             selectedCount: "Selected {n}",
             batchDelete: "Batch Delete",
-            batchDeleteConfirm: "Delete selected items?"
+            batchDeleteConfirm: "Delete selected items?",
+            poolLoadFailed: "Failed to load stock pools",
+            back: "Back",
+            detailTitle: "Details",
+            modelName: "Model Name",
+            rename: "Rename",
+            renameTitle: "Set Model Name",
+            renamePlaceholder: "Enter a name (leave empty for default)",
+            cancel: "Cancel",
+            save: "Save",
+            renamed: "Name updated",
+            pageInfo: "Page {page}/{pages} · Total {total}",
+            prevPage: "Prev",
+            nextPage: "Next",
+            itemJobTip: "Job: a pretraining run (queued/running/failed)",
+            itemModelTip: "Model: a pretrained model that was trained and saved"
         },
         chart: {
             legend: "Legend",
@@ -1569,6 +1674,12 @@ export const translations = {
             centerDesc: "Price consolidation area.<br/><span class='text-xs text-orange-500'>Orange rectangle.</span>",
             ma: "MA:",
             maDesc: "Moving Average (e.g. MA5=5-day avg).",
+            buy: "Buy:",
+            buyDesc: "Chan buy signal marker.<br/><span class='text-xs text-red-500'>Red marker = buy.</span>",
+            sell: "Sell:",
+            sellDesc: "Chan sell signal marker.<br/><span class='text-xs text-green-600'>Green marker = sell.</span>",
+            unitYi: "B",
+            unitWan: "M",
             candleTooltip: {
                 open: "O",
                 high: "H",

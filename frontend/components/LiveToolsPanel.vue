@@ -9,10 +9,12 @@
         </template>
 
         <div class="flex items-center gap-2 border-b border-gray-200 dark:border-gray-800 pb-2">
+          <!-- decorative section label; not an actionable control -->
           <UButton
             size="sm"
             variant="solid"
             color="primary"
+            disabled
           >
             {{ t('strategy.featureScan') }}
           </UButton>
@@ -73,11 +75,12 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import axios from 'axios'
 import { useI18n } from '../composables/useI18n'
 
 const { t } = useI18n()
+const toast = useToast()
 
 const props = defineProps({
   defaultPoolId: { type: String, default: '' },
@@ -141,6 +144,7 @@ const searchStockPools = async (query) => {
     poolMap.value = next
     return items
   } catch (e) {
+    console.error('searchStockPools failed', e)
     return []
   } finally {
     searchingStockPools.value = false
@@ -233,9 +237,8 @@ onMounted(async () => {
       poolMap.value = map
     }
   } catch (e) {
+    console.error('load stock_pools failed', e)
+    toast.add({ title: t('strategy.poolLoadFailed'), description: String(e?.response?.data?.detail || e?.message || ''), color: 'red' })
   }
-})
-
-onUnmounted(() => {
 })
 </script>

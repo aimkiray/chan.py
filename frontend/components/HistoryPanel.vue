@@ -107,12 +107,14 @@ const total = ref(0)
 const searchQuery = ref('')
 const selectedResultIds = ref([])
 
+// Note: no `sortable` columns — the table is server-paginated, so UTable's
+// local sort would only reorder the current page and mislead users.
 const columns = computed(() => [
   { key: 'select', label: '', class: 'w-[36px]' },
-  { key: 'code', label: t('history.code'), sortable: true },
+  { key: 'code', label: t('history.code') },
   { key: 'frequency', label: t('history.period') },
   { key: 'model', label: t('history.model') },
-  { key: 'created_at', label: t('history.analyzeTime'), sortable: true },
+  { key: 'created_at', label: t('history.analyzeTime') },
   { key: 'data_latest_time', label: t('history.dataTime') },
   { key: 'signal', label: t('history.signal') },
   { key: 'accuracy', label: t('history.accuracy') },
@@ -178,6 +180,7 @@ const fetchHistory = async () => {
     }
   } catch (e) {
     console.error(e)
+    toast.add({ title: t('history.loadFailed'), description: String(e?.response?.data?.detail || e?.message || ''), color: 'red' })
   } finally {
     loading.value = false
   }
@@ -201,10 +204,14 @@ const downloadHistory = async () => {
   try {
     const items = []
     const pageSizeForDownload = 200
+    // Hard cap on pages pulled (50 * 200 = 10,000 rows max) to avoid an
+    // unbounded fetch loop on huge histories — same idea as the page>10
+    // breaker used elsewhere.
+    const maxDownloadPages = 50
     let currentPage = 1
     let totalCount = null
 
-    while (true) {
+    while (currentPage <= maxDownloadPages) {
       const res = await axios.get('/api/history', {
         params: { page: currentPage, page_size: pageSizeForDownload }
       })
@@ -221,6 +228,7 @@ const downloadHistory = async () => {
       if (!totalCount || items.length >= totalCount || batch.length === 0) break
       currentPage += 1
     }
+    const truncated = !!totalCount && items.length < totalCount
 
     const headers = ['id', 'code', 'frequency', 'model', 'created_at', 'data_latest_time', 'signal_type', 'is_buy', 'accuracy']
     const lines = [headers.join(',')]
@@ -240,7 +248,11 @@ const downloadHistory = async () => {
     link.remove()
     window.URL.revokeObjectURL(url)
 
-    toast.add({ title: t('app.downloadSuccess'), color: 'green' })
+    if (truncated) {
+      toast.add({ title: t('history.downloadTruncated', { n: items.length }), color: 'amber' })
+    } else {
+      toast.add({ title: t('app.downloadSuccess'), color: 'green' })
+    }
   } catch (e) {
     console.error(e)
     toast.add({ title: t('app.downloadError'), color: 'red' })
@@ -262,6 +274,7 @@ const deleteItem = async (row) => {
         fetchHistory()
     } catch (e) {
         console.error("Delete failed", e)
+        toast.add({ title: t('app.deleteFailed'), description: String(e?.response?.data?.detail || e?.message || ''), color: 'red' })
     }
 }
 
@@ -274,7 +287,11 @@ const batchDelete = async () => {
     const res = await axios.post('/api/history/batch_delete', { result_ids: ids })
     const failed = res.data?.failed || []
     if (failed.length) {
-      alert(failed.map(f => `${f.result_id}: ${f.reason || 'failed'}`).join('\n'))
+      toast.add({
+        title: t('history.batchDeletePartial'),
+        description: failed.slice(0, 10).map(f => `${f.result_id}: ${f.reason || 'failed'}`).join('\n') + (failed.length > 10 ? `\n… +${failed.length - 10}` : ''),
+        color: 'amber'
+      })
     }
     selectedResultIds.value = []
     await fetchHistory()

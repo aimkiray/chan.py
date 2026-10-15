@@ -2,6 +2,13 @@
 import { useI18n } from '../composables/useI18n'
 
 const { t } = useI18n()
+
+// Preset descriptions shown below. Must stay in sync with:
+//   1) the preset list in SidebarContent.vue (strategy presets)
+//   2) the `help.strategy.presets.*` keys in locales/translations.js
+// A preset added to SidebarContent without a matching translation key will
+// render its bare key name here.
+const STRATEGY_PRESET_KEYS = ['dealer', 'quantControl', 'practical', 'conservative', 'aggressive']
 </script>
 
 <template>
@@ -14,7 +21,15 @@ const { t } = useI18n()
         </h1>
 
         <div class="prose dark:prose-invert max-w-none space-y-12">
-          
+
+          <!--
+            v-html convention: translation strings under `help.*` are TRUSTED
+            static HTML (they may contain <strong>/<br> markup). Do NOT add
+            {param} interpolation or any runtime/user-derived content to these
+            keys — v-html + interpolated input would become stored XSS.
+            Keys that are plain text are rendered via {{ }} instead.
+          -->
+
           <!-- 1. Introduction -->
           <section id="intro" class="scroll-mt-20">
             <h2 class="text-2xl font-bold text-gray-900 dark:text-white mb-4">{{ t('help.intro.title') }}</h2>
@@ -32,7 +47,7 @@ const { t } = useI18n()
                 <div class="space-y-3 text-sm text-gray-600 dark:text-gray-300">
                   <p v-html="t('help.chan.fractal.top')"></p>
                   <p v-html="t('help.chan.fractal.bottom')"></p>
-                  <p class="text-xs text-gray-500 mt-2 pt-2 border-t border-gray-200 dark:border-gray-700" v-html="t('help.chan.fractal.note')"></p>
+                  <p class="text-xs text-gray-500 mt-2 pt-2 border-t border-gray-200 dark:border-gray-700">{{ t('help.chan.fractal.note') }}</p>
                 </div>
               </div>
 
@@ -123,19 +138,19 @@ const { t } = useI18n()
               <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div class="p-4 rounded border border-gray-100 dark:border-gray-800">
                   <div class="font-medium text-blue-600 dark:text-blue-400 mb-1" v-html="t('help.ui.sidebar.stock')"></div>
-                  <div class="text-xs text-gray-500" v-html="t('help.ui.sidebar.stockDesc')"></div>
+                  <div class="text-xs text-gray-500">{{ t('help.ui.sidebar.stockDesc') }}</div>
                 </div>
                 <div class="p-4 rounded border border-gray-100 dark:border-gray-800">
                   <div class="font-medium text-blue-600 dark:text-blue-400 mb-1" v-html="t('help.ui.sidebar.period')"></div>
-                  <div class="text-xs text-gray-500" v-html="t('help.ui.sidebar.periodDesc')"></div>
+                  <div class="text-xs text-gray-500">{{ t('help.ui.sidebar.periodDesc') }}</div>
                 </div>
                 <div class="p-4 rounded border border-gray-100 dark:border-gray-800">
                   <div class="font-medium text-blue-600 dark:text-blue-400 mb-1" v-html="t('help.ui.sidebar.model')"></div>
-                  <div class="text-xs text-gray-500" v-html="t('help.ui.sidebar.modelDesc')"></div>
+                  <div class="text-xs text-gray-500">{{ t('help.ui.sidebar.modelDesc') }}</div>
                 </div>
                 <div class="p-4 rounded border border-gray-100 dark:border-gray-800">
                   <div class="font-medium text-blue-600 dark:text-blue-400 mb-1" v-html="t('help.ui.sidebar.pretrained')"></div>
-                  <div class="text-xs text-gray-500" v-html="t('help.ui.sidebar.pretrainedDesc')"></div>
+                  <div class="text-xs text-gray-500">{{ t('help.ui.sidebar.pretrainedDesc') }}</div>
                 </div>
               </div>
             </div>
@@ -159,7 +174,7 @@ const { t } = useI18n()
             <div id="strategy-presets" class="mb-8">
               <h3 class="text-lg font-bold text-gray-800 dark:text-gray-100 mb-3">{{ t('help.strategy.presets.title') }}</h3>
               <div class="grid gap-3">
-                <div v-for="(key, idx) in ['dealer', 'quantControl', 'practical', 'conservative', 'aggressive']" :key="idx"
+                <div v-for="(key, idx) in STRATEGY_PRESET_KEYS" :key="idx"
                      class="p-3 bg-gray-50 dark:bg-gray-800 rounded border-l-4 border-blue-500">
                   <div class="text-sm text-gray-700 dark:text-gray-200" v-html="t(`help.strategy.presets.${key}`)"></div>
                 </div>
