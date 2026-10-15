@@ -2653,6 +2653,8 @@ async def list_strategy_presets(include_disabled: bool = False, status: Optional
         return {
             "schema_version": meta.get("schema_version", 1),
             "updated_at": meta.get("updated_at"),
+            "invalid_presets": meta.get("invalid_presets") or [],
+            "warnings": meta.get("warnings") or [],
             "items": strategy_preset_manager.list_presets(include_disabled=include_disabled, status=status),
         }
     except Exception as e:

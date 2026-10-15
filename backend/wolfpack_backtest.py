@@ -1,3 +1,34 @@
+"""Wolfpack multi-stock backtester.
+
+Pipeline: per-code candidate signals are computed in a ProcessPoolExecutor
+(_calc_code_candidates -> chan/BSP + model predictions), then a daily
+portfolio simulation (_simulate_universe_daily_topn) selects the top-N
+highest-probability candidates each trading day and executes at the next
+available price (same-day open, or the configured decision-time price) while
+honoring T+1, stop-loss (judged on close, executed next day), pool/index/risk
+filters and sell-side limit-down / suspension tradability checks.
+
+Timezone convention: all bar timestamps are epoch seconds; trading-day
+bucketing uses the China (UTC+8) calendar via backend.live.common helpers.
+Date-only parameters (start_date/end_date/filter_start_date) are interpreted
+as UTC+8 calendar days, independent of the host's local timezone.
+
+Hidden env knobs (all optional):
+- MLCHAN_STAMP_DUTY_SELL (default 0.001): sell-side stamp duty rate applied to
+  non-ETF-like A-share codes on every sell fill.
+- MLCHAN_MIN_KL_SIZE (default 500): minimum kline bars required per code
+  before chan/BSP analysis is attempted.
+- MLCHAN_MIN_BSP_SIZE (default 200): minimum BSP sample size required before a
+  code produces candidates.
+- MLCHAN_DESIRED_TRAIN_YEARS (default 1.0): training window in years; when
+  run()'s lookback_days is not given the fetch range is extended backwards by
+  (train_years + 3) * 365 days.
+- MLCHAN_WOLFPACK_MAX_WORKERS (default 32): hard cap on the ProcessPoolExecutor
+  fan-out inside run(). The HTTP layer additionally applies its own stricter
+  cap (main._resolve_backtest_max_workers / MLCHAN_BACKTEST_MAX_WORKERS=16)
+  before calling run(); this cap protects direct/library callers.
+"""
+
 import datetime
 import concurrent.futures
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,6 +68,15 @@ def _env_float(key, default):
     except:
         return float(default)
 
+
+# Hard cap for ProcessPoolExecutor fan-out (DoS guard): direct calls to
+# WolfpackBacktester.run() bypass main.py's _resolve_backtest_max_workers
+# (_BACKTEST_MAX_WORKERS), so enforce an in-module cap aligned with the
+# live-scan hard cap (_LIVE_SCAN_MAX_WORKERS=32). Raisable via env only for
+# trusted local runs.
+_WOLFPACK_MAX_WORKERS_CAP = max(1, _env_int("MLCHAN_WOLFPACK_MAX_WORKERS", 32))
+
+
 def _extract_6digits(code: str) -> Optional[str]:
     s = str(code or "").strip().lower()
     if not s:
@@ -73,11 +113,65 @@ def _is_cn_etf_like(code: str) -> bool:
         )
     )
 
-def _sell_fee_rate_for_code(code: str, trade_cost: float, stamp_duty_sell: float) -> float:
-    base = float(trade_cost or 0.0)
-    if _is_cn_etf_like(code):
-        return base
-    return float(base) + float(stamp_duty_sell or 0.0)
+def _sell_fee_rates(code: str, trade_cost: float, stamp_duty_sell: float) -> Tuple[float, float, float]:
+    """Return (commission_rate, stamp_rate, total_rate) for a sell fill.
+
+    Commission is the per-side trade_cost; sell stamp duty applies to
+    non-ETF-like A-share codes only. Each component is clamped to [0, 1] and
+    the summed rate to [0, 1] as well."""
+    try:
+        commission = float(trade_cost or 0.0)
+    except Exception:
+        commission = 0.0
+    try:
+        stamp = float(stamp_duty_sell or 0.0)
+    except Exception:
+        stamp = 0.0
+    commission_rate = float(max(0.0, min(1.0, float(commission))))
+    stamp_rate = 0.0 if _is_cn_etf_like(str(code)) else float(max(0.0, min(1.0, float(stamp))))
+    total_rate = float(max(0.0, min(1.0, float(commission_rate) + float(stamp_rate))))
+    return float(commission_rate), float(stamp_rate), float(total_rate)
+
+
+def _limit_rate_for_code(code: str) -> float:
+    """Approximate daily price-limit band by board: ~10% main board,
+    ~20% ChiNext (300*) / STAR (688*), ~30% BSE (8*/4*/92*)."""
+    s = str(code or "").split(".")[-1]
+    if s.startswith("300") or s.startswith("688"):
+        return 0.195
+    if s.startswith("8") or s.startswith("4") or s.startswith("92"):
+        return 0.295
+    return 0.095
+
+
+def _cn_ts_from_date_str(date_str: Optional[str]) -> Optional[int]:
+    """Parse 'YYYY-MM-DD' as a China (UTC+8) calendar day and return the epoch
+    ts of that day's 00:00 CN time — consistent with cn_day_key_from_ts
+    bucketing and independent of the host's local timezone."""
+    try:
+        d = datetime.datetime.strptime(str(date_str), "%Y-%m-%d").date()
+    except Exception:
+        return None
+    dk = int(d.year) * 10000 + int(d.month) * 100 + int(d.day)
+    return _cn_ts_from_day_min_shared(dk, 0)
+
+
+def _candidate_sort_key(r) -> Tuple[float, str, int]:
+    """Deterministic ranking for same-day candidates: probability desc, then
+    code asc, then signal ts asc as stable tie-breaks so equal-prob
+    selections are reproducible regardless of ProcessPoolExecutor
+    completion order."""
+    try:
+        p = float((r or {}).get("prob"))
+    except Exception:
+        p = float("-inf")
+    if not np.isfinite(p):
+        p = float("-inf")
+    try:
+        ts = int((r or {}).get("ts") or 0)
+    except Exception:
+        ts = 0
+    return (-p, str((r or {}).get("code") or ""), int(ts))
 
 
 def _day_key_from_ts(ts: int) -> Optional[int]:
@@ -121,116 +215,6 @@ def _prev_weekday_day_key(dk: int) -> Optional[int]:
 
 def _daily_oc_from_kl_list(kl_list, decision_min: Optional[int] = None) -> Dict[int, Dict[str, float]]:
     return _daily_oc_shared(kl_list, decision_min=decision_min)
-
-
-def _simulate_universe_daily_top1(
-    candidates: List[dict],
-    start_date: str,
-    end_date: str,
-    trade_cost: float = 0.0,
-) -> dict:
-    try:
-        tc = float(trade_cost or 0.0)
-    except Exception:
-        tc = 0.0
-
-    best_by_day: Dict[int, dict] = {}
-    for r in (candidates or []):
-        if not isinstance(r, dict):
-            continue
-        try:
-            dk = int(r.get("day") or 0)
-        except Exception:
-            dk = 0
-        if dk <= 0:
-            continue
-        cur = best_by_day.get(dk)
-        if cur is None:
-            best_by_day[dk] = r
-            continue
-        try:
-            p0 = float(cur.get("prob"))
-        except Exception:
-            p0 = float("-inf")
-        try:
-            p1 = float(r.get("prob"))
-        except Exception:
-            p1 = float("-inf")
-        if float(p1) > float(p0):
-            best_by_day[dk] = r
-
-    day_list = _date_range_days(start_date, end_date)
-    eq = 1.0
-    rets = []
-    curve = []
-    trade_count = 0
-    for dk in day_list:
-        r = best_by_day.get(dk)
-        rr = 0.0
-        code = None
-        prob = None
-        if r is not None:
-            try:
-                pr = float(r.get("profit"))
-            except Exception:
-                pr = 0.0
-            if not np.isfinite(pr):
-                pr = 0.0
-            rr = float(pr) - float(tc)
-            trade_count += 1
-            code = r.get("code")
-            try:
-                prob = float(r.get("prob"))
-            except Exception:
-                prob = None
-        rets.append(float(rr))
-        eq = float(eq) * float(1.0 + float(rr))
-        curve.append({"day": int(dk), "equity": float(eq), "r": float(rr), "code": code, "prob": prob})
-
-    win_rate = float(sum(1 for x in rets if float(x) > 0.0) / float(trade_count)) if trade_count > 0 else 0.0
-    pos_sum = float(sum([x for x in rets if float(x) > 0.0])) if rets else 0.0
-    neg_sum = float(sum([x for x in rets if float(x) < 0.0])) if rets else 0.0
-    pf = None
-    if neg_sum < 0.0:
-        pf = float(pos_sum / abs(float(neg_sum))) if abs(float(neg_sum)) > 0 else None
-
-    mean = float(sum(rets) / len(rets)) if rets else 0.0
-    std = float(np.std(np.asarray(rets, dtype=float))) if rets else 0.0
-    sharpe = float(mean / std * np.sqrt(250.0)) if std > 0.0 else 0.0
-
-    ann = None
-    if day_list and len(day_list) > 1:
-        try:
-            days = float(len(day_list))
-            ann = float((float(eq) ** (365.0 / float(days))) - 1.0)
-        except Exception:
-            ann = None
-
-    peak = 1.0
-    mdd = 0.0
-    for p in [c.get("equity") for c in curve]:
-        try:
-            v = float(p)
-        except Exception:
-            continue
-        if v > peak:
-            peak = v
-        if peak > 0:
-            dd = (peak - v) / peak
-            if dd > mdd:
-                mdd = dd
-
-    return {
-        "trade_cost": float(tc),
-        "trade_count": int(trade_count),
-        "win_rate": float(win_rate),
-        "profit_factor": pf,
-        "total_return": float(eq - 1.0),
-        "annualized_return": ann,
-        "sharpe": float(sharpe),
-        "max_drawdown": float(mdd),
-        "equity_curve": curve,
-    }
 
 
 def _load_index_filter_day_set(
@@ -296,6 +280,60 @@ def _load_index_filter_day_set(
     return allow
 
 
+def _aggregate_daily_ohlc(kl_list) -> List[dict]:
+    """Aggregate a (possibly intraday) kline list into per-CN-day OHLC records
+    sorted by day key. Day bucketing uses the UTC+8 calendar
+    (cn_day_key_from_ts); open/close come from the day's first/last bar, and
+    missing/invalid o/h/l values fall back to the bar close."""
+    by_day = {}
+    for k in (kl_list or []):
+        try:
+            ts = int(getattr(getattr(k, "time", None), "ts", 0) or 0)
+        except Exception:
+            ts = 0
+        if ts <= 0:
+            continue
+        dk = _day_key_from_ts(ts)
+        if dk is None:
+            continue
+        try:
+            o = float(getattr(k, "open", 0.0) or 0.0)
+            hi = float(getattr(k, "high", 0.0) or 0.0)
+            lo = float(getattr(k, "low", 0.0) or 0.0)
+            c = float(getattr(k, "close", 0.0) or 0.0)
+        except Exception:
+            continue
+        if c <= 0.0:
+            continue
+        if o <= 0.0:
+            o = c
+        if hi <= 0.0:
+            hi = c
+        if lo <= 0.0:
+            lo = c
+        dd = by_day.get(int(dk))
+        if dd is None:
+            by_day[int(dk)] = {
+                "day": int(dk),
+                "open": float(o),
+                "high": float(hi),
+                "low": float(lo),
+                "close": float(c),
+                "ts_first": int(ts),
+                "ts_last": int(ts),
+            }
+        else:
+            dd["high"] = float(max(float(dd["high"]), float(hi)))
+            dd["low"] = float(min(float(dd["low"]), float(lo)))
+            if int(ts) <= int(dd.get("ts_first") or 0):
+                dd["ts_first"] = int(ts)
+                dd["open"] = float(o)
+            if int(ts) >= int(dd.get("ts_last") or 0):
+                dd["ts_last"] = int(ts)
+                dd["close"] = float(c)
+    return [by_day[k] for k in sorted(by_day.keys())]
+
+
 def _load_index_risk_day_map(
     index_code: str,
     start_date: str,
@@ -331,55 +369,7 @@ def _load_index_risk_day_map(
     if not kl_list:
         return None
 
-    by_day = {}
-    for k in kl_list:
-        try:
-            ts = int(getattr(getattr(k, "time", None), "ts", 0) or 0)
-        except Exception:
-            ts = 0
-        if ts <= 0:
-            continue
-        dk = _day_key_from_ts(ts)
-        if dk is None:
-            continue
-        try:
-            hi = float(getattr(k, "high", 0.0) or 0.0)
-            lo = float(getattr(k, "low", 0.0) or 0.0)
-            c = float(getattr(k, "close", 0.0) or 0.0)
-            o = float(getattr(k, "open", 0.0) or 0.0)
-        except Exception:
-            continue
-        if c <= 0.0:
-            continue
-        if o <= 0.0:
-            o = c
-        if hi <= 0.0:
-            hi = c
-        if lo <= 0.0:
-            lo = c
-        dd = by_day.get(int(dk))
-        if dd is None:
-            dd = {
-                "day": int(dk),
-                "open": float(o),
-                "high": float(hi),
-                "low": float(lo),
-                "close": float(c),
-                "ts_first": int(ts),
-                "ts_last": int(ts),
-            }
-            by_day[int(dk)] = dd
-        else:
-            dd["high"] = float(max(float(dd["high"]), float(hi)))
-            dd["low"] = float(min(float(dd["low"]), float(lo)))
-            if int(ts) <= int(dd.get("ts_first") or 0):
-                dd["ts_first"] = int(ts)
-                dd["open"] = float(o)
-            if int(ts) >= int(dd.get("ts_last") or 0):
-                dd["ts_last"] = int(ts)
-                dd["close"] = float(c)
-
-    daily = [by_day[k] for k in sorted(by_day.keys())]
+    daily = _aggregate_daily_ohlc(kl_list)
     if len(daily) < max(5, win + 2):
         return None
 
@@ -456,53 +446,7 @@ def _load_index_daily_ohlc(
     if not kl_list:
         return []
 
-    by_day = {}
-    for k in kl_list:
-        try:
-            ts = int(getattr(getattr(k, "time", None), "ts", 0) or 0)
-        except Exception:
-            ts = 0
-        if ts <= 0:
-            continue
-        dk = _day_key_from_ts(ts)
-        if dk is None:
-            continue
-        try:
-            o = float(getattr(k, "open", 0.0) or 0.0)
-            hi = float(getattr(k, "high", 0.0) or 0.0)
-            lo = float(getattr(k, "low", 0.0) or 0.0)
-            c = float(getattr(k, "close", 0.0) or 0.0)
-        except Exception:
-            continue
-        if c <= 0.0:
-            continue
-        if o <= 0.0:
-            o = c
-        if hi <= 0.0:
-            hi = c
-        if lo <= 0.0:
-            lo = c
-        dd = by_day.get(int(dk))
-        if dd is None:
-            by_day[int(dk)] = {
-                "day": int(dk),
-                "open": float(o),
-                "high": float(hi),
-                "low": float(lo),
-                "close": float(c),
-                "ts_first": int(ts),
-                "ts_last": int(ts),
-            }
-        else:
-            dd["high"] = float(max(float(dd["high"]), float(hi)))
-            dd["low"] = float(min(float(dd["low"]), float(lo)))
-            if int(ts) <= int(dd.get("ts_first") or 0):
-                dd["ts_first"] = int(ts)
-                dd["open"] = float(o)
-            if int(ts) >= int(dd.get("ts_last") or 0):
-                dd["ts_last"] = int(ts)
-                dd["close"] = float(c)
-    return [by_day[k] for k in sorted(by_day.keys())]
+    return _aggregate_daily_ohlc(kl_list)
 
 
 def _load_index_intraday_close_series(
@@ -774,12 +718,48 @@ def _simulate_universe_daily_topn(
             return float(px0), int(trade_min)
         return None, None
 
-    def _sell_at_px(codes: List[str], dk: int, use_close: bool, reason_by_code: Optional[Dict[str, str]] = None, trade_min: Optional[int] = None) -> int:
+    def _bar_for(code: str, dk: int) -> Optional[dict]:
+        dd = (daily_oc_by_code.get(str(code)) or {}).get(int(dk))
+        return dd if isinstance(dd, dict) else None
+
+    def _sell_tradeable(code: str, dk: int) -> bool:
+        """Sell-side tradability, symmetric with the buy-side limit-up guard:
+        a stock with no bar on dk (suspension / missing data) or whose day
+        closed sealed at limit-down cannot be exited that day. daily_oc rows
+        lacking low/prev_close keys degrade to 'tradeable' (cannot tell)."""
+        dd = _bar_for(code, dk)
+        if dd is None:
+            return False
+        try:
+            lo = float(dd.get("low")) if dd.get("low") is not None else None
+        except Exception:
+            lo = None
+        try:
+            cl = float(dd.get("close")) if dd.get("close") is not None else None
+        except Exception:
+            cl = None
+        try:
+            pc = float(dd.get("prev_close")) if dd.get("prev_close") is not None else None
+        except Exception:
+            pc = None
+        if cl is None or cl <= 0.0:
+            return False
+        if pc is not None and pc > 0.0 and lo is not None and lo > 0.0:
+            rate = _limit_rate_for_code(code)
+            if float(cl) <= float(pc) * (1.0 - float(rate)) and abs(float(cl) - float(lo)) < 0.01:
+                return False
+        return True
+
+    def _sell_at_px(codes: List[str], dk: int, use_close: bool, reason_by_code: Optional[Dict[str, str]] = None, trade_min: Optional[int] = None, blocked_out: Optional[List[str]] = None) -> int:
         nonlocal cash
         sold = 0
         for code in (codes or []):
             p = positions.get(str(code))
             if not p:
+                continue
+            if not _sell_tradeable(str(code), int(dk)):
+                if blocked_out is not None:
+                    blocked_out.append(str(code))
                 continue
             px, used_trade_min = _resolve_trade_px(str(code), int(dk), trade_min)
             if used_trade_min is not None:
@@ -818,9 +798,7 @@ def _simulate_universe_daily_topn(
                 prob = 0.0
 
             gross = float(sh) * float(px)
-            commission_rate = float(max(0.0, min(1.0, float(tc))))
-            stamp_rate = 0.0 if _is_cn_etf_like(str(code)) else float(max(0.0, min(1.0, float(stamp_sell))))
-            sell_fee_rate = float(max(0.0, min(1.0, float(commission_rate) + float(stamp_rate))))
+            commission_rate, stamp_rate, sell_fee_rate = _sell_fee_rates(str(code), tc, stamp_sell)
             sell_proceeds = float(gross) * float(max(0.0, 1.0 - float(sell_fee_rate)))
             buy_cost = float(sh) * float(entry_price) * float(1.0 + float(commission_rate)) if entry_price > 0.0 else None
             pnl = float(sell_proceeds - float(buy_cost)) if buy_cost is not None else None
@@ -873,6 +851,10 @@ def _simulate_universe_daily_topn(
                 break
             code = str(r.get("code") or "").strip()
             if not code or code in positions:
+                continue
+            if _bar_for(code, int(dk)) is None:
+                # no bar today (suspension / missing data): refuse a
+                # stale-price buy filled from last_close fallback
                 continue
             px, used_trade_min = _resolve_trade_px(str(code), int(dk), trade_min)
             if used_trade_min is not None:
@@ -978,6 +960,7 @@ def _simulate_universe_daily_topn(
                     "sell_rebalance": 0,
                     "sell_planned": 0,
                     "sell_executed": 0,
+                    "sell_blocked_untradeable": 0,
                     "buy_executed": 0,
                     "positions_after": int(len(positions)),
                     "pool_allow_size": None,
@@ -1088,7 +1071,7 @@ def _simulate_universe_daily_topn(
 
         sel = []
         if bool(index_allowed) and int(day_tn) > 0:
-            rows.sort(key=lambda x: float(x.get("prob", float("-inf"))), reverse=True)
+            rows.sort(key=_candidate_sort_key)
             sel = rows[: int(day_tn)]
 
         target_rows = sel
@@ -1231,12 +1214,13 @@ def _simulate_universe_daily_topn(
 
         positions_before = int(len(positions))
         sell_executed = 0
+        sell_blocked: List[str] = []
         if sell_trade_min is not None:
-            sell_executed = _sell_at_px(sell_codes, int(dk), use_close=False, reason_by_code=reason_by_code, trade_min=sell_trade_min)
+            sell_executed = _sell_at_px(sell_codes, int(dk), use_close=False, reason_by_code=reason_by_code, trade_min=sell_trade_min, blocked_out=sell_blocked)
         else:
-            sell_executed += _sell_at_px(sell_codes, int(dk), use_close=False, reason_by_code=reason_by_code, trade_min=None)
+            sell_executed += _sell_at_px(sell_codes, int(dk), use_close=False, reason_by_code=reason_by_code, trade_min=None, blocked_out=sell_blocked)
             if sell_codes_later:
-                sell_executed += _sell_at_px(sell_codes_later, int(dk), use_close=False, reason_by_code=reason_by_code, trade_min=int(decision_min))
+                sell_executed += _sell_at_px(sell_codes_later, int(dk), use_close=False, reason_by_code=reason_by_code, trade_min=int(decision_min), blocked_out=sell_blocked)
         buy_executed = 0
         if has_targets and int(day_tn) > 0:
             open_slots = max(0, int(day_tn) - int(len(positions)))
@@ -1277,6 +1261,7 @@ def _simulate_universe_daily_topn(
                 "sell_rebalance": int(len(rebalance_out)),
                 "sell_planned": int(len(sell_codes) + len(sell_codes_later)),
                 "sell_executed": int(sell_executed),
+                "sell_blocked_untradeable": int(len(sell_blocked)),
                 "buy_executed": int(buy_executed),
                 "positions_after": int(len(positions)),
                 "pool_allow_size": allow_size,
@@ -1380,6 +1365,26 @@ def _calc_code_candidates(
     use_online_latest = bool(data_src == DATA_SRC.CLICK_HOUSE)
     kl_list = fetch_stock_data(code, level, start_date, end_date, data_src, autype=autype, use_online_latest=use_online_latest)
     daily_oc = _daily_oc_from_kl_list(kl_list, decision_min=decision_min)
+    # Annotate each day with low and prev traded-day close so the simulator
+    # can apply sell-side limit-down / no-bar tradability checks. Keys are
+    # additive: consumers that only know open/close/decision_px are unaffected.
+    try:
+        _agg_days = _aggregate_daily_ohlc(kl_list)
+        _prev_c = None
+        for _d in (_agg_days or []):
+            _dk = int((_d or {}).get("day") or 0)
+            _dd = daily_oc.get(_dk) if isinstance(daily_oc, dict) else None
+            if isinstance(_dd, dict):
+                _dd["low"] = float(_d.get("low") or 0.0)
+                _dd["prev_close"] = float(_prev_c) if _prev_c else None
+            try:
+                _c = float((_d or {}).get("close") or 0.0)
+            except Exception:
+                _c = 0.0
+            if _c > 0.0:
+                _prev_c = float(_c)
+    except Exception:
+        pass
 
     min_kl = _env_int("MLCHAN_MIN_KL_SIZE", 500)
     if not kl_list or len(kl_list) < min_kl:
@@ -1408,10 +1413,9 @@ def _calc_code_candidates(
 
     fixed_ts = None
     if filter_start_date:
-        try:
-            fixed_ts = int(datetime.datetime.strptime(str(filter_start_date), "%Y-%m-%d").timestamp())
-        except Exception:
-            fixed_ts = None
+        # UTC+8 calendar-day boundary, consistent with cn_day_key_from_ts
+        # (was local-tz datetime.timestamp() -> host-dependent)
+        fixed_ts = _cn_ts_from_date_str(filter_start_date)
 
     used_model_type = str(model_type or "").strip().lower() or "lr"
     if used_model_type in ["logistic_regression", "logreg"]:
@@ -1549,12 +1553,7 @@ def _calc_code_candidates(
                 h_px = float(getattr(k, "high", 0.0) or 0.0)
                 prev = kl_list[idx - 1]
                 p_px = float(getattr(prev, "close", 0.0) or c_px)
-                limit_rate = 0.095
-                s_code = code.split(".")[-1] if "." in code else code
-                if s_code.startswith("300") or s_code.startswith("688"):
-                    limit_rate = 0.195
-                elif s_code.startswith("8") or s_code.startswith("4") or s_code.startswith("92"):
-                    limit_rate = 0.295
+                limit_rate = _limit_rate_for_code(code)
                 if p_px > 0 and c_px >= p_px * (1.0 + limit_rate) and abs(c_px - h_px) < 0.01:
                     continue
             except Exception:
@@ -1596,8 +1595,10 @@ def _calc_code_candidates(
     
     if filter_start_date:
         try:
-            fs_ts = int(datetime.datetime.strptime(filter_start_date, "%Y-%m-%d").timestamp())
-            out = [r for r in out if r.get("ts", 0) >= fs_ts]
+            # same UTC+8 boundary convention as fixed_ts above
+            fs_ts = _cn_ts_from_date_str(filter_start_date)
+            if fs_ts is not None:
+                out = [r for r in out if int(r.get("ts") or 0) >= int(fs_ts)]
         except Exception:
             pass
 
@@ -1658,6 +1659,26 @@ class WolfpackBacktester:
         feature_preset: Optional[str] = None,
         side_filter: str = "buy",
     ) -> Dict[str, Any]:
+        """Run the wolfpack backtest.
+
+        Parameter groups:
+        - pool/data: pool_codes, start_date/end_date, frequency
+          (30m/60m/15m/5m/1m/1d), data_src (clickhouse/baostock/csv/tdx/ccxt;
+          akshare disabled), autype (qfq/hfq/none), pool_id +
+          pool_point_in_time (point-in-time constituent snapshots).
+        - signal/model: enable_rolling_lookback, rolling_sample_mode,
+          rolling_stride, min_prob, holding_period, profit_threshold,
+          walk_forward_max_folds, model, pretrained_model_key, rank_mode,
+          lookback_days, only_features, feature_preset, side_filter.
+        - portfolio/exec: portfolio_top_n, trade_cost, stop_loss, enforce_t1,
+          max_workers (clamped to [1, min(pool_size,
+          _WOLFPACK_MAX_WORKERS_CAP)]), sell_mode, t1_decision_time,
+          t1_gap_*_threshold.
+        - filters: index_filter_enabled/index_code/index_ma_window,
+          risk_filter_enabled + risk_* (risk_mode, thresholds, atr window,
+          intraday thresholds, fail modes). See module docstring for the
+          MLCHAN_* env knobs.
+        """
         pool_id = str(pool_id or "").strip() or None
         pool_point_in_time = bool(pool_point_in_time)
         side_filter = _normalize_side_filter(side_filter, default="buy")
@@ -1791,7 +1812,7 @@ class WolfpackBacktester:
             mw = int(max_workers)
         except Exception:
             mw = 8
-        mw = max(1, min(int(mw), int(len(pool_codes))))
+        mw = max(1, min(int(mw), int(len(pool_codes)), int(_WOLFPACK_MAX_WORKERS_CAP)))
 
         all_candidates = []
         per_code = {}
@@ -1971,6 +1992,15 @@ class WolfpackBacktester:
                     except Exception:
                         pass
 
+        # as_completed() yield order is nondeterministic; re-sort the merged
+        # list by (day, -prob, code, ts) so every downstream consumer sees a
+        # reproducible candidate order (the per-day top-N selection re-sorts
+        # with the same ranking via _candidate_sort_key).
+        try:
+            all_candidates.sort(key=lambda r: (int((r or {}).get("day") or 0),) + _candidate_sort_key(r))
+        except Exception:
+            pass
+
         portfolio = _simulate_universe_daily_topn(
             all_candidates,
             start_date,
@@ -2009,6 +2039,7 @@ class WolfpackBacktester:
                 "rolling_stride": int(rolling_stride) if rolling_stride is not None else 1,
                 "min_prob": float(mp),
                 "holding_period": int(holding_period),
+                "max_workers": int(mw),
                 "trade_cost": float(trade_cost or 0.0),
                 "profit_threshold": profit_threshold,
                 "walk_forward_max_folds": int(walk_forward_max_folds),

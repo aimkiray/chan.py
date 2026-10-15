@@ -1,6 +1,7 @@
 import argparse
 import contextlib
 import datetime as dt
+import hashlib
 import io
 import json
 import math
@@ -365,11 +366,18 @@ def _fit_model(train: pd.DataFrame, val: pd.DataFrame, n_jobs: int, n_estimators
 def _score_metrics(y_true, prob, threshold: float) -> Dict[str, float]:
     y_true = np.asarray(y_true).astype(int)
     prob = np.asarray(prob).astype(float)
+    # NaN probabilities must not crash the metric pass: treat them as
+    # non-up predictions and let the guarded metrics degrade to None.
+    prob = np.where(np.isfinite(prob), prob, 0.0)
     pred = (prob >= float(threshold)).astype(int)
+    try:
+        brier = float(brier_score_loss(y_true, prob)) if len(y_true) else None
+    except Exception:
+        brier = None
     out = {
         "count": int(len(y_true)),
         "accuracy": float(accuracy_score(y_true, pred)) if len(y_true) else None,
-        "brier_score": float(brier_score_loss(y_true, prob)) if len(y_true) else None,
+        "brier_score": brier,
         "actual_up_rate": float(y_true.mean()) if len(y_true) else None,
         "predicted_up_rate": float(pred.mean()) if len(y_true) else None,
         "majority_baseline_accuracy": float(max(y_true.mean(), 1.0 - y_true.mean())) if len(y_true) else None,
@@ -542,7 +550,7 @@ def predict(args) -> int:
 
     model_rows = feat[(feat["date"] < as_of) & feat["label_up"].notna()].copy()
     model_rows = model_rows.dropna(subset=["label_up"])
-    if model_rows.empty or as_of_rows.empty:
+    if model_rows.empty:
         raise RuntimeError("not enough feature rows for training or prediction")
 
     unique_dates = sorted(model_rows["date"].unique())
@@ -586,7 +594,9 @@ def predict(args) -> int:
     predictions["rank_by_prob_up"] = predictions["prob_up"].rank(method="first", ascending=False).astype(int)
     predictions = predictions.sort_values(["rank_by_confidence", "code"])
 
-    generated_at = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Microsecond component avoids collisions when two runs land in the same
+    # second (the run_id is also the on-disk directory name).
+    generated_at = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     run_id = f"mainboard_nextday_{as_of.isoformat()}_to_{target_date.isoformat()}_{generated_at}"
     base_dir = Path(args.output_dir)
     if not base_dir.is_absolute():
@@ -897,7 +907,12 @@ def predict_chan_bsp(args) -> int:
             cap = int(args.per_code_sample_cap or 0)
             if cap > 0 and len(samples) > cap:
                 samples = samples[-cap:]
+            max_total = int(getattr(args, "max_total_samples", 0) or 0)
             for info in samples:
+                if max_total > 0 and len(merged_bsp) >= max_total:
+                    # Bound resident training samples: evict the oldest entry
+                    # so merged_bsp cannot grow to pool_size x per_code_cap.
+                    merged_bsp.pop(next(iter(merged_bsp)), None)
                 merged_idx += 1
                 merged_bsp[merged_idx] = info
         if i == 1 or i % int(args.progress_every or 100) == 0 or i == len(pool):
@@ -984,8 +999,25 @@ def predict_chan_bsp(args) -> int:
             )
         predictions = predictions.sort_values(["status", "rank_by_confidence", "code"], na_position="last")
 
-    generated_at = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_id = f"mainboard_chan_bsp_{args.frequency}_{as_of.isoformat()}_to_{target_date.isoformat()}_{generated_at}"
+    # Microseconds + side/config discriminator keep run ids unique when two
+    # configurations finish in the same second.
+    generated_at = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    side = str(args.side_filter or "both")
+    disc = hashlib.md5(
+        "|".join(
+            [
+                side,
+                str(args.rolling_sample_mode or ""),
+                str(args.rolling_stride or ""),
+                str(eval_lookahead),
+                str(min_score),
+                str(bool(market_state.get("enabled"))),
+                str(market_state.get("index_code") or ""),
+                str(market_state.get("ma_window") or ""),
+            ]
+        ).encode("utf-8")
+    ).hexdigest()[:6]
+    run_id = f"mainboard_chan_bsp_{args.frequency}_{as_of.isoformat()}_to_{target_date.isoformat()}_{generated_at}_{side}_{disc}"
     base_dir = Path(args.output_dir)
     if not base_dir.is_absolute():
         base_dir = ROOT / base_dir
@@ -1147,8 +1179,21 @@ def evaluate(args) -> int:
 
     y_true = valid["actual_up"].astype(int).to_numpy()
     prob = valid["prob_up"].astype(float).to_numpy()
-    threshold = float(metadata.get("model", {}).get("threshold", 0.5))
+    # Threshold source differs per method: `predict` stores model.threshold,
+    # while chan_bsp runs accept rows by filter.min_score and carry no model
+    # threshold (falling back to 0.5 would skew accuracy vs. hit/pred_up).
+    model_meta = metadata.get("model") if isinstance(metadata.get("model"), dict) else {}
+    threshold_raw = model_meta.get("threshold")
+    if threshold_raw is None:
+        threshold_raw = filt_meta.get("min_score")
+    threshold = float(threshold_raw if threshold_raw is not None else 0.5)
     summary = _score_metrics(y_true, prob, threshold)
+    # Score accuracy on the recorded pred_up labels so the metric shares the
+    # same acceptance口径 as hit/up_prediction_accuracy regardless of which
+    # threshold produced the snapshot.
+    if len(valid):
+        summary["accuracy"] = float(valid["hit"].astype(float).mean())
+        summary["predicted_up_rate"] = float(valid["pred_up"].astype(float).mean())
     summary.update(
         {
             "run_id": metadata.get("run_id"),
@@ -1249,6 +1294,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     chan.add_argument("--rolling-stride", type=int, default=1)
     chan.add_argument("--per-code-sample-cap", type=int, default=500)
     chan.add_argument("--min-total-samples", type=int, default=2000)
+    chan.add_argument("--max-total-samples", type=int, default=200000, help="cap merged training samples kept in memory (0=unlimited); oldest entries are evicted first")
     chan.add_argument("--min-train", type=int, default=1000)
     chan.add_argument("--min-val", type=int, default=300)
     chan.add_argument("--min-test", type=int, default=1000)

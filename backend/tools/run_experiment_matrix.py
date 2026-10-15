@@ -2,6 +2,8 @@ import argparse
 import csv
 import datetime as dt
 import json
+import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -20,6 +22,17 @@ from backend.tools.daily_direction_snapshot import (  # noqa: E402
     _market_trend_filter_state,
     main as snapshot_main,
 )
+
+
+# Whitelist for matrix directory names; shared by experiment_matrix_service and
+# export_live_model_bundle so read paths cannot pick arbitrary directories.
+MATRIX_ID_RE = re.compile(r"^matrix_\d{8}_\d{6}(?:_[A-Za-z0-9_-]+)?$")
+
+# Resource guardrails for the CLI path (the API enforces its own bounds in
+# backend/main.py; these keep direct invocations from queuing unbounded work).
+MATRIX_MAX_CONFIGS = int(os.environ.get("MLCHAN_MATRIX_MAX_CONFIGS", "240") or 240)
+MATRIX_MAX_N_JOBS = int(os.environ.get("MLCHAN_MATRIX_MAX_N_JOBS", "32") or 32)
+MATRIX_MAX_LIMIT = int(os.environ.get("MLCHAN_MATRIX_MAX_LIMIT", "5000") or 5000)
 
 
 def _resolve_path(path: str) -> Path:
@@ -66,7 +79,7 @@ def _latest_matrix_dir(output_dir: str) -> Optional[Path]:
     base = _resolve_path(output_dir)
     if not base.exists():
         return None
-    items = [p for p in base.iterdir() if p.is_dir() and p.name.startswith("matrix_")]
+    items = [p for p in base.iterdir() if p.is_dir() and MATRIX_ID_RE.match(p.name)]
     if not items:
         return None
     items.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -122,6 +135,12 @@ def _load_json(path: Path) -> Dict:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _atomic_write_json(path: Path, payload: Dict) -> None:
+    tmp = path.with_name(f"{path.name}.tmp_{os.getpid()}")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _run_dirs(matrix_dir: Path) -> List[Path]:
@@ -429,17 +448,27 @@ def _run_snapshot_config(config: Dict, args, matrix_dir: Path) -> Dict:
     cmd = _snapshot_cmd(config, args, matrix_dir)
     before = set(_run_dirs(matrix_dir))
     started = time.time()
-    ret = snapshot_main(cmd)
+    error = None
+    try:
+        ret = int(snapshot_main(cmd))
+    except Exception as e:
+        # Isolate single-config failures so one bad snapshot (missing pool,
+        # DB hiccup, invalid date) does not abort the whole matrix.
+        ret = 1
+        error = str(e)
     after = set(_run_dirs(matrix_dir))
     new_dirs = sorted(list(after - before), key=lambda p: p.stat().st_mtime)
     run_dir = new_dirs[-1] if new_dirs else None
-    return {
+    record = {
         "config": dict(config),
         "return_code": int(ret),
         "elapsed_sec": round(time.time() - started, 3),
         "run_dir": str(run_dir) if run_dir else None,
         "execution_mode": "full",
     }
+    if error is not None:
+        record["error"] = error
+    return record
 
 
 def _group_grid_by_base(grid: List[Dict]) -> List[List[Dict]]:
@@ -462,24 +491,32 @@ def _execution_status(summary: Dict) -> str:
     completed = int(summary.get("completed_count") or summary.get("evaluated_count") or 0)
     effective_completed = completed + skipped_existing + dry_run
     total = int(summary.get("total_count") or summary.get("total_runs") or 0)
-    if failed > 0 and effective_completed <= 0:
-        return "error"
+    if effective_completed <= 0:
+        if failed > 0:
+            return "error"
+        if skipped > 0:
+            # Every item was skipped (e.g. evaluation target data not loaded
+            # yet): nothing failed, but nothing completed either.
+            return "not_ready"
+        return "empty"
     if failed > 0 or skipped > 0:
         return "partial"
     if total > 0 and effective_completed >= total:
         return "success"
-    if effective_completed > 0:
-        return "partial"
-    return "empty"
+    return "partial"
 
 
 def _write_execution_status(matrix_dir: Path, status: Dict) -> None:
     try:
-        status["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
-        (matrix_dir / "matrix_execution_status.json").write_text(
-            json.dumps(status, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        status_path = matrix_dir / "matrix_execution_status.json"
+        # Merge into the previous status file so a partial update (e.g. an
+        # evaluation pass) does not drop the prediction_summary or vice versa.
+        merged = _load_json(status_path)
+        if not isinstance(merged, dict):
+            merged = {}
+        merged.update(status or {})
+        merged["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
+        _atomic_write_json(status_path, merged)
     except Exception:
         pass
 
@@ -519,9 +556,12 @@ def run_predictions(args, matrix_dir: Path, grid: List[Dict]) -> Dict:
     def flush_manifest() -> None:
         summary["status"] = _execution_status(summary)
         manifest["prediction_summary"] = dict(summary)
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(manifest_path, manifest)
 
-    existing_run_map = _discover_existing_run_map(matrix_dir) if args.resume else {}
+    # Reusing a matrix dir is idempotent by default: configs matching an
+    # existing run are skipped unless --force re-runs them. --resume
+    # additionally carries prior run records into the manifest.
+    existing_run_map = {} if bool(getattr(args, "force", False)) else _discover_existing_run_map(matrix_dir)
     processed_count = 0
     groups = _group_grid_by_base(grid)
     for group in groups:
@@ -532,7 +572,7 @@ def run_predictions(args, matrix_dir: Path, grid: List[Dict]) -> Dict:
             for config in group:
                 processed_count += 1
                 key = _config_key_tuple(config)
-                if args.resume and key in existing_run_map:
+                if key in existing_run_map:
                     print(f"[{processed_count}/{len(grid)}] skip existing {config}")
                     summary["skipped_existing_count"] += 1
                     flush_manifest()
@@ -558,7 +598,7 @@ def run_predictions(args, matrix_dir: Path, grid: List[Dict]) -> Dict:
             continue
 
         base_key = _config_key_tuple(base_config)
-        base_run_dir = existing_run_map.get(base_key) if args.resume else None
+        base_run_dir = existing_run_map.get(base_key)
         processed_count += 1
         if base_run_dir is not None:
             print(f"[{processed_count}/{len(grid)}] skip existing base {base_config}")
@@ -590,7 +630,7 @@ def run_predictions(args, matrix_dir: Path, grid: List[Dict]) -> Dict:
                 continue
             processed_count += 1
             key = _config_key_tuple(config)
-            if args.resume and key in existing_run_map:
+            if key in existing_run_map:
                 print(f"[{processed_count}/{len(grid)}] skip existing derived {config}")
                 summary["skipped_existing_count"] += 1
                 flush_manifest()
@@ -680,18 +720,27 @@ def evaluate_runs(args, matrix_dir: Path) -> Dict:
             summary["skipped_count"] += 1
             summary["skipped_runs"].append({"run_dir": str(run_dir), "return_code": None, "reason": "dry_run"})
             continue
-        ret = snapshot_main(eval_args)
+        error = None
+        try:
+            ret = int(snapshot_main(eval_args))
+        except Exception as e:
+            # Isolate single-run failures so one bad run dir does not abort
+            # evaluation of the remaining runs.
+            ret = 1
+            error = str(e)
         record = {"run_dir": str(run_dir), "return_code": int(ret)}
+        if error is not None:
+            record["error"] = error
         if int(ret) == 0:
             summary["evaluated_count"] += 1
         elif int(ret) == 2:
             summary["skipped_count"] += 1
             summary["skipped_runs"].append(record)
-            print(f"  evaluation skipped/failed return_code={ret}")
+            print(f"  evaluation skipped (target data not ready) return_code={ret}")
         else:
             summary["failed_count"] += 1
             summary["failed_runs"].append(record)
-            print(f"  evaluation skipped/failed return_code={ret}")
+            print(f"  evaluation failed return_code={ret}" + (f" error={error}" if error else ""))
     summary["status"] = _execution_status(summary)
     _write_execution_status(matrix_dir, {"evaluation_summary": summary, "status": summary["status"]})
     return summary
@@ -865,29 +914,72 @@ def _max_drawdown_from_rows(items: List[Dict]) -> Optional[float]:
     return float(max_dd)
 
 
+def matrix_group_key(row: Dict) -> Tuple:
+    """Normalized grouping key shared by the matrix report and the live
+    bundle selector so both aggregate identical groups."""
+    try:
+        lookahead = int(float(row.get("profit_lookahead") or 0))
+    except Exception:
+        lookahead = 0
+    market_enabled = bool(row.get("market_filter_enabled"))
+    try:
+        market_ma = int(float(row.get("market_filter_ma") or 0)) if market_enabled else 0
+    except Exception:
+        market_ma = 0
+    return (
+        str(row.get("side_filter") or ""),
+        str(row.get("rolling_sample_mode") or ""),
+        lookahead,
+        market_enabled,
+        market_ma,
+    )
+
+
+def iter_matrix_groups(rows: List[Dict]) -> List[Tuple[Tuple, List[Dict]]]:
+    groups: Dict[Tuple, List[Dict]] = {}
+    for row in rows or []:
+        groups.setdefault(matrix_group_key(row), []).append(row)
+    return list(groups.items())
+
+
+def aggregate_matrix_group(items: List[Dict]) -> Dict:
+    """Shared per-group aggregation. Returns the common metrics plus the
+    ``evaluated`` row subset so callers (report, bundle selector) can compute
+    extra fields without re-implementing the evaluated predicate."""
+    evaluated = [r for r in items if r.get("eval_accuracy") is not None and r.get("matched_count") not in [None, ""]]
+    total_matched = sum(int(r.get("matched_count") or 0) for r in evaluated)
+    if total_matched > 0:
+        weighted_acc = sum(float(r.get("eval_accuracy") or 0.0) * int(r.get("matched_count") or 0) for r in evaluated) / total_matched
+        weighted_base = sum(float(r.get("majority_baseline_accuracy") or 0.0) * int(r.get("matched_count") or 0) for r in evaluated) / total_matched
+    else:
+        weighted_acc = None
+        weighted_base = None
+    coverages = [float(r.get("coverage")) for r in items if r.get("coverage") is not None]
+    pf, pf_inf = _profit_factor_from_items(evaluated)
+    return {
+        "evaluated": evaluated,
+        "evaluated_count": len(evaluated),
+        "total_matched": total_matched,
+        "weighted_accuracy": weighted_acc,
+        "weighted_baseline": weighted_base,
+        "weighted_accuracy_minus_baseline": (weighted_acc - weighted_base) if weighted_acc is not None and weighted_base is not None else None,
+        "avg_coverage": (sum(coverages) / len(coverages)) if coverages else None,
+        "weighted_avg_net_return": _weighted_metric(evaluated, "avg_net_return"),
+        "total_net_return": sum(float(_safe_float(r.get("total_net_return")) or 0.0) for r in evaluated) if evaluated else None,
+        "win_rate_return": _weighted_metric(evaluated, "win_rate_return"),
+        "gross_profit_sum": sum(float(_safe_float(r.get("gross_profit_sum")) or 0.0) for r in evaluated) if evaluated else 0.0,
+        "gross_loss_sum": sum(float(_safe_float(r.get("gross_loss_sum")) or 0.0) for r in evaluated) if evaluated else 0.0,
+        "profit_factor": pf,
+        "profit_factor_is_infinite": bool(pf_inf),
+        "max_drawdown": _max_drawdown_from_rows(evaluated),
+    }
+
+
 def build_group_summary(rows: List[Dict]) -> List[Dict]:
-    groups: Dict[tuple, List[Dict]] = {}
-    for row in rows:
-        key = (
-            row.get("side_filter"),
-            row.get("rolling_sample_mode"),
-            row.get("profit_lookahead"),
-            bool(row.get("market_filter_enabled")),
-            row.get("market_filter_ma") if bool(row.get("market_filter_enabled")) else 0,
-        )
-        groups.setdefault(key, []).append(row)
     out = []
-    for key, items in groups.items():
-        evaluated = [r for r in items if r.get("eval_accuracy") is not None and r.get("matched_count") not in [None, ""]]
-        total_matched = sum(int(r.get("matched_count") or 0) for r in evaluated)
-        if total_matched > 0:
-            weighted_acc = sum(float(r.get("eval_accuracy") or 0.0) * int(r.get("matched_count") or 0) for r in evaluated) / total_matched
-            weighted_base = sum(float(r.get("majority_baseline_accuracy") or 0.0) * int(r.get("matched_count") or 0) for r in evaluated) / total_matched
-        else:
-            weighted_acc = None
-            weighted_base = None
-        coverages = [float(r.get("coverage")) for r in items if r.get("coverage") is not None]
-        pf, pf_inf = _profit_factor_from_items(evaluated)
+    for key, items in iter_matrix_groups(rows):
+        agg = aggregate_matrix_group(items)
+        agg.pop("evaluated", None)
         out.append(
             {
                 "side_filter": key[0],
@@ -896,20 +988,7 @@ def build_group_summary(rows: List[Dict]) -> List[Dict]:
                 "market_filter_enabled": key[3],
                 "market_filter_ma": key[4],
                 "run_count": len(items),
-                "evaluated_count": len(evaluated),
-                "total_matched": total_matched,
-                "weighted_accuracy": weighted_acc,
-                "weighted_baseline": weighted_base,
-                "weighted_accuracy_minus_baseline": (weighted_acc - weighted_base) if weighted_acc is not None and weighted_base is not None else None,
-                "avg_coverage": (sum(coverages) / len(coverages)) if coverages else None,
-                "weighted_avg_net_return": _weighted_metric(evaluated, "avg_net_return"),
-                "total_net_return": sum(float(_safe_float(r.get("total_net_return")) or 0.0) for r in evaluated) if evaluated else None,
-                "win_rate_return": _weighted_metric(evaluated, "win_rate_return"),
-                "gross_profit_sum": sum(float(_safe_float(r.get("gross_profit_sum")) or 0.0) for r in evaluated) if evaluated else 0.0,
-                "gross_loss_sum": sum(float(_safe_float(r.get("gross_loss_sum")) or 0.0) for r in evaluated) if evaluated else 0.0,
-                "profit_factor": pf,
-                "profit_factor_is_infinite": bool(pf_inf),
-                "max_drawdown": _max_drawdown_from_rows(evaluated),
+                **agg,
             }
         )
     out.sort(
@@ -1006,6 +1085,8 @@ def run_matrix(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--output-dir", default="backend/model_cache/daily_direction_predictions")
     parser.add_argument("--matrix-dir", default=None)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--force", action="store_true", help="re-run configs even when a matching run already exists in --matrix-dir")
+    parser.add_argument("--max-configs", type=int, default=MATRIX_MAX_CONFIGS, help="abort when the resolved grid exceeds this size (0 disables)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-market-filter-derivation", action="store_true", help="disable deriving MA variants from no-market snapshots")
     parser.add_argument("--evaluate-after-predict", action="store_true")
@@ -1015,6 +1096,10 @@ def run_matrix(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--eval-lookahead", type=int, default=None)
     args = parser.parse_args(argv)
 
+    # CLI-side resource guardrails (the API clamps the same inputs in main.py).
+    args.n_jobs = max(1, min(int(args.n_jobs or 1), MATRIX_MAX_N_JOBS))
+    args.limit = max(0, min(int(args.limit or 0), MATRIX_MAX_LIMIT))
+
     load_dotenv(ROOT / ".env")
     if args.evaluate_only or args.report_only:
         matrix_dir = _matrix_dir_for_read(args)
@@ -1023,14 +1108,17 @@ def run_matrix(argv: Optional[List[str]] = None) -> int:
 
     if args.report_only:
         report_matrix(matrix_dir)
-        _write_execution_status(matrix_dir, {"status": "success", "stage": "report"})
+        # Merge a stage marker only; keep the previously computed status
+        # instead of unconditionally claiming success.
+        _write_execution_status(matrix_dir, {"stage": "report"})
         return 0
 
     if args.evaluate_only:
         eval_summary = evaluate_runs(args, matrix_dir)
         report_matrix(matrix_dir)
         status = _execution_status(eval_summary)
-        _write_execution_status(matrix_dir, {"status": status, "evaluation_summary": eval_summary})
+        # not_ready (all runs skipped, target data pending) is not a success
+        # but also not an error: keep a non-zero exit so scripts can retry.
         return 0 if status == "success" else 2
 
     client = None
@@ -1039,6 +1127,8 @@ def run_matrix(argv: Optional[List[str]] = None) -> int:
     if client is None and not args.dates:
         raise RuntimeError("ClickHouse is not available")
     grid = _build_grid(args, client)
+    if int(args.max_configs or 0) > 0 and len(grid) > int(args.max_configs):
+        raise RuntimeError(f"resolved grid has {len(grid)} configs > --max-configs={int(args.max_configs)}")
     print(f"matrix_dir={matrix_dir}")
     print(f"config_count={len(grid)}")
     pred_summary = run_predictions(args, matrix_dir, grid)
@@ -1053,6 +1143,10 @@ def run_matrix(argv: Optional[List[str]] = None) -> int:
             status = "error"
         elif status == "partial" or eval_status == "partial":
             status = "partial"
+        elif eval_status == "not_ready":
+            # Predictions completed but every evaluation was skipped
+            # (target data pending): partial rather than success/not_ready.
+            status = "partial" if status == "success" else "not_ready"
         elif status == "empty":
             status = eval_status
     _write_execution_status(

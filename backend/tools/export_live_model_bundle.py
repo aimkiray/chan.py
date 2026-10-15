@@ -4,7 +4,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -18,13 +18,20 @@ from backend.chan_service import (  # noqa: E402
     get_pretrained_model_detail_by_key,
     json_safe_value,
     list_pretrained_model_metas,
+    load_pretrained_model_bundle_by_key,
     normalize_code,
     pretrain_and_persist_model,
 )
 from backend.live.common import parse_autype, parse_data_src, parse_frequency  # noqa: E402
 from backend.storage import StorageManager  # noqa: E402
 from backend.tools.daily_direction_snapshot import _load_active_mainboard  # noqa: E402
-from backend.tools.run_experiment_matrix import build_result_rows, report_matrix  # noqa: E402
+from backend.tools.run_experiment_matrix import (  # noqa: E402
+    MATRIX_ID_RE,
+    aggregate_matrix_group,
+    build_result_rows,
+    iter_matrix_groups,
+    report_matrix,
+)
 
 
 def _resolve_path(path: str) -> Path:
@@ -36,7 +43,7 @@ def _latest_matrix_dir(output_dir: str) -> Optional[Path]:
     base = _resolve_path(output_dir)
     if not base.exists():
         return None
-    items = [p for p in base.iterdir() if p.is_dir() and p.name.startswith("matrix_")]
+    items = [p for p in base.iterdir() if p.is_dir() and MATRIX_ID_RE.match(p.name)]
     if not items:
         return None
     items.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -75,70 +82,20 @@ def _weighted_avg(rows: List[Dict], key: str, weight_key: str = "matched_count")
     return num / den
 
 
-def _profit_factor_from_rows(rows: List[Dict]) -> Tuple[Optional[float], bool]:
-    pos = 0.0
-    loss = 0.0
-    saw_inf = False
-    for row in rows or []:
-        pos += float(_safe_float(row.get("gross_profit_sum")) or 0.0)
-        loss += float(_safe_float(row.get("gross_loss_sum")) or 0.0)
-        if bool(row.get("profit_factor_is_infinite")):
-            saw_inf = True
-    if loss <= 0:
-        return (None, bool(pos > 0 or saw_inf))
-    return (pos / loss, False)
-
-
 def _profit_factor_gate_value(group: Dict) -> Optional[float]:
     if bool(group.get("profit_factor_is_infinite")):
         return float("inf")
     return _safe_float(group.get("profit_factor"))
 
 
-def _max_drawdown_from_rows(rows: List[Dict]) -> Optional[float]:
-    dated = []
-    for row in rows or []:
-        value = _safe_float(row.get("avg_net_return"))
-        if value is None:
-            continue
-        dated.append((str(row.get("as_of_date") or ""), float(value)))
-    if not dated:
-        return None
-    dated.sort(key=lambda x: x[0])
-    equity = 1.0
-    peak = 1.0
-    max_dd = 0.0
-    for _, ret in dated:
-        equity += float(ret)
-        if equity > peak:
-            peak = equity
-        if peak > 0:
-            max_dd = max(max_dd, (peak - equity) / peak)
-    return float(max_dd)
-
-
 def _group_rows(rows: List[Dict]) -> List[Dict]:
-    groups: Dict[Tuple, List[Dict]] = {}
-    for row in rows or []:
-        key = (
-            str(row.get("side_filter") or ""),
-            str(row.get("rolling_sample_mode") or ""),
-            int(float(row.get("profit_lookahead") or 0)),
-            bool(row.get("market_filter_enabled")),
-            int(float(row.get("market_filter_ma") or 0)) if bool(row.get("market_filter_enabled")) else 0,
-        )
-        groups.setdefault(key, []).append(row)
-
+    # Shares grouping key normalization and the evaluated/weighted aggregation
+    # with build_group_summary (run_experiment_matrix) so the selector cannot
+    # diverge from the report.
     out = []
-    for key, items in groups.items():
-        evaluated = [r for r in items if _safe_float(r.get("eval_accuracy")) is not None and int(float(r.get("matched_count") or 0)) > 0]
-        total_matched = sum(int(float(r.get("matched_count") or 0)) for r in evaluated)
-        weighted_accuracy = _weighted_avg(evaluated, "eval_accuracy")
-        weighted_baseline = _weighted_avg(evaluated, "majority_baseline_accuracy")
-        alpha = (weighted_accuracy - weighted_baseline) if weighted_accuracy is not None and weighted_baseline is not None else None
-        coverages = [_safe_float(r.get("coverage")) for r in items]
-        coverages = [x for x in coverages if x is not None]
-        pf, pf_inf = _profit_factor_from_rows(evaluated)
+    for key, items in iter_matrix_groups(rows):
+        agg = aggregate_matrix_group(items)
+        evaluated = agg.pop("evaluated", [])
         group = {
             "side_filter": key[0],
             "rolling_sample_mode": key[1],
@@ -146,22 +103,11 @@ def _group_rows(rows: List[Dict]) -> List[Dict]:
             "market_filter_enabled": key[3],
             "market_filter_ma": key[4],
             "run_count": len(items),
-            "evaluated_count": len(evaluated),
-            "total_matched": int(total_matched),
-            "weighted_accuracy": weighted_accuracy,
-            "weighted_baseline": weighted_baseline,
-            "weighted_accuracy_minus_baseline": alpha,
+            **agg,
             "avg_filter_auc": _weighted_avg(items, "filter_auc", weight_key="accepted_count"),
             "avg_filter_brier": _weighted_avg(items, "filter_brier", weight_key="accepted_count"),
             "avg_eval_auc": _weighted_avg(evaluated, "eval_auc"),
             "avg_eval_brier": _weighted_avg(evaluated, "eval_brier"),
-            "avg_coverage": (sum(coverages) / len(coverages)) if coverages else None,
-            "weighted_avg_net_return": _weighted_avg(evaluated, "avg_net_return"),
-            "total_net_return": sum(float(_safe_float(r.get("total_net_return")) or 0.0) for r in evaluated) if evaluated else None,
-            "win_rate_return": _weighted_avg(evaluated, "win_rate_return"),
-            "profit_factor": pf,
-            "profit_factor_is_infinite": bool(pf_inf),
-            "max_drawdown": _max_drawdown_from_rows(evaluated),
             "sample_run_dir": str((items[0] or {}).get("run_dir") or ""),
         }
         out.append(group)
@@ -336,6 +282,8 @@ def _find_trained_meta(model_key: str, bundle_path: str) -> Dict:
 
 def export_bundle(args) -> int:
     load_dotenv(ROOT / ".env")
+    if bool(args.allow_pending) and not bool(args.dry_run):
+        raise RuntimeError("--allow-pending is only supported together with --dry-run")
     matrix_dir = _resolve_path(args.matrix_dir) if args.matrix_dir else _latest_matrix_dir(args.output_dir)
     if matrix_dir is None or not matrix_dir.exists():
         raise RuntimeError("matrix directory not found")
@@ -431,10 +379,25 @@ def export_bundle(args) -> int:
     if not path:
         raise RuntimeError(str((result or {}).get("detail") or "pretrain failed"))
 
-    model_key = str((result or {}).get("model_key") or "")
+    model_key = str((result or {}).get("model_key") or "").strip()
+    if not model_key:
+        raise RuntimeError("pretrain returned no model_key; refusing to register an empty key")
+
+    # Verify the exported artifact end-to-end, mirroring the checks done by
+    # load_pretrained_model_bundle_by_key (bundle exists, cache version and
+    # key match, non-empty feature_meta) before anything is registered.
+    if not Path(str(path)).exists():
+        raise RuntimeError(f"exported bundle file is missing: {path}")
+    try:
+        bundle = load_pretrained_model_bundle_by_key(model_key)
+    except Exception as e:
+        raise RuntimeError(f"exported bundle failed load verification: {e}")
+    if not isinstance(bundle, dict):
+        raise RuntimeError("exported bundle failed verification (bundle unreadable or version/feature_meta mismatch)")
+
     trained_meta = _find_trained_meta(model_key, str(path))
     inner = trained_meta.get("meta", {}) if isinstance(trained_meta.get("meta"), dict) else {}
-    StorageManager().upsert_pretrained_model(
+    record_id = StorageManager().upsert_pretrained_model(
         model_key=model_key,
         model_type=model_type,
         frequency=freq_raw,
@@ -448,6 +411,8 @@ def export_bundle(args) -> int:
             "accuracy": inner.get("accuracy") or (result.get("accuracy") if isinstance(result, dict) else None),
         },
     )
+    if record_id is None:
+        raise RuntimeError("failed to register pretrained model in storage")
     if args.model_name:
         StorageManager().set_pretrained_model_name(model_key, str(args.model_name))
 

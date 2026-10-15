@@ -1,6 +1,12 @@
 {
   "schema_version": 1,
   "updated_at": "2026-07-07",
+  "notes": {
+    "params_scope": "params 按键名应用到请求模型（AnalyzeRequest/ValidateRequest/PretrainRequest 等）。仅部分模型含有的字段（如 topk_frac、backtest_mode、walk_forward_max_folds、rank_transform_enabled、data_length_mode）对缺该字段的请求会被跳过，并记录在 audit.skipped_unknown_params，属预期行为。",
+    "status_semantics": "status=active/experimental 参与 /api/strategy_presets/select 择优；status=guardrail 仅做风控拒绝判断（如 reject_no_trade），与 disabled/archived 一样不参与 select 候选。",
+    "gate_semantics": "gates 默认 required=true；required=false 的 gate 指标缺失或比较失败时仅记 warning，不影响 passed。",
+    "score_semantics": "select 排序使用跨候选 min-max 归一化后的 score_normalized，原始 score 仅作参考，权重绝对值不直接决定胜负。"
+  },
   "presets": [
     {
       "name": "balanced_purify_5m",

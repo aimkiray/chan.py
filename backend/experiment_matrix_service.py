@@ -1,10 +1,24 @@
+"""Service layer for experiment-matrix runs.
+
+Note on layering: this service deliberately delegates to the in-process
+entry points of ``backend.tools.run_experiment_matrix`` (``run_matrix``,
+``evaluate_runs``, ``report_matrix``) so that API-triggered matrix jobs share
+the exact same code path and artifact contract as the CLI. Moving the core
+grid/execution logic into the service and reducing the tool to a thin argv
+wrapper is a worthwhile refactor, but is intentionally left for a dedicated
+change to keep behavioral parity.
+"""
+
 import datetime
-import re
+import json
+import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from backend.tools.run_experiment_matrix import (
+    MATRIX_ID_RE,
     build_group_summary,
     build_result_rows,
     evaluate_runs,
@@ -15,7 +29,10 @@ from backend.tools.run_experiment_matrix import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MATRIX_ROOT = REPO_ROOT / "backend" / "model_cache" / "daily_direction_predictions"
-MATRIX_ID_RE = re.compile(r"^matrix_\d{8}_\d{6}(?:_[A-Za-z0-9_-]+)?$")
+# A matrix that reports "running" (fewer completed predictions than configured)
+# but whose manifest has not been touched for this long is treated as
+# interrupted (worker killed/restarted) rather than alive.
+MATRIX_STALE_SEC = float(os.environ.get("MLCHAN_MATRIX_STALE_SEC", "3600") or 3600)
 
 
 def matrix_root() -> Path:
@@ -50,7 +67,7 @@ def resolve_matrix_dir(matrix_id: str, must_exist: bool = True) -> Path:
 
 def _load_json(path: Path) -> Dict[str, Any]:
     try:
-        return __import__("json").loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
@@ -137,8 +154,24 @@ def _status_from_progress(progress: Dict[str, int]) -> str:
     return "empty"
 
 
+def _matrix_status_with_heartbeat(matrix_dir: Path, manifest_path: Path, progress: Dict[str, int]) -> str:
+    status = _status_from_progress(progress)
+    if status != "running":
+        return status
+    # The manifest is flushed after every config; if it has not been touched
+    # for MATRIX_STALE_SEC the producing worker is most likely gone.
+    try:
+        mtime = manifest_path.stat().st_mtime if manifest_path.exists() else matrix_dir.stat().st_mtime
+    except Exception:
+        mtime = None
+    if mtime is not None and (time.time() - float(mtime)) > MATRIX_STALE_SEC:
+        return "interrupted"
+    return status
+
+
 def matrix_summary(matrix_dir: Path) -> Dict[str, Any]:
-    manifest = _load_json(matrix_dir / "matrix_manifest.json")
+    manifest_path = matrix_dir / "matrix_manifest.json"
+    manifest = _load_json(manifest_path)
     rows = build_result_rows(matrix_dir)
     progress = _progress(rows, manifest)
     params = _matrix_parameters(rows, manifest)
@@ -154,7 +187,7 @@ def matrix_summary(matrix_dir: Path) -> Dict[str, Any]:
         "generated_at": generated_at,
         "start_date": min(dates) if dates else None,
         "end_date": max(dates) if dates else None,
-        "status": _status_from_progress(progress),
+        "status": _matrix_status_with_heartbeat(matrix_dir, manifest_path, progress),
         "progress": progress,
         "parameters": params,
     }
@@ -259,6 +292,22 @@ def rebuild_matrix_report(matrix_id: str) -> Dict[str, Any]:
     return matrix_detail(matrix_id, refresh_report=True)
 
 
+def _execution_for_job(execution: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize the persisted execution status for job consumers.
+
+    The tool writes ``not_ready`` when an evaluation pass skipped every run
+    (target-date data not loaded yet). Surface it as ``pending_evaluation``,
+    the status name the matrix API/frontend already understands, and pin
+    ``return_code`` so the job-level status mapping in ``main.py`` does not
+    silently report such runs as success.
+    """
+    out = dict(execution) if isinstance(execution, dict) else {}
+    if str(out.get("status") or "") == "not_ready":
+        out["status"] = "pending_evaluation"
+        out["return_code"] = 2
+    return out
+
+
 def evaluate_matrix(matrix_id: str, target_date: Optional[str] = None, eval_lookahead: Optional[int] = None) -> Dict[str, Any]:
     matrix_dir = resolve_matrix_dir(matrix_id)
     args = SimpleNamespace(target_date=target_date, eval_lookahead=eval_lookahead, dry_run=False)
@@ -267,18 +316,39 @@ def evaluate_matrix(matrix_id: str, target_date: Optional[str] = None, eval_look
     execution = _load_json(matrix_dir / "matrix_execution_status.json")
     if not execution:
         execution = {"status": eval_summary.get("status"), "evaluation_summary": eval_summary}
-    return {"detail": matrix_detail(matrix_id), "execution": execution}
+    return {"detail": matrix_detail(matrix_id), "execution": _execution_for_job(execution)}
 
 
 def _matrix_dir_from_argv(argv: List[str]) -> Optional[Path]:
+    """Extract --matrix-dir from argv (both ``--matrix-dir X`` and
+    ``--matrix-dir=X`` forms). Only whitelisted matrix dirs under
+    ``matrix_root()`` are trusted for status-file reads; anything else is
+    ignored so a crafted argv cannot point the service at arbitrary paths.
+    """
     items = list(argv or [])
+    value: Optional[str] = None
     for idx, item in enumerate(items):
-        if str(item) == "--matrix-dir" and idx + 1 < len(items):
-            try:
-                return Path(str(items[idx + 1]))
-            except Exception:
-                return None
-    return None
+        item = str(item)
+        if item == "--matrix-dir" and idx + 1 < len(items):
+            value = str(items[idx + 1])
+        elif item.startswith("--matrix-dir="):
+            value = item.split("=", 1)[1]
+    if not value:
+        return None
+    try:
+        path = Path(value)
+    except Exception:
+        return None
+    if not MATRIX_ID_RE.match(path.name):
+        return None
+    try:
+        root = matrix_root().resolve()
+        resolved = path.resolve()
+        if root not in [resolved, *resolved.parents]:
+            return None
+    except Exception:
+        return None
+    return path
 
 
 def run_matrix_with_args(argv: List[str]) -> Dict[str, Any]:
@@ -287,7 +357,12 @@ def run_matrix_with_args(argv: List[str]) -> Dict[str, Any]:
     execution = {}
     if matrix_dir is not None:
         execution = _load_json(matrix_dir / "matrix_execution_status.json")
+    # ``_load_json`` returns whatever JSON was persisted; a non-dict payload
+    # (e.g. a JSON list) is truthy and would explode on the item assignment
+    # below, so normalize to a dict before touching ``return_code``.
+    if not isinstance(execution, dict):
+        execution = {}
     if not execution:
         execution = {"status": "success" if ret == 0 else "error"}
     execution["return_code"] = ret
-    return execution
+    return _execution_for_job(execution)

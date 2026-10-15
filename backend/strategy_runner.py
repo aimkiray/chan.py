@@ -2,6 +2,8 @@ import json
 import datetime
 import traceback
 import asyncio
+import contextlib
+import io
 import baostock as bs
 import concurrent.futures
 import os
@@ -160,22 +162,68 @@ def _profit_filter_check(
     return len(failures) == 0, metrics, failures
 
 def get_hs300_stocks() -> List[str]:
-    try:
-        lg = bs.login()
-        if lg.error_code != '0':
-            print(f"login respond error_code:{lg.error_code}")
+    # baostock's SDK drives one process-global socket/session (see
+    # DataAPI.BaoStockAPI.CBaoStock): login -> query -> paginate -> logout must
+    # be serialized via the shared _conn_lock, because the strategy task
+    # workers (default 2 threads) can call this concurrently and would
+    # otherwise interleave on the same socket / kick each other's session off.
+    from DataAPI.BaoStockAPI import CBaoStock
+    with CBaoStock._conn_lock:
+        try:
+            # bs.login()/logout() print status lines; swallow them with a
+            # scoped redirect_stdout while holding the session lock (same
+            # convention as chan_service.download_stock_history).
+            with contextlib.redirect_stdout(io.StringIO()):
+                lg = bs.login()
+            # login() returns a truthy ResultData even on failure; only
+            # error_code == '0' counts as a logged-in session.
+            if lg is None or getattr(lg, "error_code", None) != '0':
+                print(f"login respond error_code:{getattr(lg, 'error_code', lg)}")
+                return []
+            rs = bs.query_hs300_stocks()
+            hs300_stocks = []
+            while (rs.error_code == '0') & rs.next():
+                # [updateDate, code, code_name]
+                # code format: sh.600000
+                hs300_stocks.append(rs.get_row_data()[1])
+            if getattr(rs, "error_code", None) != '0':
+                # Pagination hit a server-side error mid-stream; a truncated
+                # list must not masquerade as the full HS300 constituents.
+                print(f"query_hs300_stocks failed mid-pagination: {getattr(rs, 'error_msg', '')}")
+                return []
+            return hs300_stocks
+        except Exception as e:
+            print(f"Error getting HS300 stocks: {e}")
             return []
-        rs = bs.query_hs300_stocks()
-        hs300_stocks = []
-        while (rs.error_code == '0') & rs.next():
-            # [updateDate, code, code_name]
-            # code format: sh.600000
-            hs300_stocks.append(rs.get_row_data()[1])
-        bs.logout()
-        return hs300_stocks
-    except Exception as e:
-        print(f"Error getting HS300 stocks: {e}")
-        return []
+        finally:
+            # logout always runs — a query exception must not leave the raw
+            # login session dangling.
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    bs.logout()
+            except Exception:
+                pass
+            # This function terminates the shared session; flag it so the
+            # next CBaoStock use re-logins instead of trusting a dead one.
+            try:
+                CBaoStock.is_connect = False
+            except Exception:
+                pass
+
+
+def _strategy_result_sort_key(r):
+    """Deterministic result ordering: score desc (signal_score preferred,
+    accuracy as fallback), then code asc. Dicts without any score sort last."""
+    code = ""
+    score = None
+    if isinstance(r, dict):
+        code = str(r.get("code") or "")
+        for k in ("signal_score", "accuracy"):
+            v = _finite_float_or_none(r.get(k))
+            if v is not None:
+                score = v
+                break
+    return (0 if score is not None else 1, -float(score or 0.0), code)
 
 def _process_single_stock_strategy(
     code: str,
@@ -670,6 +718,36 @@ def _process_single_stock_strategy(
             pass
 
         info = accuracy_info if isinstance(accuracy_info, dict) else {}
+        # The portfolio block filters predictions on `is_buy`, but only
+        # walk_forward results carry it — time_split predictions have just
+        # ts/prob/label/profit (compare chan_service's two `predictions`
+        # emitters). Forcing walk_forward when need_predictions is set is not
+        # viable: it needs ~1400+ samples per stock, far beyond typical BSP
+        # counts here, so every stock would degrade to
+        # walk_forward_insufficient_data. Backfill `is_buy` instead by
+        # matching each prediction's ts to the sample's open_time.ts in
+        # bsp_dict — the same infos train_time_split_backtest consumed.
+        if need_predictions and isinstance(info.get("predictions"), list):
+            try:
+                ts2buy = {}
+                for v in (bsp_dict or {}).values():
+                    if not isinstance(v, dict):
+                        continue
+                    try:
+                        ts = int(getattr(v.get("open_time"), "ts", 0) or 0)
+                    except Exception:
+                        ts = 0
+                    if ts > 0:
+                        ts2buy[ts] = bool(v.get("is_buy"))
+                for p in info["predictions"]:
+                    if isinstance(p, dict) and "is_buy" not in p:
+                        try:
+                            pts = int(p.get("ts") or 0)
+                        except Exception:
+                            pts = 0
+                        p["is_buy"] = bool(ts2buy.get(pts, False))
+            except Exception:
+                pass
         info = json_safe_value(info) if isinstance(info, dict) else {}
         info["daily_oc"] = daily_oc
         return code, result, len(bsp_dict), current_accuracy, method, info
@@ -697,6 +775,22 @@ class StrategyRunner:
     def _update_progress(self, run_id: int, processed: int, total: int, status: str = "running", result_json: str = None, result_count: int = None):
         session = self.storage.Session()
         try:
+            # Read-modify-write: the `status != "canceled"` gate below reads
+            # the row, then writes. A concurrent cancel/stop commit landing
+            # between the SELECT and our commit would be silently overwritten
+            # (lost update) under pysqlite's deferred transactions. Opening
+            # the txn as BEGIN IMMEDIATE takes the write lock up front and
+            # serializes the whole gate-read + write (see
+            # StorageManager._begin_immediate); cancel then either commits
+            # first (we see "canceled" and keep it) or waits and lands after.
+            begin = getattr(self.storage, "_begin_immediate", None)
+            if callable(begin):
+                try:
+                    begin(session)
+                except Exception:
+                    # Progress writes are best-effort; fall back to the
+                    # unguarded path rather than dropping the update.
+                    pass
             run = session.query(StrategyRun).filter(StrategyRun.id == run_id).first()
             if run:
                 run.processed_stocks = processed
@@ -720,6 +814,11 @@ class StrategyRunner:
             session.close()
 
     def run_strategy_sync(self, run_id: int, params: Dict[str, Any]):
+        # Hoisted so the failure path can persist partial progress/results
+        # instead of resetting the run to 0/0 with no output.
+        results = []
+        processed = 0
+        stocks = []
         try:
             if self._is_run_canceled(run_id):
                 return
@@ -951,17 +1050,28 @@ class StrategyRunner:
             stocks = uniq
 
             if pool_id:
-                print(f"Fetching stocks for pool_id: {pool_id}")
-                if not stocks:
-                    stocks = CClickHouseAPI.get_pool_members(pool_id)
-                    print(f"Got {len(stocks)} stocks from pool {pool_id}")
-            
+                if str(pool_id).strip().lower() == "hs300":
+                    # 'hs300' is the frontend's HS300 selector value, not a
+                    # ClickHouse pool — let the scope fallback below resolve it
+                    # via baostock instead of a pointless pool_members query.
+                    pass
+                else:
+                    print(f"Fetching stocks for pool_id: {pool_id}")
+                    if not stocks:
+                        stocks = CClickHouseAPI.get_pool_members(pool_id)
+                        print(f"Got {len(stocks)} stocks from pool {pool_id}")
+
             if not stocks:
-                if scope == 'hs300':
+                scope_norm = str(scope or "").strip().lower()
+                if scope_norm in ("", "hs300"):
                     stocks = get_hs300_stocks()
                 else:
-                    # Fallback or other scopes
-                    stocks = get_hs300_stocks()
+                    # Unknown scope: fail explicitly. The old code fell back
+                    # to get_hs300_stocks() for every non-'hs300' value, which
+                    # made the scope parameter silently meaningless.
+                    print(f"[Strategy] unsupported scope={scope!r}; supported scopes: 'hs300' (or provide codes/manual_codes/pool_id)")
+                    self._update_progress(run_id, 0, 0, "failed")
+                    return
             
             if not stocks:
                 self._update_progress(run_id, 0, 0, "failed")
@@ -1064,12 +1174,13 @@ class StrategyRunner:
             print(f"Starting strategy execution with {max_workers} workers for {len(stocks)} stocks.")
 
             executor = concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
+            cancelled = False
+            loop_finished = False
             try:
                 active_futures = set()
                 stock_iter = iter(stocks)
                 future_to_code = {}
                 target_active = max_workers * 2
-                cancelled = False
 
                 def submit_next():
                     try:
@@ -1122,11 +1233,17 @@ class StrategyRunner:
                         break
 
                 while active_futures:
-                    if processed % 5 == 0 and self._is_run_canceled(run_id):
+                    # Poll cancellation every wait round (~1s), not only when
+                    # processed % 5 == 0 — a single slow stock used to delay a
+                    # cancel by minutes.
+                    done, _ = concurrent.futures.wait(
+                        active_futures,
+                        timeout=1.0,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    if self._is_run_canceled(run_id):
                         cancelled = True
                         break
-
-                    done, _ = concurrent.futures.wait(active_futures, return_when=concurrent.futures.FIRST_COMPLETED)
 
                     for future in done:
                         active_futures.remove(future)
@@ -1156,7 +1273,7 @@ class StrategyRunner:
                                 print(f"Exception in worker: {e}")
                             traceback.print_exc()
 
-                        if processed % 5 == 0 and self._is_run_canceled(run_id):
+                        if self._is_run_canceled(run_id):
                             cancelled = True
                             break
 
@@ -1164,14 +1281,25 @@ class StrategyRunner:
 
                     if cancelled:
                         break
+                loop_finished = not cancelled
             finally:
-                if self._is_run_canceled(run_id):
+                # Cancel/exception path: drop still-queued work and return
+                # without blocking on the pool (running worker processes
+                # finish their current item but their results are discarded).
+                # Only the clean-completion path drains the pool.
+                if cancelled or (not loop_finished) or self._is_run_canceled(run_id):
                     try:
                         executor.shutdown(wait=False, cancel_futures=True)
                     except Exception:
                         pass
                 else:
                     executor.shutdown(wait=True, cancel_futures=False)
+
+            # Deterministic output order: results were appended in
+            # as_completed order, which varies between runs; sort so
+            # identical inputs serialize identically. The PORTFOLIO row is
+            # inserted at position 0 afterwards and stays pinned.
+            results.sort(key=_strategy_result_sort_key)
 
             if self._is_run_canceled(run_id):
                 try:
@@ -1261,4 +1389,14 @@ class StrategyRunner:
             
         except Exception as e:
             traceback.print_exc()
-            self._update_progress(run_id, 0, 0, "failed")
+            # Keep the progress reached so far and persist whatever results
+            # were already produced, instead of resetting the run to 0/0.
+            try:
+                results.sort(key=_strategy_result_sort_key)
+            except Exception:
+                pass
+            try:
+                partial_json = json.dumps(json_safe_value(results), ensure_ascii=False, allow_nan=False)
+            except Exception:
+                partial_json = None
+            self._update_progress(run_id, processed, len(stocks), "failed", partial_json, len(results))

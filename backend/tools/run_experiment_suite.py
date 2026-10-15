@@ -70,8 +70,10 @@ def run_experiment_suite(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--profit-lookahead", type=int, default=3, help="profit lookahead N bars")
     parser.add_argument("--min-score", type=float, default=0.55, help="confidence threshold")
     parser.add_argument("--limit", type=int, default=0, help="optional stock limit for testing")
-    parser.add_argument("--market-filter-enabled", action="store_true", default=True, help="enable market filter")
-    parser.add_argument("--no-market-filter", action="store_false", dest="market_filter_enabled")
+    # default=None so the flag actually toggles state; absent means "enabled"
+    # (the historical default), --no-market-filter disables it.
+    parser.add_argument("--market-filter-enabled", action="store_true", default=None, help="enable market filter (default)")
+    parser.add_argument("--no-market-filter", action="store_false", dest="market_filter_enabled", help="disable market filter")
     parser.add_argument("--market-filter-index", default="sh000001", help="market filter index")
     parser.add_argument("--market-filter-ma", type=int, default=20, help="market filter MA window")
     parser.add_argument("--output-dir", default="backend/model_cache/daily_direction_predictions", help="predictions root")
@@ -79,6 +81,7 @@ def run_experiment_suite(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--evaluate-suite", action="store_true", help="run evaluation on the generated runs")
     
     args = parser.parse_args(argv)
+    market_filter_enabled = True if args.market_filter_enabled is None else bool(args.market_filter_enabled)
 
     scenarios = ["buy", "sell", "both"]
     if args.evaluate_suite:
@@ -89,23 +92,24 @@ def run_experiment_suite(argv: Optional[List[str]] = None) -> int:
         missing = [s for s in scenarios if s not in run_dirs]
         if missing:
             raise SystemExit(f"Suite {suite_dir} is missing scenario run(s): {', '.join(missing)}")
-        print(f"======================================================================")
+        print("=" * 70)
         print(f"Evaluating Experiment Suite: {suite_dir.name}")
-        print(f"======================================================================\n")
+        print("=" * 70 + "\n")
         evaluate_suite(suite_dir, run_dirs, args)
         return 0
 
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     suite_dir = _resolve_path(args.output_dir) / f"suite_{timestamp}"
     suite_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f"======================================================================")
+
+    print("=" * 70)
     print(f"Starting Experiment Suite: {suite_dir.name}")
     print(f"As-Of Date: {args.as_of or 'latest'}")
     print(f"Lookahead: {args.profit_lookahead} bars, Rolling Mode: {args.rolling_sample_mode}")
-    print(f"======================================================================\n")
+    print("=" * 70 + "\n")
 
     run_dirs = {}
+    run_results = {}
     for side in scenarios:
         print(f"---> Running prediction for Side Filter: {side.upper()}...")
         cmd_args = [
@@ -122,7 +126,7 @@ def run_experiment_suite(argv: Optional[List[str]] = None) -> int:
             cmd_args.extend(["--as-of", args.as_of])
         if args.target_date:
             cmd_args.extend(["--target-date", args.target_date])
-        if args.market_filter_enabled:
+        if market_filter_enabled:
             cmd_args.extend([
                 "--market-filter-enabled",
                 "--market-filter-index", args.market_filter_index,
@@ -131,21 +135,45 @@ def run_experiment_suite(argv: Optional[List[str]] = None) -> int:
         else:
             cmd_args.append("--no-market-filter")
 
+        before_dirs = {p for p in suite_dir.glob("mainboard_chan_bsp_*") if p.is_dir()}
         t_start = time.time()
-        ret = snapshot_main(cmd_args)
+        error = None
+        try:
+            ret = int(snapshot_main(cmd_args))
+        except Exception as e:
+            # One failing scenario must not abort the rest of the suite.
+            ret = 1
+            error = str(e)
         t_elapsed = time.time() - t_start
-        print(f"---> Finished prediction for Side Filter: {side.upper()} in {t_elapsed:.1f}s. Return Code: {ret}\n")
-        
-        # Locate the generated run directory
-        # Subdirectories will match: mainboard_chan_bsp_{freq}_{as_of}_to_{target}_{timestamp}
-        subdirs = sorted(suite_dir.glob("mainboard_chan_bsp_*"))
-        if subdirs:
-            # The latest directory created for this run
-            for sd in reversed(subdirs):
-                if sd not in run_dirs.values():
-                    run_dirs[side] = sd
-                    break
+        run_results[side] = int(ret)
+        if error is not None:
+            print(f"---> Prediction for {side.upper()} raised: {error}")
 
+        # Locate the run directory produced by this invocation: prefer the new
+        # dir whose metadata side_filter matches instead of "latest unused".
+        new_dirs = [p for p in suite_dir.glob("mainboard_chan_bsp_*") if p.is_dir() and p not in before_dirs]
+        new_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        chosen = None
+        for sd in new_dirs:
+            if _load_run_side(sd) == side:
+                chosen = sd
+                break
+        if chosen is None and new_dirs:
+            chosen = new_dirs[0]
+            print(f"---> Warning: no new run dir with side_filter={side}; using latest new dir {chosen.name}")
+        if chosen is not None:
+            run_dirs[side] = chosen
+        state = "ok" if int(ret) == 0 else f"failed(rc={int(ret)})"
+        print(f"---> Finished prediction for Side Filter: {side.upper()} in {t_elapsed:.1f}s. Return Code: {ret} [{state}]\n")
+
+    failed_sides = [s for s in scenarios if run_results.get(s) != 0]
+    ok_sides = [s for s in scenarios if run_results.get(s) == 0]
+    if failed_sides:
+        print(
+            "Suite predictions finished with failures: "
+            f"ok=[{','.join(ok_sides) or '-'}] failed=[{','.join(failed_sides)}] dir={suite_dir}"
+        )
+        return 1
     print(f"Suite prediction snapshots successfully generated in: {suite_dir}")
     return 0
 
@@ -162,15 +190,21 @@ def evaluate_suite(suite_dir: Path, run_dirs: dict, args) -> None:
         if args.target_date:
             eval_args.extend(["--target-date", args.target_date])
 
-        ret = snapshot_main(eval_args)
+        try:
+            ret = int(snapshot_main(eval_args))
+        except Exception as e:
+            ret = 1
+            print(f"[Warning] Evaluation for {side.upper()} raised: {e}")
         if ret == 0:
             eval_jsons = list(r_dir.glob("evaluation_summary_*.json"))
             if eval_jsons:
                 eval_jsons.sort(key=lambda p: p.stat().st_mtime)
                 with eval_jsons[-1].open("r", encoding="utf-8") as f:
                     eval_results[side] = json.load(f)
+        elif ret == 2:
+            print(f"[Warning] Evaluation skipped for {side.upper()}: target data not ready (return code {ret}).")
         else:
-            print(f"[Warning] Evaluation failed or data not ready for {side.upper()} (return code {ret}).")
+            print(f"[Warning] Evaluation failed for {side.upper()} (return code {ret}).")
 
     if eval_results:
         generate_markdown_report(suite_dir, eval_results)
@@ -180,20 +214,20 @@ def evaluate_suite(suite_dir: Path, run_dirs: dict, args) -> None:
 
 def generate_markdown_report(suite_dir: Path, results: dict):
     lines = []
-    lines.append(f"# Experiment Suite Comparison Report")
+    lines.append("# Experiment Suite Comparison Report")
     lines.append(f"Generated on: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"Suite Directory: `{suite_dir.name}`\n")
-    
+
     # Common Meta
     any_res = list(results.values())[0]
-    lines.append(f"### Metadata")
+    lines.append("### Metadata")
     lines.append(f"- **As-Of Date**: `{any_res.get('as_of_date')}`")
     lines.append(f"- **Target Date**: `{any_res.get('target_date')}`")
     lines.append(f"- **Lookahead**: `{any_res.get('eval_lookahead', 1)}` bars\n")
 
-    lines.append(f"### Performance Comparison Table")
-    lines.append(f"| Metric / Scenario | BUY Only Strategy | SELL Only Strategy | BOTH Baseline Strategy |")
-    lines.append(f"| :--- | :---: | :---: | :---: |")
+    lines.append("### Performance Comparison Table")
+    lines.append("| Metric / Scenario | BUY Only Strategy | SELL Only Strategy | BOTH Baseline Strategy |")
+    lines.append("| :--- | :---: | :---: | :---: |")
     
     # Matched count
     lines.append(f"| **Matched Count** (Trades) | {results.get('buy', {}).get('matched_count', '-')} | {results.get('sell', {}).get('matched_count', '-')} | {results.get('both', {}).get('matched_count', '-')} |")
