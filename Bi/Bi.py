@@ -1,3 +1,4 @@
+import math
 from typing import List, Optional
 
 from Common.cache import make_cache
@@ -218,6 +219,8 @@ class CBi:
         rsi_lst: List[float] = []
         for klc in self.klc_lst:
             rsi_lst.extend(klu.rsi for klu in klc.lst if hasattr(klu, "rsi"))
+        # RSI 预热期产出 NaN，min/max 对 NaN 粘滞会导致笔特征=nan，先过滤非有限值
+        rsi_lst = [v for v in rsi_lst if math.isfinite(v)]
         if len(rsi_lst) == 0:
             raise CChanException("Cal_Rsi 需要配置 RSI 指标模型（klu.rsi 不存在）", ErrCode.CONFIG_ERROR)
         return 10000.0/(min(rsi_lst)+1e-7) if self.is_down() else max(rsi_lst)

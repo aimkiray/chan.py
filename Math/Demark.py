@@ -1,8 +1,8 @@
-import copy
 from dataclasses import dataclass
 from typing import List, Literal, Optional, TypedDict
 
 from Common.CEnum import BI_DIR
+from Common.ChanException import CChanException, ErrCode
 
 
 @dataclass
@@ -48,7 +48,8 @@ class CDemarkIndex:
 class CDemarkCountdown:
     def __init__(self, _dir: BI_DIR, kl_list: List[C_KL], TDST_peak: float, config):
         self.dir = _dir
-        self.kl_list: List[C_KL] = copy.deepcopy(kl_list)
+        # 入参是调用方新切的窗口且 C_KL 创建后不再修改，浅拷贝即可（原 deepcopy 冗余）
+        self.kl_list: List[C_KL] = list(kl_list)
         self.idx = 0
         self.TDST_peak = TDST_peak
         self.finish = False
@@ -80,7 +81,8 @@ class CDemarkCountdown:
 class CDemarkSetup:
     def __init__(self, _dir: BI_DIR, kl_list: List[C_KL], pre_kl: C_KL, config):
         self.dir = _dir
-        self.kl_list: List[C_KL] = copy.deepcopy(kl_list)
+        # 入参是引擎新切的窗口（kl_lst[-B-1:-1]）且 C_KL 创建后不再修改，浅拷贝即可（原 deepcopy 冗余）
+        self.kl_list: List[C_KL] = list(kl_list)
         self.pre_kl = pre_kl  # 跳空时用
         self.DEMARK_LEN = config.DEMARK_LEN
         self.SETUP_BIAS = config.SETUP_BIAS
@@ -101,6 +103,8 @@ class CDemarkSetup:
         self.last_demark_index = CDemarkIndex()
         if not self.setup_finished:
             self.kl_list.append(kl)
+            # setup 计数在条件连续满足时可越过 DEMARK_LEN 继续增长（不回收），
+            # 直至条件中断才置 setup_finished；DEMARK_LEN 仅是触发 countdown 的门槛
             if self.dir == BI_DIR.DOWN:
                 if self.kl_list[-1].close < self.kl_list[-1-self.SETUP_BIAS].v(self.SETUP_CMP2CLOSE, self.dir):
                     self.add_setup()
@@ -147,6 +151,10 @@ class CDemarkEngine:
         setup_cmp2close=True,
         countdown_cmp2close=True
     ):
+        for name, p in (("demark_len", demark_len), ("setup_bias", setup_bias),
+                        ("countdown_bias", countdown_bias), ("max_countdown", max_countdown)):
+            if not isinstance(p, int) or p < 1:
+                raise CChanException(f"CDemarkEngine {name} must be int >= 1, got {p!r}", ErrCode.PARA_ERROR)
         self.DEMARK_LEN = demark_len
         self.SETUP_BIAS = setup_bias
         self.COUNTDOWN_BIAS = countdown_bias
@@ -163,13 +171,18 @@ class CDemarkEngine:
         if len(self.kl_lst) <= self.SETUP_BIAS+1:
             return CDemarkIndex()
 
-        if self.kl_lst[-1].close < self.kl_lst[-1-self.SETUP_BIAS].close:
+        # SETUP_CMP2CLOSE 同时约束 setup 的触发与续计（CDemarkSetup.update 用
+        # .v(SETUP_CMP2CLOSE, dir)）：True 与参照 bar 的 close 比，False 与其
+        # low（DOWN）/high（UP）比；两侧规则须一致，否则会出现"触发后立刻断计"
+        # 或"满足续计规则却永不触发"的割裂
+        ref_kl = self.kl_lst[-1-self.SETUP_BIAS]
+        if self.kl_lst[-1].close < ref_kl.v(self.SETUP_CMP2CLOSE, BI_DIR.DOWN):
             if not any(series.dir == BI_DIR.DOWN and not series.setup_finished for series in self.series):
                 self.series.append(CDemarkSetup(BI_DIR.DOWN, self.kl_lst[-self.SETUP_BIAS-1:-1], self.kl_lst[-self.SETUP_BIAS-2], self))
             for series in self.series:
                 if series.dir == BI_DIR.UP and series.countdown is None and not series.setup_finished:
                     series.setup_finished = True
-        elif self.kl_lst[-1].close > self.kl_lst[-1-self.SETUP_BIAS].close:
+        elif self.kl_lst[-1].close > ref_kl.v(self.SETUP_CMP2CLOSE, BI_DIR.UP):
             if not any(series.dir == BI_DIR.UP and not series.setup_finished for series in self.series):
                 self.series.append(CDemarkSetup(BI_DIR.UP, self.kl_lst[-self.SETUP_BIAS-1:-1], self.kl_lst[-self.SETUP_BIAS-2], self))
             for series in self.series:
@@ -177,7 +190,7 @@ class CDemarkEngine:
                     series.setup_finished = True
 
         self.clear()
-        self.clean_series_from_setup_finish()
+        self.update_all_series()
 
         result = self.cal_result()
         self.clear()
@@ -197,13 +210,23 @@ class CDemarkEngine:
         for s in invalid_series:
             self.series.remove(s)
 
-    def clean_series_from_setup_finish(self):
+    def update_all_series(self):
+        """用最新一根 K 线推进所有存活 series。
+
+        若某 series 的 setup 在本轮恰好数到 DEMARK_LEN（setup 完成、转入
+        countdown 阶段），按实现约定只保留该 series、丢弃其余——一个时点
+        只跟踪一个已完成 setup 的序列。
+        """
         finished_setup: Optional[int] = None
         for series in self.series:
             demark_idx = series.update(self.kl_lst[-1])
             for setup_idx in demark_idx.get_setup():
                 if setup_idx['idx'] == self.DEMARK_LEN:
-                    assert finished_setup is None
+                    # 不变量：同一根 K 线至多一个 series 完成 setup——同向未完成
+                    # series 不会重复创建（见 update 的 any() 检查），反向不可能同
+                    # 时延展；显式 raise 代替 assert，避免 -O 下静默保留错误序列
+                    if finished_setup is not None:
+                        raise CChanException("multiple demark setups finished on the same bar", ErrCode.COMMON_ERROR)
                     finished_setup = id(series)
         if finished_setup is not None:
             self.series = [series for series in self.series if id(series) == finished_setup]

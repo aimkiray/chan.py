@@ -1,5 +1,7 @@
 from typing import List
 
+from Common.ChanException import CChanException, ErrCode
+
 
 class CMACD_item:
     def __init__(self, fast_ema, slow_ema, DIF, DEA):
@@ -12,6 +14,11 @@ class CMACD_item:
 
 class CMACD:
     def __init__(self, fastperiod=12, slowperiod=26, signalperiod=9):
+        for name, p in (("fastperiod", fastperiod), ("slowperiod", slowperiod), ("signalperiod", signalperiod)):
+            if not isinstance(p, int) or p < 1:
+                raise CChanException(f"CMACD {name} must be int >= 1, got {p!r}", ErrCode.PARA_ERROR)
+        # macd_info 保留全量历史：add() 只读 [-1]，但序列留作回溯/调试用途；
+        # 每根 K 线约 5 个 float，会话级数据量下 O(n) 内存可接受，故不裁剪
         self.macd_info: List[CMACD_item] = []
         self.fastperiod = fastperiod
         self.slowperiod = slowperiod
