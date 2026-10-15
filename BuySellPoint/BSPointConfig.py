@@ -1,7 +1,7 @@
 from typing import Dict, List, Optional
 
 from Common.CEnum import BSP_TYPE, MACD_ALGO
-from Common.func_util import _parse_inf
+from Common.ChanException import CChanException, ErrCode
 
 
 class CBSPointConfig:
@@ -14,6 +14,25 @@ class CBSPointConfig:
 
 
 class CPointConfig:
+    # attribute names declared in __init__; only these may be overridden via set()
+    ALLOWED_FIELDS = frozenset([
+        "divergence_rate",
+        "min_zs_cnt",
+        "bsp1_only_multibi_zs",
+        "max_bs2_rate",
+        "macd_algo",
+        "bs1_peak",
+        "tmp_target_types",
+        "target_types",
+        "bsp2_follow_1",
+        "bsp3_follow_1",
+        "bsp3_peak",
+        "bsp2s_follow_2",
+        "max_bsp2s_lv",
+        "strict_bsp3",
+        "bsp3a_max_zs_cnt",
+    ])
+
     def __init__(self,
                  divergence_rate,
                  min_zs_cnt,
@@ -74,8 +93,11 @@ class CPointConfig:
         self.macd_algo = _d[macd_algo]
 
     def set(self, k, v):
-        v = _parse_inf(v)
         if k == "macd_algo":
             self.SetMacdAlgo(v)
-        else:
-            exec(f"self.{k} = {v}")
+            return
+        if k not in self.ALLOWED_FIELDS:
+            raise CChanException(f"invalid bsp config para = {k}", ErrCode.PARA_ERROR)
+        if not isinstance(v, (int, float, str, bool, list, tuple, type(None))):
+            raise CChanException(f"invalid bsp config value for {k}: {type(v)}", ErrCode.PARA_ERROR)
+        setattr(self, k, v)

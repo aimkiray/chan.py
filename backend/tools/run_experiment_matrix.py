@@ -32,7 +32,7 @@ def _resolve_path(path: str) -> Path:
 def _parse_date(raw: Optional[str]) -> Optional[dt.date]:
     if raw is None or str(raw).strip() == "":
         return None
-    return dt.date.fromisoformat(str(raw).strip()[:10])
+    return dt.date.fromisoformat(str(raw).strip())
 
 
 def _csv_items(raw: str, default: Iterable[str]) -> List[str]:
@@ -187,6 +187,11 @@ def _base_config_key(config: Dict) -> Tuple:
 def _build_grid(args, client) -> List[Dict]:
     if args.dates:
         dates = _csv_items(args.dates, [])
+        for value in dates:
+            try:
+                _parse_date(value)
+            except ValueError:
+                raise RuntimeError(f"invalid --dates entry (expected ISO YYYY-MM-DD): {value!r}")
     else:
         if client is None:
             raise RuntimeError("ClickHouse is required when --dates is not provided")
@@ -325,6 +330,14 @@ def _status_counts(rows: List[Dict]) -> Dict[str, int]:
 
 def _derived_run_id(base_meta: Dict, config: Dict) -> str:
     target = str(base_meta.get("target_date") or "")
+    for label, value in (("as_of_date", config.get("as_of_date")), ("target_date", target)):
+        text = str(value or "").strip()
+        if not text:
+            continue
+        try:
+            _parse_date(text)
+        except ValueError:
+            raise RuntimeError(f"invalid {label} for derived run id: {text!r}")
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     ma = int(config.get("market_filter_ma") or 0)
     return (
@@ -378,6 +391,8 @@ def _derive_market_filtered_run(base_run_dir: Path, config: Dict, args, matrix_d
     while run_dir.exists():
         run_dir = matrix_dir / f"{run_id}_{suffix}"
         suffix += 1
+    if matrix_dir.resolve() not in run_dir.resolve().parents:
+        raise RuntimeError(f"derived run_dir escapes matrix_dir: {run_dir}")
     run_dir.mkdir(parents=True, exist_ok=True)
 
     new_pred_path = run_dir / "predictions.csv"

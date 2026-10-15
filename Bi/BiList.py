@@ -118,7 +118,7 @@ class CBiList:
             self[-1].next = None
 
     def try_add_virtual_bi(self, klc: CKLine, need_del_end=False):
-        if need_del_end:
+        if need_del_end or (len(self) > 0 and not self[-1].is_sure):
             self.delete_virtual_bi()
         if len(self) == 0:
             return False

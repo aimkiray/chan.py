@@ -902,6 +902,8 @@ class StrategyRunner:
                 enforce_t1 = bool(enforce_t1_raw)
             pool_id = params.get('pool_id')
             enable_rolling_lookback = params.get('enable_rolling_lookback', True)
+            # 0 disables the portfolio block below; default matches StrategyRequest.portfolio_top_n
+            portfolio_top_n = _optional_int_param(params, "portfolio_top_n", default=2, min_value=0)
             
             # 1. Get Stocks
             stocks = []

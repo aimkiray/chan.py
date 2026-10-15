@@ -26,13 +26,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 数据库配置
+# 数据库配置（敏感字段从环境变量读取，env 命名与 DataAPI/ClickHouseAPI.py 一致）
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+try:
+    _DB_PORT = int(os.getenv("DB_PORT", 9000))
+except Exception:
+    _DB_PORT = 9000
+
 DB_CONFIG = {
-    'host': 'localhost',
-    'port': 9000, 
-    'user': 'default',
-    'password': '12138',
-    'database': 'stock_data'
+    'host': os.getenv("DB_HOST", "localhost"),
+    'port': _DB_PORT,
+    'user': os.getenv("DB_USER", "default"),
+    'password': os.getenv("DB_PASSWORD", ""),
+    'database': os.getenv("DB_NAME", "stock_data")
 }
 
 MARKET_CLOSE_TIME = (15, 0)
@@ -6572,8 +6583,7 @@ def download_stock_data(args):
                 file_queue.put((table_name, filepath))
                 
             except Exception as e:
-                # logger.warning(f"处理 {stock_code} {table_name} 失败: {e}")
-                pass
+                logger.warning(f"处理 {stock_code} {table_name} 失败: {e}")
 
     except Exception as e:
         logger.error(f"Downloader failed for {stock_code}: {e}")
@@ -6984,7 +6994,16 @@ def parse_cli_args():
 
 
 def _run_script(args: list[str]):
-    cmd = [sys.executable, *args]
+    if not args:
+        logger.warning("_run_script 调用缺少脚本参数，跳过执行")
+        return
+    script = args[0]
+    if not os.path.isabs(script):
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), script)
+    if not os.path.exists(script):
+        logger.warning(f"脚本不存在，跳过执行: {args[0]} (resolved: {script})")
+        return
+    cmd = [sys.executable, script, *args[1:]]
     logger.info("运行命令：" + " ".join(cmd))
     subprocess.run(cmd, check=True)
 

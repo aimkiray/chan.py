@@ -4,6 +4,10 @@ import datetime
 import os
 import sys
 
+# This smoke test exercises the train_on_fly path with stubbed model loading;
+# allow it without requiring a real pre-trained bundle in the default env.
+os.environ.setdefault("MLCHAN_LIVE_REQUIRE_PRETRAINED_MODEL", "0")
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 import backend.main as m

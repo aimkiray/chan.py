@@ -81,8 +81,7 @@ class CZSList:
             if len(lst) < 3:
                 return None
             lst = lst[-3:]
-            if lst[0].dir == lst[0].parent_seg.dir:
-                lst = lst[1:]
+            if lst[0].parent_seg is not None and lst[0].dir == lst[0].parent_seg.dir:
                 return None
         min_high = min(item._high() for item in lst)
         max_low = max(item._low() for item in lst)

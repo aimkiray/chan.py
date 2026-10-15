@@ -7,6 +7,7 @@ import uuid
 import gc
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -1055,10 +1056,18 @@ def _attach_strategy_preset_accuracy(accuracy_info, preset, audit):
         accuracy_info["strategy_preset_gate"] = {"passed": False, "error": str(e)}
     return accuracy_info
 
-# Allow CORS
+# Allow CORS. Allowed origins are configurable via MLCHAN_CORS_ORIGINS
+# (comma-separated). Defaults to local dev frontends; never "*" together
+# with allow_credentials.
+_cors_origins_env = str(os.environ.get("MLCHAN_CORS_ORIGINS", "") or "").strip()
+_CORS_ALLOW_ORIGINS = (
+    [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+    if _cors_origins_env
+    else ["http://localhost:3000", "http://127.0.0.1:3000"]
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For dev, allow all. In prod, specify.
+    allow_origins=_CORS_ALLOW_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -3626,6 +3635,39 @@ def _prepare_live_run_params(params: Dict[str, Any], *, wants_schedule: bool) ->
                 raise HTTPException(status_code=400, detail=f"live run params missing required field: {key}")
     return out
 
+
+_LIVE_RUN_SENSITIVE_FIELDS = ("notify_webhook", "notify_secret", "sms_token", "sms_phone")
+
+
+def _mask_secret_value(value):
+    s = str(value or "")
+    if not s:
+        return value
+    return "***" + s[-4:] if len(s) > 4 else "***"
+
+
+def _mask_live_run_secrets(run):
+    """Return a copy of a live-run dict with sensitive fields masked.
+
+    Response-side only: applied on GET endpoints so credentials are never
+    echoed back. Storage/write paths are untouched.
+    """
+    if not isinstance(run, dict):
+        return run
+    out = dict(run)
+    containers = [out]
+    params = out.get("params")
+    if isinstance(params, dict):
+        params = dict(params)
+        out["params"] = params
+        containers.append(params)
+    for container in containers:
+        for key in _LIVE_RUN_SENSITIVE_FIELDS:
+            if key in container:
+                container[key] = _mask_secret_value(container[key])
+    return out
+
+
 @app.post("/api/live/scan_features")
 async def live_scan_features(req: LiveScanFeaturesRequest):
     try:
@@ -3950,7 +3992,8 @@ async def live_create_run(req: LiveRunCreateRequest):
 async def live_list_runs(status: Optional[str] = None, limit: int = 200, portfolio_id: Optional[int] = None):
     try:
         st = str(status or "").strip().lower() or None
-        return {"items": storage.list_live_runs(status=st, limit=limit, portfolio_id=portfolio_id)}
+        items = storage.list_live_runs(status=st, limit=limit, portfolio_id=portfolio_id) or []
+        return {"items": [_mask_live_run_secrets(r) for r in items]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -4314,7 +4357,7 @@ async def live_get_run(run_id: str):
         out = storage.get_live_run(run_id)
         if not out:
             raise HTTPException(status_code=404, detail="run not found")
-        return {"item": out}
+        return {"item": _mask_live_run_secrets(out)}
     except HTTPException:
         raise
     except Exception as e:
@@ -6855,19 +6898,39 @@ async def get_strategy_run(run_id: int):
 static_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
 if os.path.exists(static_dir):
     app.mount("/assets", StaticFiles(directory=os.path.join(static_dir, "assets")), name="assets")
-    
+
+    _static_root = Path(static_dir).resolve()
+
+    def _safe_static_path(rel_path: str):
+        """Resolve rel_path inside the static root; return None if it escapes."""
+        try:
+            candidate = (_static_root / str(rel_path or "")).resolve()
+            candidate.relative_to(_static_root)
+            return candidate
+        except Exception:
+            return None
+
     @app.get("/")
     async def read_index():
-        return FileResponse(os.path.join(static_dir, "index.html"))
-        
+        index_path = _safe_static_path("index.html")
+        if index_path is None or not index_path.is_file():
+            raise HTTPException(status_code=404, detail="index.html not found")
+        return FileResponse(str(index_path))
+
     @app.get("/{catchall:path}")
     async def read_catchall(catchall: str):
+        # Paths escaping the static root are rejected outright
+        file_path = _safe_static_path(catchall)
+        if file_path is None:
+            raise HTTPException(status_code=404, detail="not found")
         # Check if file exists in static
-        file_path = os.path.join(static_dir, catchall)
-        if os.path.exists(file_path) and os.path.isfile(file_path):
-            return FileResponse(file_path)
+        if file_path.is_file():
+            return FileResponse(str(file_path))
         # Otherwise return index.html for SPA routing
-        return FileResponse(os.path.join(static_dir, "index.html"))
+        index_path = _safe_static_path("index.html")
+        if index_path is None or not index_path.is_file():
+            raise HTTPException(status_code=404, detail="index.html not found")
+        return FileResponse(str(index_path))
 
 if __name__ == "__main__":
     import uvicorn

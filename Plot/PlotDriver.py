@@ -10,7 +10,7 @@ from Chan import CChan
 from Common.CEnum import BI_DIR, FX_TYPE, KL_TYPE, KLINE_DIR, TREND_TYPE
 from Common.ChanException import CChanException, ErrCode
 from Common.CTime import CTime
-from Math.Demark import T_DEMARK_INDEX, CDemarkEngine
+from Math.Demark import T_DEMARK_INDEX
 
 from .PlotMeta import CBi_meta, CChanPlotMeta, CZS_meta
 
@@ -307,7 +307,7 @@ class CPlotDriver:
                 else:  # 画阴线
                     ax.add_patch(Rectangle((i - width / 2, kl.open), width, kl.close - kl.open, color=down_color))
                     ax.plot([i, i], [kl.low, kl.high], color=down_color)
-            elif plot_mode in "close":
+            elif plot_mode == "close":
                 _y.append(kl.close)
                 _x.append(i)
             elif plot_mode == "high":
@@ -317,7 +317,7 @@ class CPlotDriver:
                 _y.append(kl.low)
                 _x.append(i)
             elif plot_mode == "open":
-                _y.append(kl.low)
+                _y.append(kl.open)
                 _x.append(i)
             else:
                 raise CChanException(f"unknow plot mode={plot_mode}, must be one of kl/close/open/high/low", ErrCode.PLOT_ERR)
@@ -741,7 +741,7 @@ class CPlotDriver:
             else:
                 end_idx = demark_idx['series'].kl_list[-1].idx
             ax.plot(
-                [demark_idx['series'].kl_list[CDemarkEngine.SETUP_BIAS].idx, end_idx],
+                [demark_idx['series'].kl_list[demark_idx['series'].SETUP_BIAS].idx, end_idx],
                 [demark_idx['series'].TDST_peak, demark_idx['series'].TDST_peak],
                 c=begin_line_color,
                 linestyle=linestyle
@@ -810,7 +810,7 @@ class CPlotDriver:
                 else:
                     upper_bias += getTextBox(ax, txt_instance).height
             for demark_idx in klu.demark.get_countdown():
-                box_bias = 0.5*text_height if text_height is not None and demark_idx['idx'] == CDemarkEngine.MAX_COUNTDOWN else 0
+                box_bias = 0.5*text_height if text_height is not None and demark_idx['idx'] == demark_idx['series'].MAX_COUNTDOWN else 0
                 txt_instance = ax.text(
                     klu.idx,
                     klu.low-under_bias-box_bias if demark_idx['dir'] == BI_DIR.DOWN else klu.high+upper_bias+box_bias,
@@ -822,7 +822,7 @@ class CPlotDriver:
                 )
                 if text_height is None:
                     text_height = getTextBox(ax, txt_instance).height
-                if demark_idx['idx'] == CDemarkEngine.MAX_COUNTDOWN:
+                if demark_idx['idx'] == demark_idx['series'].MAX_COUNTDOWN:
                     txt_instance.set_bbox(dict(facecolor=max_countdown_background, edgecolor=max_countdown_background, pad=0))
                 if demark_idx['dir'] == BI_DIR.DOWN:
                     under_bias += getTextBox(ax, txt_instance).height

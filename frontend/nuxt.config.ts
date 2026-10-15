@@ -4,11 +4,11 @@ import { defineNuxtConfig } from 'nuxt/config'
 export default defineNuxtConfig({
   modules: ['@nuxt/ui'],
   ssr: false,
-  devtools: { enabled: true },
+  devtools: { enabled: false },
   experimental: { appManifest: false },
 
   devServer: {
-    host: '0.0.0.0',
+    host: '127.0.0.1',
     port: 3000
   },
 

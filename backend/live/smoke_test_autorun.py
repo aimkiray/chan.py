@@ -3,6 +3,11 @@ import sys
 import types
 import asyncio
 
+# Enable live-run autostart for _on_startup_live_runs and allow the
+# stubbed-bundle / on-the-fly paths without a real pre-trained bundle.
+os.environ.setdefault("MLCHAN_LIVE_AUTOSTART", "1")
+os.environ.setdefault("MLCHAN_LIVE_REQUIRE_PRETRAINED_MODEL", "0")
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 import backend.main as m
@@ -27,8 +32,26 @@ class K:
 
 
 def main():
+    import atexit
     import datetime
+    import shutil
+    import tempfile
     import DataAPI.ClickHouseAPI as ch
+
+    # Isolate live-run/step/order writes from the real analysis.db: point the
+    # module-level storage at a DummyStorage backed by a throwaway sqlite file.
+    _tmp_dir = tempfile.mkdtemp(prefix="mlchan_smoke_autorun_")
+    _tmp_storage = DummyStorage(db_path=os.path.join(_tmp_dir, "smoke_test_autorun.db"))
+    m.storage = _tmp_storage
+
+    def _cleanup_tmp_storage():
+        try:
+            _tmp_storage.engine.dispose()
+        except Exception:
+            pass
+        shutil.rmtree(_tmp_dir, ignore_errors=True)
+
+    atexit.register(_cleanup_tmp_storage)
 
     ch.CClickHouseAPI.get_pool_members = classmethod(lambda cls, pool_id=None, table=None, limit=None: ["300001", "300002"])
 
@@ -255,6 +278,18 @@ def main():
             "steps": 1,
             "offset_seconds": 5,
             "notify_enabled": 0,
+            # live_start_run calls _prepare_live_run_params(wants_schedule=True),
+            # which requires non-empty params incl. pool_id/frequency/data_src/autype.
+            "params": {
+                "sim_id": "sim_test",
+                "portfolio_id": 1,
+                "pool_id": "index:IDX399673",
+                "frequency": "30m",
+                "data_src": "clickhouse",
+                "autype": "qfq",
+                "top_n": 2,
+                "t1_decision_time": "10:00",
+            },
         }
         ls2 = LocalStorageStart(run0)
         m.storage = ls2

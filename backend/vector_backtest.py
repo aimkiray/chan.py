@@ -308,7 +308,9 @@ class VectorBacktester:
         score_mode = str(kwargs.get("score_mode", "raw") or "raw").strip().lower()
         score_higher_is_better = bool(kwargs.get("score_higher_is_better", True))
         if score_mode in ["rank", "cross_section_rank", "cross_sectional_rank", "cs_rank"]:
-            score_df = score_df.rank(axis=1, pct=True, ascending=not bool(score_higher_is_better))
+            # Downstream always picks max via sort_values(ascending=False), so rank the
+            # preferred end highest: ascending=True -> highest raw score gets pct=1.0.
+            score_df = score_df.rank(axis=1, pct=True, ascending=bool(score_higher_is_better))
         score_df = score_df.fillna(float("-inf"))
         
         # 4. Vector Simulation

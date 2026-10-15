@@ -167,9 +167,10 @@ class CBi:
         return self.dir == BI_DIR.UP
 
     def update_virtual_end(self, new_klc: CKLine):
-        self.append_sure_end(self.end_klc)
+        if self.__is_sure:
+            self.append_sure_end(self.end_klc)
         self.update_new_end(new_klc)
-        self.__used_to_be_sure = self.__is_sure
+        self.__used_to_be_sure = self.__is_sure or self.__used_to_be_sure
         self.__is_sure = False
 
     def restore_from_virtual_end(self, sure_end: CKLine):

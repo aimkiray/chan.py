@@ -6,8 +6,94 @@ param (
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $RepoRoot
 
-# Resolve absolute path
-$AbsTargetDir = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $TargetDir))
+# Resolve absolute path (fail closed: refuse unresolvable paths instead of falling through)
+# Deployment targets are local directories only: reject UNC/remote forms ('\\', '//') and
+# wildcard characters up front, because on pwsh/.NET Core GetFullPath does NOT throw for them.
+if ([string]::IsNullOrWhiteSpace($TargetDir)) {
+    Write-Error "Invalid TargetDir: value must not be null or empty."
+    exit 1
+}
+if ($TargetDir.StartsWith('\\') -or $TargetDir.StartsWith('//')) {
+    Write-Error "Invalid TargetDir '$TargetDir': UNC/remote paths are not allowed; the deployment target must be a local directory."
+    exit 1
+}
+if ($TargetDir -match '[*?]') {
+    Write-Error "Invalid TargetDir '$TargetDir': wildcard characters ('*', '?') are not allowed."
+    exit 1
+}
+$AbsTargetDir = $null
+try {
+    if ([System.IO.Path]::IsPathRooted($TargetDir)) {
+        $AbsTargetDir = [System.IO.Path]::GetFullPath($TargetDir)
+    } else {
+        $AbsTargetDir = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $TargetDir))
+    }
+} catch {
+    Write-Error "Invalid TargetDir '$TargetDir': cannot resolve an absolute path ($($_.Exception.Message))"
+    exit 1
+}
+if ([string]::IsNullOrWhiteSpace($AbsTargetDir)) {
+    Write-Error "Invalid TargetDir '$TargetDir': resolved to an empty path."
+    exit 1
+}
+if ($AbsTargetDir.StartsWith('\\?\') -or $AbsTargetDir.StartsWith('\\.\')) {
+    Write-Error "Invalid TargetDir '$TargetDir': extended-length/device paths are not allowed."
+    exit 1
+}
+# Re-check on the resolved path: '//host/share' normalizes to '\\host\share', and a wildcard
+# could survive resolution on engines where GetFullPath does not throw.
+if ($AbsTargetDir.StartsWith('\\') -or $AbsTargetDir.StartsWith('//')) {
+    Write-Error "Invalid TargetDir '$TargetDir': resolved path '$AbsTargetDir' is a UNC/remote path; only local directories are allowed."
+    exit 1
+}
+if ($AbsTargetDir -match '[*?]') {
+    Write-Error "Invalid TargetDir '$TargetDir': resolved path '$AbsTargetDir' contains wildcard characters."
+    exit 1
+}
+# Reject path components ending with a space or dot: Windows silently maps 'foo '/'foo.' to
+# 'foo', which would desynchronize the string-based repo-root check below from the real target
+# on disk (fail closed instead of normalizing: a legitimate deploy dir never has such names).
+foreach ($comp in ($AbsTargetDir -split '[\\/]')) {
+    if ($comp.Length -gt 0 -and ($comp.EndsWith(' ') -or $comp.EndsWith('.'))) {
+        Write-Error "Invalid TargetDir '$TargetDir': path component '$comp' ends with a space or dot, which is ambiguous on Windows filesystems."
+        exit 1
+    }
+}
+
+# Refuse if TargetDir already exists as a file (Get-ChildItem would return the file itself and Remove-Item would delete it)
+if (Test-Path -LiteralPath $AbsTargetDir -PathType Leaf) {
+    Write-Error "Unsafe TargetDir '$AbsTargetDir': path exists and is a file, not a directory."
+    exit 1
+}
+
+# Refuse junctions/symlinks anywhere along the target path so the cleanup cannot be redirected
+$walk = $AbsTargetDir.TrimEnd('\')
+while ($walk) {
+    if (Test-Path -LiteralPath $walk) {
+        $walkItem = Get-Item -LiteralPath $walk -Force
+        if ($walkItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            $linkDest = $walkItem.LinkTarget
+            if (-not $linkDest) { $linkDest = $walkItem.Target }
+            Write-Error "Unsafe TargetDir '$AbsTargetDir': '$walk' is a junction/symlink pointing to '$linkDest'; refusing to deploy through a reparse point."
+            exit 1
+        }
+    }
+    $walkParent = Split-Path -Parent $walk
+    if (-not $walkParent -or $walkParent -eq $walk) { break }
+    $walk = $walkParent
+}
+
+# Safety guard: refuse to clean/deploy into the repo root, one of its ancestors, or a filesystem root
+$RepoRootFull = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\')
+$TargetFull = $AbsTargetDir.TrimEnd('\')
+$TargetRoot = [System.IO.Path]::GetPathRoot($AbsTargetDir).TrimEnd('\')
+$IsRepoOrAncestor = $RepoRootFull.Equals($TargetFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+    $RepoRootFull.StartsWith($TargetFull + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
+$IsFileSystemRoot = $TargetFull.Equals($TargetRoot, [System.StringComparison]::OrdinalIgnoreCase)
+if ($IsRepoOrAncestor -or $IsFileSystemRoot) {
+    Write-Error "Unsafe TargetDir '$AbsTargetDir': must not be the repository root, an ancestor of it, or a filesystem root."
+    exit 1
+}
 
 Write-Host "Deploying to: $AbsTargetDir"
 
@@ -22,10 +108,11 @@ if ($LASTEXITCODE -ne 0) {
 Set-Location $RepoRoot
 
 # 2. Prepare Target Directory
-if (Test-Path $AbsTargetDir) {
+if (Test-Path -LiteralPath $AbsTargetDir) {
     Write-Host "Cleaning existing deployment directory (keeping venv)..."
-    # Get all items in the target directory except 'venv' and delete them
-    Get-ChildItem -Path $AbsTargetDir | Where-Object { $_.Name -ne "venv" } | Remove-Item -Recurse -Force
+    # Get all items in the target directory except 'venv' and delete them.
+    # -LiteralPath everywhere: child names containing wildcard characters must still be handled.
+    Get-ChildItem -LiteralPath $AbsTargetDir | Where-Object { $_.Name -ne "venv" } | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force }
 } else {
     New-Item -ItemType Directory -Path $AbsTargetDir | Out-Null
 }
@@ -35,7 +122,7 @@ Write-Host "Copying Backend Files..."
 $foldersToCopy = @("backend", "DataAPI", "Common", "Plot", "Math", "KLine", "Seg", "Bi", "BuySellPoint", "ChanModel", "Combiner", "ZS")
 foreach ($folder in $foldersToCopy) {
     if (Test-Path $folder) {
-        Copy-Item -Path $folder -Destination $AbsTargetDir -Recurse
+        Copy-Item -LiteralPath $folder -Destination $AbsTargetDir -Recurse
     } else {
         Write-Warning "Folder not found: $folder"
     }
@@ -45,18 +132,18 @@ foreach ($folder in $foldersToCopy) {
 $rootFiles = @("Chan.py", "ChanConfig.py", "__init__.py")
 foreach ($file in $rootFiles) {
     if (Test-Path $file) {
-        Copy-Item -Path $file -Destination $AbsTargetDir
+        Copy-Item -LiteralPath $file -Destination $AbsTargetDir
     }
 }
 
 # Copy Config Files
 if (Test-Path ".env") {
-    Copy-Item -Path ".env" -Destination $AbsTargetDir
+    Copy-Item -LiteralPath ".env" -Destination $AbsTargetDir
 } else {
     Write-Warning ".env not found; skipping."
 }
 if (Test-Path "requirements.txt") {
-    Copy-Item -Path "requirements.txt" -Destination $AbsTargetDir
+    Copy-Item -LiteralPath "requirements.txt" -Destination $AbsTargetDir
 } else {
     Write-Warning "requirements.txt not found; skipping."
 }
@@ -75,7 +162,7 @@ if (Test-Path $TargetVenv) {
     $VenvPath = Join-Path $RepoRoot "venv"
     if (Test-Path $VenvPath) {
         Write-Host "Copying venv from repository..."
-        Copy-Item -Path $VenvPath -Destination $AbsTargetDir -Recurse
+        Copy-Item -LiteralPath $VenvPath -Destination $AbsTargetDir -Recurse
     } else {
         Write-Host "Venv not found in repository. Creating new venv..."
         python -m venv $TargetVenv

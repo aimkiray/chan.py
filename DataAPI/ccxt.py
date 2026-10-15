@@ -24,8 +24,8 @@ def GetColumnNameFromFieldList(fileds: str):
 class CCXT(CCommonStockApi):
     is_connect = None
 
-    def __init__(self, code, k_type=KL_TYPE.K_DAY, begin_date=None, end_date=None, autype=AUTYPE.QFQ):
-        super(CCXT, self).__init__(code, k_type, begin_date, end_date, autype)
+    def __init__(self, code, k_type=KL_TYPE.K_DAY, begin_date=None, end_date=None, autype=AUTYPE.QFQ, asset_type="STOCK"):
+        super(CCXT, self).__init__(code, k_type, begin_date, end_date, autype, asset_type)
 
     def get_kl_data(self):
         fields = "time,open,high,low,close"

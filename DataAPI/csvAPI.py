@@ -1,4 +1,5 @@
 import os
+import re
 
 from Common.CEnum import DATA_FIELD, KL_TYPE
 from Common.ChanException import CChanException, ErrCode
@@ -7,6 +8,9 @@ from Common.func_util import str2float
 from KLine.KLine_Unit import CKLine_Unit
 
 from .CommonStockAPI import CCommonStockApi
+
+# code whitelist: "<market>.<code>" (e.g. sh.600000/sz.399001/bj.430047) or bare alphanumeric
+_SAFE_CODE_PATTERN = re.compile(r"^[a-zA-Z0-9]+(\.[a-zA-Z0-9]+)?$")
 
 
 def create_item_dict(data, column_name):
@@ -41,7 +45,9 @@ def parse_time_column(inp):
 
 
 class CSV_API(CCommonStockApi):
-    def __init__(self, code, k_type=KL_TYPE.K_DAY, begin_date=None, end_date=None, autype=None):
+    def __init__(self, code, k_type=KL_TYPE.K_DAY, begin_date=None, end_date=None, autype=None, asset_type="STOCK"):
+        if not _SAFE_CODE_PATTERN.match(str(code or "")):
+            raise CChanException(f"invalid csv code: {code!r}", ErrCode.PARA_ERROR)
         self.headers_exist = True  # 第一行是否是标题，如果是数据，设置为False
         self.columns = [
             DATA_FIELD.FIELD_TIME,
@@ -54,12 +60,23 @@ class CSV_API(CCommonStockApi):
             # DATA_FIELD.FIELD_TURNRATE,
         ]  # 每一列字段
         self.time_column_idx = self.columns.index(DATA_FIELD.FIELD_TIME)
-        super(CSV_API, self).__init__(code, k_type, begin_date, end_date, autype)
+        super(CSV_API, self).__init__(code, k_type, begin_date, end_date, autype, asset_type)
+
+    def _resolve_file_path(self):
+        cur_path = os.path.dirname(os.path.realpath(__file__))
+        data_dir = os.path.realpath(os.path.join(cur_path, ".."))
+        k_type = self.k_type.name[2:].lower()
+        file_path = os.path.realpath(os.path.join(data_dir, f"{self.code}_{k_type}.csv"))
+        try:
+            in_data_dir = os.path.commonpath([data_dir, file_path]) == data_dir
+        except ValueError:
+            in_data_dir = False
+        if not in_data_dir:
+            raise CChanException(f"csv file path escapes data dir: {file_path}", ErrCode.PARA_ERROR)
+        return file_path
 
     def get_kl_data(self):
-        cur_path = os.path.dirname(os.path.realpath(__file__))
-        k_type = self.k_type.name[2:].lower()
-        file_path = f"{cur_path}/../{self.code}_{k_type}.csv"
+        file_path = self._resolve_file_path()
         if not os.path.exists(file_path):
             raise CChanException(f"file not exist: {file_path}", ErrCode.SRC_DATA_NOT_FOUND)
 

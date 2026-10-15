@@ -3456,7 +3456,12 @@ def train_model_from_xy(X_train, y_train, model_type="xgboost", n_jobs=-1, use_s
         used_X_train, used_y_train, used_X_val, used_y_val = _split_train_val_time_order(X_train, y_train, _min_val_fraction())
 
     fit_kwargs = {}
-    if model_type in ["xgboost", "lightgbm"] and used_X_val and used_y_val:
+    # LGBMClassifier.fit() accepts no `verbose` kwarg, and its eval_set data is
+    # not validated/coerced (X here is a plain list of lists -> TypeError).
+    # eval_set never affects training (no early stopping configured), so only
+    # xgboost gets fit kwargs; lightgbm stays silent via verbosity=-1 already
+    # set in build_estimator.
+    if model_type == "xgboost" and used_X_val and used_y_val:
         fit_kwargs["eval_set"] = [(used_X_val, used_y_val)]
         fit_kwargs["verbose"] = False
     model.fit(used_X_train, used_y_train, **fit_kwargs)
@@ -7183,7 +7188,9 @@ def delete_pretrained_model_bundle_by_key(key: str):
         pass
 
     try:
-        bp = str(meta.get("bundle_path") or bundle_path)
+        # meta["bundle_path"] is informational only; only the conventional
+        # cache path derived from the validated key may be removed.
+        bp = bundle_path
         if bp and os.path.exists(bp):
             os.remove(bp)
             removed_bundle = True
@@ -7337,8 +7344,10 @@ def load_pretrained_model_bundle_by_key(key: str):
     meta = get_pretrained_model_detail_by_key(key)
     if not meta:
         return None
-    bundle_path = meta.get("bundle_path")
-    if not bundle_path or not os.path.exists(bundle_path):
+    # meta["bundle_path"] is informational only; always load from the
+    # conventional cache path derived from the validated key.
+    bundle_path, _meta_path = _pretrained_model_paths_by_key(str(key).strip())
+    if not os.path.exists(bundle_path):
         return None
     with gzip.open(bundle_path, "rb") as f:
         bundle = pickle.load(f)

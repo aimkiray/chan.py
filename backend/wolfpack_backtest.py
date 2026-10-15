@@ -645,6 +645,10 @@ def _simulate_universe_daily_topn(
             if buy_trade_min is not None:
                 break
 
+    # same minute _buy_at_px will use: sell_trade_min and buy_trade_min are both
+    # decision_min whenever the decision-px path is enabled, else open (9:30)
+    buy_exec_min = int(decision_min) if (bool(decision_px_enabled) and int(decision_min) > (9 * 60 + 30)) else None
+
     def _format_day_time(dk: int, use_close: bool) -> str:
         try:
             s = str(int(dk))
@@ -732,6 +736,8 @@ def _simulate_universe_daily_topn(
     positions: Dict[str, dict] = {}
     trade_logs: List[dict] = []
     daily_stats: List[dict] = []
+    pending_rows: List[dict] = []
+    pending_stop_sell: List[str] = []
 
     def _equity_at_px(dk: int, use_close: bool) -> float:
         tot = float(cash)
@@ -754,6 +760,20 @@ def _simulate_universe_daily_topn(
             return float(v / float(base_capital))
         return float(v)
 
+    def _resolve_trade_px(code: str, dk: int, trade_min: Optional[int]) -> Tuple[Optional[float], Optional[int]]:
+        if trade_min is None:
+            return None, None
+        m = daily_oc_by_code.get(str(code)) or {}
+        dd = m.get(int(dk)) or {}
+        raw = dd.get("decision_px")
+        try:
+            px0 = float(raw) if raw is not None else None
+        except Exception:
+            px0 = None
+        if px0 is not None and px0 > 0.0 and np.isfinite(px0):
+            return float(px0), int(trade_min)
+        return None, None
+
     def _sell_at_px(codes: List[str], dk: int, use_close: bool, reason_by_code: Optional[Dict[str, str]] = None, trade_min: Optional[int] = None) -> int:
         nonlocal cash
         sold = 0
@@ -761,23 +781,11 @@ def _simulate_universe_daily_topn(
             p = positions.get(str(code))
             if not p:
                 continue
-            used_trade_min = None
-            if trade_min is not None:
-                m = daily_oc_by_code.get(str(code)) or {}
-                dd = m.get(int(dk)) or {}
-                raw = dd.get("decision_px")
-                try:
-                    px0 = float(raw) if raw is not None else None
-                except Exception:
-                    px0 = None
-                if px0 is not None and px0 > 0.0 and np.isfinite(px0):
-                    used_trade_min = int(trade_min)
-                    px = float(px0)
-                    time_text = _format_day_time_at_min(int(dk), int(used_trade_min))
-                    trade_ts = _format_day_ts_at_min(int(dk), int(used_trade_min))
-                else:
-                    used_trade_min = None
-            if used_trade_min is None:
+            px, used_trade_min = _resolve_trade_px(str(code), int(dk), trade_min)
+            if used_trade_min is not None:
+                time_text = _format_day_time_at_min(int(dk), int(used_trade_min))
+                trade_ts = _format_day_ts_at_min(int(dk), int(used_trade_min))
+            else:
                 o, c = _get_oc(code, dk)
                 px = c if use_close else o
                 time_text = _format_day_time(int(dk), bool(use_close))
@@ -866,23 +874,11 @@ def _simulate_universe_daily_topn(
             code = str(r.get("code") or "").strip()
             if not code or code in positions:
                 continue
-            used_trade_min = None
-            if trade_min is not None:
-                m = daily_oc_by_code.get(str(code)) or {}
-                dd = m.get(int(dk)) or {}
-                raw = dd.get("decision_px")
-                try:
-                    px0 = float(raw) if raw is not None else None
-                except Exception:
-                    px0 = None
-                if px0 is not None and px0 > 0.0 and np.isfinite(px0):
-                    used_trade_min = int(trade_min)
-                    px = float(px0)
-                    time_text = _format_day_time_at_min(int(dk), int(used_trade_min))
-                    trade_ts = _format_day_ts_at_min(int(dk), int(used_trade_min))
-                else:
-                    used_trade_min = None
-            if used_trade_min is None:
+            px, used_trade_min = _resolve_trade_px(str(code), int(dk), trade_min)
+            if used_trade_min is not None:
+                time_text = _format_day_time_at_min(int(dk), int(used_trade_min))
+                trade_ts = _format_day_ts_at_min(int(dk), int(used_trade_min))
+            else:
                 o, c = _get_oc(code, dk)
                 px = c if use_close else o
                 time_text = _format_day_time(int(dk), bool(use_close))
@@ -945,6 +941,11 @@ def _simulate_universe_daily_topn(
             bought += 1
         return int(bought)
 
+    def _buy_decision_ts(code: str, dk: int) -> Optional[int]:
+        _, used_min = _resolve_trade_px(str(code), int(dk), buy_exec_min)
+        minute = int(used_min) if used_min is not None else (9 * 60 + 30)
+        return _format_day_ts_at_min(int(dk), int(minute))
+
     for dk in day_list:
         market_ok = bool(_market_data_ok(int(dk)))
         index_allowed = True
@@ -998,7 +999,21 @@ def _simulate_universe_daily_topn(
             day_tn = tn
             risk_flat = False
 
-        rows = by_day.get(int(dk)) or []
+        rows = pending_rows + list(by_day.get(int(dk)) or [])
+        pending_rows = []
+        if rows:
+            eligible_rows = []
+            for r in rows:
+                try:
+                    sig_ts = int((r or {}).get("ts") or 0)
+                except Exception:
+                    sig_ts = 0
+                dec_ts = _buy_decision_ts(str((r or {}).get("code") or ""), int(dk))
+                if sig_ts > 0 and dec_ts is not None and int(sig_ts) > int(dec_ts):
+                    pending_rows.append(r)  # signal is later than today's decision moment; defer to next trading day
+                    continue
+                eligible_rows.append(r)
+            rows = eligible_rows
         intraday_before = int(len(rows))
         if intraday_cfg and bool(intraday_cfg.get("enabled")) and rows:
             try:
@@ -1013,13 +1028,12 @@ def _simulate_universe_daily_topn(
             prev_close = (intraday_cfg.get("prev_close_by_day") or {}).get(int(dk))
             ma20 = (intraday_cfg.get("ma20_by_day") or {}).get(int(dk))
             get_px = intraday_cfg.get("get_index_close_at_ts")
-            daily_low = (intraday_cfg.get("daily_low_by_day") or {}).get(int(dk))
             missing = []
             if prev_close is None:
                 missing.append("prev_close")
             if ma20 is None:
                 missing.append("ma20")
-            if (not callable(get_px)) and daily_low is None:
+            if not callable(get_px):
                 missing.append("current_price")
             if missing:
                 if fail_mode == "flat":
@@ -1028,6 +1042,8 @@ def _simulate_universe_daily_topn(
                     day_tn = min(int(day_tn), 1) if int(day_tn) > 0 else 0
 
             next_rows = []
+            px_eval = 0
+            px_missing = 0
             for r in rows:
                 try:
                     ts = int(r.get("ts") or 0)
@@ -1039,8 +1055,10 @@ def _simulate_universe_daily_topn(
                         cur_px = get_px(ts)
                     except Exception:
                         cur_px = None
-                if cur_px is None:
-                    cur_px = daily_low
+                if ts > 0:
+                    px_eval += 1
+                    if cur_px is None:
+                        px_missing += 1
                 if prev_close is None or ma20 is None or cur_px is None:
                     next_rows.append(r)
                     continue
@@ -1059,6 +1077,12 @@ def _simulate_universe_daily_topn(
                 if float(change) <= float(threshold):
                     continue
                 next_rows.append(r)
+            if "current_price" not in missing and px_eval > 0 and px_missing >= px_eval:
+                # no signal-time index price available at all; same data-fail semantics
+                if fail_mode == "flat":
+                    day_tn = 0
+                elif fail_mode == "reduce":
+                    day_tn = min(int(day_tn), 1) if int(day_tn) > 0 else 0
             rows = next_rows
         intraday_after = int(len(rows))
 
@@ -1073,6 +1097,9 @@ def _simulate_universe_daily_topn(
         has_targets = bool(target_codes)
 
         forced_sell = []
+        if pending_stop_sell:
+            forced_sell = list(dict.fromkeys([str(c) for c in pending_stop_sell if str(c) in positions]))
+        next_stop_sell = []
         for code, p in list((positions or {}).items()):
             o, c = _get_oc(code, dk)
             if c is None or c <= 0.0:
@@ -1085,7 +1112,8 @@ def _simulate_universe_daily_topn(
             if ep > 0.0:
                 ret = float(c / ep - 1.0)
                 if float(ret) <= float(sl):
-                    forced_sell.append(str(code))
+                    next_stop_sell.append(str(code))  # stop is judged on today's close; earliest execution is next trading day
+        pending_stop_sell = next_stop_sell
 
         out_of_pool_sell = []
         if bool(force_sell_out_of_pool) and (universe_allow_by_day is not None):
@@ -1816,15 +1844,12 @@ class WolfpackBacktester:
                 w = max(2, int(w))
                 closes = [float(d.get("close") or 0.0) for d in daily]
                 days = [int(d.get("day") or 0) for d in daily]
-                lows = [float(d.get("low") or 0.0) for d in daily]
                 prev_close_by_day = {}
                 ma20_by_day = {}
-                daily_low_by_day = {}
                 for i in range(len(days)):
                     dk = int(days[i])
                     if dk <= 0:
                         continue
-                    daily_low_by_day[dk] = float(lows[i]) if lows[i] and lows[i] > 0.0 else None
                     if i - 1 >= 0 and closes[i - 1] and closes[i - 1] > 0.0:
                         prev_close_by_day[dk] = float(closes[i - 1])
                     if i >= w:
@@ -1857,7 +1882,6 @@ class WolfpackBacktester:
                     "data_fail_mode": str(risk_intraday_data_fail_mode or "reduce"),
                     "ma20_by_day": ma20_by_day,
                     "prev_close_by_day": prev_close_by_day,
-                    "daily_low_by_day": daily_low_by_day,
                     "get_index_close_at_ts": _get_index_close_at_ts,
                 }
             else:
@@ -1868,7 +1892,6 @@ class WolfpackBacktester:
                     "data_fail_mode": str(risk_intraday_data_fail_mode or "reduce"),
                     "ma20_by_day": {},
                     "prev_close_by_day": {},
-                    "daily_low_by_day": {},
                     "get_index_close_at_ts": None,
                 }
 

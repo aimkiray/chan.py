@@ -107,18 +107,31 @@ class PortfolioService:
             }
 
     def add_position(self, portfolio_id: int, code: str, volume: int, price: float, name: str = ""):
+        if volume == 0:
+            # A zero-volume trade is meaningless input (likely a caller bug);
+            # reject it explicitly instead of silently no-op'ing.
+            raise ValueError("volume must be non-zero (positive to add, negative to reduce)")
         with self.get_session() as db:
             # Check if exists
             pos = db.query(Position).filter(Position.portfolio_id == portfolio_id, Position.code == code).first()
             if pos:
-                # Average down/up
                 new_vol = pos.volume + volume
-                if new_vol > 0:
-                    new_avg = (pos.volume * pos.avg_price + volume * price) / new_vol
+                if new_vol < 0:
+                    # Oversell would corrupt the position; reject and keep the row.
+                    raise ValueError(
+                        f"oversell rejected: holding {pos.volume} of {code}, cannot reduce by {abs(volume)}"
+                    )
+                if new_vol == 0:
+                    db.delete(pos) # Fully closed
+                elif volume > 0:
+                    # Add to position: weighted average cost
+                    pos.avg_price = (pos.volume * pos.avg_price + volume * price) / new_vol
                     pos.volume = new_vol
-                    pos.avg_price = new_avg
+                    pos.updated_at = datetime.datetime.utcnow()
                 else:
-                    db.delete(pos) # Closed
+                    # Reduce position: decrease volume only, keep avg_price unchanged
+                    pos.volume = new_vol
+                    pos.updated_at = datetime.datetime.utcnow()
             else:
                 if volume > 0:
                     pos = Position(
@@ -130,6 +143,8 @@ class PortfolioService:
                         current_price=price
                     )
                     db.add(pos)
+                else:
+                    raise ValueError(f"cannot reduce non-existent position {code}")
             db.commit()
 
     def update_prices(self, price_map: Dict[str, float]):

@@ -2,6 +2,7 @@ import akshare as ak
 import pandas as pd
 import datetime
 from Common.CEnum import AUTYPE, DATA_FIELD, KL_TYPE
+from Common.ChanException import CChanException, ErrCode
 from Common.CTime import CTime
 from Common.func_util import str2float, kltype_lt_day
 from KLine.KLine_Unit import CKLine_Unit
@@ -34,10 +35,30 @@ class CAkShare(CCommonStockApi):
     def __init__(self, code, k_type=KL_TYPE.K_DAY, begin_date=None, end_date=None, autype=AUTYPE.QFQ, asset_type="STOCK"):
         super(CAkShare, self).__init__(code, k_type, begin_date, end_date, autype, asset_type)
 
+    def _is_index(self, symbol: str) -> bool:
+        # Index detection aligned with TdxAPI._is_index_code:
+        # SH indices: sh.000xxx / sh.880xxx / sh.999999; SZ indices: sz.399xxx.
+        # Bare codes keep the legacy 399xxx-only heuristic (sh/sz/bj prefix decides market first).
+        c = str(self.code or "").strip().lower()
+        s6 = str(symbol or "").strip()
+        heuristic = (
+            (c.startswith("sh") and (s6.startswith("000") or s6.startswith("880") or s6 == "999999"))
+            or (c.startswith("sz") and s6.startswith("399"))
+            or (not c.startswith(("sh", "sz", "bj")) and s6.startswith("399"))
+        )
+        if str(self.asset_type or "").strip().upper() == "INDEX":
+            if not heuristic:
+                msg = f"asset_type=INDEX but code '{self.code}' does not match known index patterns; routing to index API anyway"
+                if msg not in self.warnings:
+                    print(f"[WARNING] {msg}")
+                    self.warnings.append(msg)
+            return True
+        return heuristic
+
     def get_kl_data(self):
         # AkShare uses 6-digit code. Need to strip sh/sz prefix if present
         symbol = self.code.split('.')[-1]
-        is_index = symbol.startswith("399")
+        is_index = self._is_index(symbol)
         
         # Simple heuristic to detect ETF (Start with 51, 52, 56, 58 for SH, 15 for SZ)
         # This is not perfect but covers most ETFs.
@@ -59,7 +80,12 @@ class CAkShare(CCommonStockApi):
             if kltype_lt_day(self.k_type):
                 # Minute data
                 # period: '1', '5', '15', '30', '60'
-                if is_index and hasattr(ak, "index_zh_a_hist_min_em"):
+                if is_index:
+                    if not hasattr(ak, "index_zh_a_hist_min_em"):
+                        raise CChanException(
+                            f"akshare lacks index_zh_a_hist_min_em; cannot fetch minute index data for {self.code}",
+                            ErrCode.SRC_DATA_TYPE_ERR,
+                        )
                     df = ak.index_zh_a_hist_min_em(
                         symbol=symbol,
                         period=period,
@@ -95,7 +121,10 @@ class CAkShare(CCommonStockApi):
                 p_map = {'d': 'daily', 'w': 'weekly', 'm': 'monthly'}
                 p = p_map.get(period, 'daily')
                 
-                if is_etf:
+                if is_index:
+                    # index_kline has no fq adjustment; index_zh_a_hist resolves sh/sz market internally
+                    df = ak.index_zh_a_hist(symbol=symbol, period=p, start_date=start_date, end_date=end_date)
+                elif is_etf:
                     df = ak.fund_etf_hist_em(symbol=symbol, period=p, start_date=start_date, end_date=end_date, adjust=adjust)
                 else:
                     df = ak.stock_zh_a_hist(symbol=symbol, period=p, start_date=start_date, end_date=end_date, adjust=adjust)
@@ -274,7 +303,7 @@ class CAkShare(CCommonStockApi):
     def SetBasciInfo(self):
         # AkShare basic info is separate, we might skip or implement if needed
         self.name = self.code
-        self.is_stock = True
+        self.is_stock = not self._is_index(self.code.split('.')[-1])
 
     @classmethod
     def do_init(cls):
