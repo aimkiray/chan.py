@@ -50,3 +50,7 @@ ETF基础信息列表.csv
 
 # Generated test artifacts
 test.png
+
+# SQLite WAL sidecar files
+*.db-shm
+*.db-wal
