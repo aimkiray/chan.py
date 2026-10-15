@@ -1,4 +1,5 @@
 import copy
+import itertools
 from typing import List, Union, overload
 
 from Bi.Bi import CBi
@@ -55,8 +56,21 @@ class CKLine_List:
         self.last_sure_segseg_start_bi_idx = -1
 
     def __deepcopy__(self, memo):
-        new_obj = CKLine_List(self.kl_type, self.config)
+        # 用 __new__ 起步而非走 __init__：bi/seg/zs/bsp/metric 等成员随后全部
+        # 被深拷贝覆盖，__init__ 里重建一遍纯属白构造（且 deprecated seg_algo 会重复打 warning）
+        cls = self.__class__
+        new_obj: CKLine_List = cls.__new__(cls)
         memo[id(self)] = new_obj
+        new_obj.kl_type = self.kl_type
+        # config 与 CChan.__deepcopy__ 对齐：CChan 先 copy.deepcopy(self.conf, memo)，
+        # 这里取 memo 中那份副本，使拷贝侧各层共享同一个新 conf，
+        # 消除“kl_datas 仍持原 conf / chan.conf 已是新 conf”的双向污染；
+        # 独立深拷贝 CKLine_List 时 memo 里没有，则自行深拷贝保证隔离
+        conf = memo.get(id(self.config))
+        if conf is None:
+            conf = copy.deepcopy(self.config, memo)
+        new_obj.config = conf
+        new_obj.lst = []
         for klc in self.lst:
             klus_new = []
             for klu in klc.lst:
@@ -87,6 +101,9 @@ class CKLine_List:
         new_obj.metric_model_lst = copy.deepcopy(self.metric_model_lst, memo)
         new_obj.step_calculation = copy.deepcopy(self.step_calculation, memo)
         new_obj.seg_bs_point_lst = copy.deepcopy(self.seg_bs_point_lst, memo)
+        # 增量计算游标一并拷贝，否则拷贝侧首次 cal_seg 会全量回扫
+        new_obj.last_sure_seg_start_bi_idx = self.last_sure_seg_start_bi_idx
+        new_obj.last_sure_segseg_start_bi_idx = self.last_sure_segseg_start_bi_idx
         return new_obj
 
     @overload
@@ -102,6 +119,10 @@ class CKLine_List:
         return len(self.lst)
 
     def cal_seg_and_zs(self):
+        if len(self.lst) == 0 or len(self.bi_list) == 0:
+            # 无K线/无笔时无可计算内容，安全返回；
+            # 最高级别空数据由 CChan.load()/trigger_load() 统一抛 ErrCode.NO_DATA
+            return
         if not self.step_calculation:
             self.bi_list.try_add_virtual_bi(self.lst[-1])
         self.last_sure_seg_start_bi_idx = cal_seg(self.bi_list, self.seg_list, self.last_sure_seg_start_bi_idx)
@@ -124,7 +145,17 @@ class CKLine_List:
         if len(self.lst) == 0:
             self.lst.append(CKLine(klu, idx=0))
         else:
-            _dir = self.lst[-1].try_add(klu)
+            last_klc = self.lst[-1]
+            if len(self.lst) == 1 and len(last_klc.lst) == 1:
+                # 首根KLC没有先验方向（原实现恒为UP）：用次根相对首根的位置初始化。
+                # 次根高点更高，或高点持平且低点不更低 -> 向上合并；否则向下。
+                # 对非包含情形该推断与 test_combine 的几何结论一致；对包含情形
+                # 决定首个合并KLC取高高(UP)还是低低(DOWN)，避免与真实走势相反。
+                first_klu = last_klc.lst[0]
+                last_klc.set_dir(KLINE_DIR.UP if klu.high > first_klu.high or
+                                 (klu.high == first_klu.high and klu.low >= first_klu.low)
+                                 else KLINE_DIR.DOWN)
+            _dir = last_klc.try_add(klu)
             if _dir != KLINE_DIR.COMBINE:  # 不需要合并K线
                 self.lst.append(CKLine(klu, idx=len(self.lst), _dir=_dir))
                 if len(self.lst) >= 3:
@@ -135,7 +166,10 @@ class CKLine_List:
                 self.cal_seg_and_zs()
 
     def klu_iter(self, klc_begin_idx=0):
-        for klc in self.lst[klc_begin_idx:]:
+        if klc_begin_idx < 0:
+            # islice 不支持负索引，换算成等价正索引（与原切片语义一致）
+            klc_begin_idx = max(len(self.lst) + klc_begin_idx, 0)
+        for klc in itertools.islice(self.lst, klc_begin_idx, None):
             yield from klc.lst
 
 
@@ -158,9 +192,14 @@ def cal_seg(bi_list, seg_list: CSegListComm, last_sure_seg_start_bi_idx):
             bi.set_seg_idx(cur_seg.idx+1)
             bi_idx -= 1
             continue
-        if bi.idx < cur_seg.start_bi.idx:
-            assert cur_seg.pre
+        while bi.idx < cur_seg.start_bi.idx:
+            # bi 早于当前 seg 覆盖范围：持续回退直到被某个 seg 覆盖。
+            # 正常数据下首 seg 恒从 bi0 开始（含 split_first_seg），因此回退到底属于异常，显式抛错
             cur_seg = cur_seg.pre
+            if cur_seg is None:
+                raise CChanException(
+                    f"bi idx={bi.idx} 未被任何线段覆盖（首线段start_bi.idx={seg_list[0].start_bi.idx}）",
+                    ErrCode.COMMON_ERROR)
         bi.set_seg_idx(cur_seg.idx)
         bi_idx -= 1
 
@@ -191,7 +230,12 @@ def update_zs_in_seg(bi_list, seg_list, zs_list):
                 break
             if zs.is_inside(seg):
                 seg.add_zs(zs)
-            assert zs.begin_bi.idx > 0
+            if zs.begin_bi.idx <= 0:
+                # 首笔起点没有“进中枢的笔”；正常构造路径（CZSList.add_to_free_lst）已禁止
+                # 此类中枢，此处防御显式抛错——不能用 assert（-O 下 bi_list[-1] 静默污染为最新笔）
+                raise CChanException(
+                    f"中枢起点为首个bi(begin_bi.idx={zs.begin_bi.idx})，无前笔可作为bi_in",
+                    ErrCode.COMMON_ERROR)
             zs.set_bi_in(bi_list[zs.begin_bi.idx-1])
             if zs.end_bi.idx+1 < len(bi_list):
                 zs.set_bi_out(bi_list[zs.end_bi.idx+1])

@@ -12,6 +12,13 @@ class CBiConfig:
         bi_end_is_peak=True,
         bi_allow_sub_peak=True,
     ):
+        if bi_algo not in ("normal", "fx"):
+            raise CChanException(f"unknown bi_algo={bi_algo}", ErrCode.PARA_ERROR)
+        for _name, _val in (("is_strict", is_strict), ("gap_as_kl", gap_as_kl),
+                            ("bi_end_is_peak", bi_end_is_peak),
+                            ("bi_allow_sub_peak", bi_allow_sub_peak)):
+            if not isinstance(_val, bool):
+                raise CChanException(f"{_name} must be bool, got {_val!r}", ErrCode.PARA_ERROR)
         self.bi_algo = bi_algo
         self.is_strict = is_strict
         if bi_fx_check == "strict":

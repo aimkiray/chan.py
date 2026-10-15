@@ -44,8 +44,8 @@ class CKLine(CKLine_Combiner[CKLine_Unit]):
 
     def check_fx_valid(self, item2: "CKLine", method, for_virtual=False):
         # for_virtual: 虚笔时使用
-        assert self.next is not None and item2.pre is not None
-        assert self.pre is not None
+        # next 属性本身不带断言，需显式校验；pre 属性访问时已内部断言非 None（不再冗余检查）
+        assert self.next is not None
         assert item2.idx > self.idx
         if self.fx == FX_TYPE.TOP:
             assert for_virtual or item2.fx == FX_TYPE.BOTTOM

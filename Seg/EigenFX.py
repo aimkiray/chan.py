@@ -44,7 +44,9 @@ class CEigenFX:
         combine_dir = self.ele[1].try_add(bi, allow_top_equal=allow_top_equal)
         if combine_dir == KLINE_DIR.COMBINE:
             return False
-        self.ele[2] = CEigen(bi, combine_dir)
+        # 与前两元素一致用 kl_dir 构造；combine_dir 可能是 INCLUDED，死路径中
+        # ele[2] 移位为 ele[0]/ele[1] 后 INCLUDED 方向参与 try_add 会抛错
+        self.ele[2] = CEigen(bi, self.kl_dir)
         if not self.actual_break():
             return self.reset()
         self.ele[1].update_fx(self.ele[0], self.ele[2], exclude_included=self.exclude_included, allow_top_equal=allow_top_equal)  # type: ignore
@@ -53,7 +55,9 @@ class CEigenFX:
         return True if is_fx else self.reset()
 
     def add(self, bi: CBi) -> bool:  # 返回是否出现分形
-        assert bi.dir != self.dir
+        # 业务不变量不用 assert（python -O 下会被剥离，同向笔会静默产出错误分型）
+        if bi.dir == self.dir:
+            raise CChanException(f"特征序列元素的方向必须和线段方向相反! 当前笔:{bi.idx}({bi.dir}) 线段方向:{self.dir}", ErrCode.SEG_EIGEN_ERR)
         self.lst.append(bi)
         if self.ele[0] is None:  # 第一元素
             return self.treat_first_ele(bi)
@@ -84,9 +88,7 @@ class CEigenFX:
         if self.ele[1].gap:
             assert self.ele[0] is not None
             end_bi_idx = self.GetPeakBiIdx()
-            thred_value = bi_lst[end_bi_idx].get_end_val()
-            break_thred = self.ele[0].low if self.is_up() else self.ele[0].high
-            return self.find_revert_fx(bi_lst, end_bi_idx+2, thred_value, break_thred)
+            return self.find_revert_fx(bi_lst, end_bi_idx+2)
         else:
             if not self.actual_break_flag:
                 return None
@@ -109,6 +111,11 @@ class CEigenFX:
     def clear(self):
         self.ele = [None, None, None]
         self.lst = []
+        # actual_break_flag/last_evidence_* 描述的是"当前候选分型"的突破证据，
+        # 清空重建后必须复位，否则上一轮的"未实际突破"结论会被锁存到新分型上
+        self.actual_break_flag = True
+        self.last_evidence_bi = None
+        self.last_evidence_bi_is_sure = False
 
     def __str__(self):
         _t = [f"{[] if ele is None else ','.join([str(b.idx) for b in ele.lst])}" for ele in self.ele]
@@ -145,9 +152,11 @@ class CEigenFX:
         else:
             if ele2_bi.next:
                 if self.is_up() and ele2_bi.next._high() > self.ele[1].high:
-                    ...
+                    # 疑似顶分型被后续笔证伪：非实际突破，落到末尾 return False -> reset()
+                    return False
                 elif self.is_down() and ele2_bi.next._low() < self.ele[1].low:
-                    ...
+                    # 疑似底分型被后续笔证伪：同上
+                    return False
                 else:
                     self.actual_break_flag = False
                     return True
@@ -156,29 +165,29 @@ class CEigenFX:
                 return True
         return False
 
-    def find_revert_fx(self, bi_list: CBiList, begin_idx: int, thred_value: float, break_thred: float):
-        COMMON_COMBINE = False  # 是否用普通分形合并规则处理
+    def find_revert_fx(self, bi_list: CBiList, begin_idx: int):
         # 如果返回None，表示找到最后了
+        if begin_idx >= len(bi_list):
+            return None  # 峰后尚无反向笔可供判定，视同"未找到"等待后续数据
         first_bi_dir = bi_list[begin_idx].dir  # down则是要找顶分型
-        egien_fx = CEigenFX(revert_bi_dir(first_bi_dir), exclude_included=not COMMON_COMBINE, lv=self.lv)  # 顶分型的话要找上升线段
-        for bi in bi_list[begin_idx::2]:
-            if egien_fx.add(bi):
-                if COMMON_COMBINE:
-                    return True
-
+        revert_eigen_fx = CEigenFX(revert_bi_dir(first_bi_dir), exclude_included=True, lv=self.lv)  # 顶分型的话要找上升线段
+        for idx in range(begin_idx, len(bi_list), 2):  # 同向笔序列，步长2避免整段切片拷贝
+            bi = bi_list[idx]
+            if revert_eigen_fx.add(bi):
                 while True:
-                    _test = egien_fx.can_be_end(bi_list)
-                    if not egien_fx.actual_break_flag:
+                    _test = revert_eigen_fx.can_be_end(bi_list)
+                    if not revert_eigen_fx.actual_break_flag:
                         _test = None
                     if _test in [True, None]:
-                        assert egien_fx.ele[2]
-                        self.last_evidence_bi = egien_fx.ele[2].lst[-1]
+                        if revert_eigen_fx.ele[2] is None:
+                            raise CChanException(
+                                f"find_revert_fx: 分型判定成立但第三元素缺失, 笔idx={bi.idx}, lv={self.lv}",
+                                ErrCode.SEG_EIGEN_ERR)
+                        self.last_evidence_bi = revert_eigen_fx.ele[2].lst[-1]
                         if _test is True:
-                            self.last_evidence_bi_is_sure = self.last_evidence_bi.is_used_to_be_sure and egien_fx.last_evidence_bi_is_sure
+                            self.last_evidence_bi_is_sure = self.last_evidence_bi.is_used_to_be_sure and revert_eigen_fx.last_evidence_bi_is_sure
                         return _test
-                    elif not egien_fx.reset():
+                    elif not revert_eigen_fx.reset():
                         break
-            # if (bi.is_down() and bi._low() < thred_value) or (bi.is_up() and bi._high() > thred_value):
-            # 这段逻辑删除的原因参看#272，如果有其他badcase，再看怎么统一修复
-            #     return False
+            # 早期曾用 thred_value/break_thred 提前判否定（参看#272），已移除
         return None

@@ -7,7 +7,7 @@ class DATA_SRC(Enum):
     CCXT = auto()
     CSV = auto()
     AK_SHARE = auto()
-    AKSHARE = auto()
+    AKSHARE = auto()  # AK_SHARE 的拼写别名（兼容用户配置两种写法），GetStockAPI 中两者均映射 CAkShare
     TDX = auto()
     CLICK_HOUSE = auto()
 

@@ -1,6 +1,7 @@
 from typing import List, Optional, Union, overload
 
 from Common.CEnum import FX_TYPE, KLINE_DIR
+from Common.ChanException import CChanException, ErrCode
 from KLine.KLine import CKLine
 
 from .Bi import CBi
@@ -8,10 +9,11 @@ from .BiConfig import CBiConfig
 
 
 class CBiList:
-    def __init__(self, bi_conf=CBiConfig()):
+    def __init__(self, bi_conf: Optional[CBiConfig] = None):
         self.bi_list: List[CBi] = []
         self.last_end = None  # 最后一笔的尾部
-        self.config = bi_conf
+        # 不使用 CBiConfig() 作为默认参数，避免可变默认值跨实例共享
+        self.config = bi_conf if bi_conf is not None else CBiConfig()
 
         self.free_klc_lst = []  # 仅仅用作第一笔未画出来之前的缓存，为了获得更精准的结果而已，不加这块逻辑其实对后续计算没太大影响
 
@@ -40,9 +42,10 @@ class CBiList:
             if self.can_make_bi(klc, exist_free_klc):
                 self.add_new_bi(exist_free_klc, klc)
                 self.last_end = klc
+                self.free_klc_lst = []  # 首笔已确立，缓存分型使命完成
                 return True
+        # 失败时 last_end 仍为 None：它是"最后一笔的尾部"，尚无笔时不应指向普通分型
         self.free_klc_lst.append(klc)
-        self.last_end = klc
         return False
 
     def update_bi(self, klc: CKLine, last_klc: CKLine, cal_virtual: bool) -> bool:
@@ -81,6 +84,11 @@ class CBiList:
         else:
             if for_virtual:
                 self.bi_list[-1].append_sure_end(_tmp_last_bi.end_klc)
+            # 清理幽灵指针：新尾笔不得再指向已被弹出的笔，被弹笔也不得回链/挂线段
+            self.bi_list[-1].next = None
+            _tmp_last_bi.pre = None
+            _tmp_last_bi.next = None
+            _tmp_last_bi.parent_seg = None
             return True
 
     def update_bi_sure(self, klc: CKLine) -> bool:
@@ -103,17 +111,27 @@ class CBiList:
         return _tmp_end != self.get_last_klu_of_last_bi()
 
     def delete_virtual_bi(self):
-        if len(self) > 0 and not self.bi_list[-1].is_sure:
-            sure_end_list = [klc for klc in self.bi_list[-1].sure_end]
+        # while 而非 if：不假设至多一层虚笔，防御连续遗留的虚尾
+        while len(self) > 0 and not self.bi_list[-1].is_sure:
+            sure_end_list = list(self.bi_list[-1].sure_end)
             if len(sure_end_list):
                 self.bi_list[-1].restore_from_virtual_end(sure_end_list[0])
                 self.last_end = self[-1].end_klc
                 for sure_end in sure_end_list[1:]:
+                    # 隐式契约显性化：sure_end 回放出的确定笔必须仍满足成笔校验
+                    # （与创建时相同的 for_virtual 上下文；不满足说明上游逻辑出错）
+                    if not self.can_make_bi(sure_end, self.last_end, for_virtual=True):
+                        raise CChanException(
+                            f"sure_end 回放校验失败: bi_idx={self[-1].idx} sure_end_idx={sure_end.idx}",
+                            ErrCode.BI_ERR)
                     self.add_new_bi(self.last_end, sure_end, is_sure=True)
                     self.last_end = self[-1].end_klc
             else:
-                del self.bi_list[-1]
-        self.last_end = self[-1].end_klc if len(self) > 0 else None
+                _victim = self.bi_list.pop()
+                _victim.pre = None
+                _victim.next = None
+                _victim.parent_seg = None
+            self.last_end = self[-1].end_klc if len(self) > 0 else None
         if len(self) > 0:
             self[-1].next = None
 
@@ -130,7 +148,6 @@ class CBiList:
             return True
         _tmp_klc = klc
         while _tmp_klc and _tmp_klc.idx > self[-1].end_klc.idx:
-            assert _tmp_klc is not None
             if self.can_make_bi(_tmp_klc, self[-1].end_klc, for_virtual=True):
                 # 新增一笔
                 self.add_new_bi(self.last_end, _tmp_klc, is_sure=False)
@@ -150,21 +167,7 @@ class CBiList:
         bi_span = self.get_klc_span(klc, last_end)
         if self.config.is_strict:
             return bi_span >= 4
-        uint_kl_cnt = 0
-        tmp_klc = last_end.next
-        while tmp_klc:
-            uint_kl_cnt += len(tmp_klc.lst)
-            if not tmp_klc.next:
-                # If we reach the end and still haven't met the criteria, checking against klc.idx might fail logic below
-                # But here we just want to count klines between last_end and klc
-                if tmp_klc.idx < klc.idx:
-                     pass # Should continue? But next is None.
-                break
-            if tmp_klc.next.idx < klc.idx:
-                tmp_klc = tmp_klc.next
-            else:
-                break
-        # Relax the constraint: if span is enough, we accept it even if uint_kl_cnt is small in non-strict mode
+        # 非严格模式仅要求 span>=3（历史遗留的 uint_kl_cnt 统计为死代码，已移除）
         return bi_span >= 3
 
     def get_klc_span(self, klc: CKLine, last_end: CKLine) -> int:
@@ -219,22 +222,24 @@ class CBiList:
 
 
 def end_is_peak(last_end: CKLine, cur_end: CKLine) -> bool:
+    # 用 .next 属性而非 get_next()（后者 assert 非 None）：cur_end 不在
+    # next 链上时链尾返回 None，此时按兜底语义返回 True，而非抛 AssertionError
     if last_end.fx == FX_TYPE.BOTTOM:
         cmp_thred = cur_end.high  # 或者严格点选择get_klu_max_high()
-        klc = last_end.get_next()
-        while True:
+        klc = last_end.next
+        while klc is not None:
             if klc.idx >= cur_end.idx:
                 return True
             if klc.high > cmp_thred:
                 return False
-            klc = klc.get_next()
+            klc = klc.next
     elif last_end.fx == FX_TYPE.TOP:
         cmp_thred = cur_end.low  # 或者严格点选择get_klu_min_low()
-        klc = last_end.get_next()
-        while True:
+        klc = last_end.next
+        while klc is not None:
             if klc.idx >= cur_end.idx:
                 return True
             if klc.low < cmp_thred:
                 return False
-            klc = klc.get_next()
+            klc = klc.next
     return True

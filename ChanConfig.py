@@ -144,9 +144,6 @@ class CChanConfig:
                 prop = k.replace("-seg", "")
                 self.seg_bs_point_conf.b_conf.set(prop, v)
                 self.seg_bs_point_conf.s_conf.set(prop, v)
-            elif k in args:
-                self.bs_point_conf.b_conf.set(k, v)
-                self.bs_point_conf.s_conf.set(k, v)
             else:
                 raise CChanException(f"unknown para = {k}", ErrCode.PARA_ERROR)
         self.bs_point_conf.b_conf.parse_target_type()
@@ -157,7 +154,8 @@ class CChanConfig:
 
 class ConfigWithCheck:
     def __init__(self, conf):
-        self.conf = conf
+        # 拷贝一份再消费：get()/items() 会从 dict 中删键，不能污染调用方传入的配置
+        self.conf = dict(conf)
 
     def get(self, k, default_value=None):
         res = self.conf.get(k, default_value)

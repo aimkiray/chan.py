@@ -2,28 +2,31 @@ from Bi.BiList import CBiList
 from Common.CEnum import BI_DIR, SEG_TYPE
 
 from .EigenFX import CEigenFX
-from .SegConfig import CSegConfig
 from .SegListComm import CSegListComm
 
 
 class CSegListChan(CSegListComm):
-    def __init__(self, seg_config=CSegConfig(), lv=SEG_TYPE.BI):
+    def __init__(self, seg_config=None, lv=SEG_TYPE.BI):
         super(CSegListChan, self).__init__(seg_config=seg_config, lv=lv)
+
+    def _pop_last_seg(self):
+        # 弹出尾线段时必须同步清理其覆盖笔的 parent_seg 与前驱的 next，
+        # 否则下游（BSPointList.treat_bsp3_after 等）会读到悬空引用
+        _seg = self.lst.pop()
+        for bi in _seg.bi_list:
+            bi.parent_seg = None
+        if _seg.pre:
+            _seg.pre.next = None
 
     def do_init(self):
         # 删除末尾不确定的线段
         while len(self) and not self.lst[-1].is_sure:
-            _seg = self[-1]
-            for bi in _seg.bi_list:
-                bi.parent_seg = None
-            if _seg.pre:
-                _seg.pre.next = None
-            self.lst.pop()
+            self._pop_last_seg()
         if len(self):
-            assert self.lst[-1].eigen_fx and self.lst[-1].eigen_fx.ele[-1]
-            if not self.lst[-1].eigen_fx.ele[-1].lst[-1].is_sure:
+            eigen_fx = self.lst[-1].eigen_fx
+            if eigen_fx and eigen_fx.ele[-1] and not eigen_fx.ele[-1].lst[-1].is_sure:
                 # 如果确定线段的分形的第三元素包含不确定笔，也需要重新算，不然线段分形元素的高低点可能不对
-                self.lst.pop()
+                self._pop_last_seg()
 
     def update(self, bi_lst: CBiList):
         self.do_init()
@@ -41,7 +44,8 @@ class CSegListChan(CSegListComm):
             last_seg_dir = None if len(self) == 0 else self[-1].dir
 
             fx_eigen = None
-            for bi in bi_lst[cur_begin:]:
+            for _idx in range(cur_begin, len(bi_lst)):  # 索引遍历避免每次尾扫整段切片拷贝
+                bi = bi_lst[_idx]
                 if bi.is_down() and last_seg_dir != BI_DIR.UP:
                     if up_eigen.add(bi):
                         fx_eigen = up_eigen
@@ -82,5 +86,6 @@ class CSegListChan(CSegListComm):
             if is_true:
                 return end_bi_idx + 1
             return None
-        else:
-            return fx_eigen.lst[1].idx
+        # can_be_end 在 #272 注释掉阈值判定后只返回 True/None，以下为
+        # 防御性兜底（不可达）：若未来恢复 False 返回，从第二元素重找
+        return fx_eigen.lst[1].idx

@@ -9,8 +9,6 @@ from KLine.KLine_Unit import CKLine_Unit
 
 class CBi:
     def __init__(self, begin_klc: CKLine, end_klc: CKLine, idx: int, is_sure: bool):
-        # self.__begin_klc = begin_klc
-        # self.__end_klc = end_klc
         self.__dir = None
         self.__idx = idx
         self.__type = BI_TYPE.STRICT
@@ -90,13 +88,11 @@ class CBi:
         return f"{self.dir}|{self.begin_klc} ~ {self.end_klc}"
 
     def check(self):
-        try:
-            if self.is_down():
-                assert self.begin_klc.high > self.end_klc.low
-            else:
-                assert self.begin_klc.low < self.end_klc.high
-        except Exception as e:
-            raise CChanException(f"{self.idx}:{self.begin_klc[0].time}~{self.end_klc[-1].time}笔的方向和收尾位置不一致!", ErrCode.BI_ERR) from e
+        # 业务不变量校验不使用 assert（-O 下会被剥离），非法笔必须显式失败
+        _ok = self.begin_klc.high > self.end_klc.low if self.is_down() \
+            else self.begin_klc.low < self.end_klc.high
+        if not _ok:
+            raise CChanException(f"{self.idx}:{self.begin_klc[0].time}~{self.end_klc[-1].time}笔的方向和收尾位置不一致!", ErrCode.BI_ERR)
 
     def set(self, begin_klc: CKLine, end_klc: CKLine):
         self.__begin_klc: CKLine = begin_klc
@@ -142,8 +138,9 @@ class CBi:
 
     @make_cache
     def get_klc_cnt(self):
-        assert self.end_klc.idx == self.get_end_klu().klc.idx
-        assert self.begin_klc.idx == self.get_begin_klu().klc.idx
+        if self.end_klc.idx != self.get_end_klu().klc.idx or \
+           self.begin_klc.idx != self.get_begin_klu().klc.idx:
+            raise CChanException(f"bi idx={self.idx} 端点klc与峰元klu所属klc不一致", ErrCode.BI_ERR)
         return self.end_klc.idx - self.begin_klc.idx + 1
 
     @make_cache
@@ -217,9 +214,12 @@ class CBi:
 
     @make_cache
     def Cal_Rsi(self):
+        # klu.rsi 是可选属性（仅在 RSI 指标模型启用时由 set_metric 写入）
         rsi_lst: List[float] = []
         for klc in self.klc_lst:
-            rsi_lst.extend(klu.rsi for klu in klc.lst)
+            rsi_lst.extend(klu.rsi for klu in klc.lst if hasattr(klu, "rsi"))
+        if len(rsi_lst) == 0:
+            raise CChanException("Cal_Rsi 需要配置 RSI 指标模型（klu.rsi 不存在）", ErrCode.CONFIG_ERROR)
         return 10000.0/(min(rsi_lst)+1e-7) if self.is_down() else max(rsi_lst)
 
     @make_cache
@@ -238,8 +238,14 @@ class CBi:
     @make_cache
     def Cal_MACD_peak(self):
         peak = 1e-7
+        # 与 Cal_MACD_area 口径一致：只统计 [begin_klu, end_klu] 区间内的 klu，
+        # 端点合并K线内越界的 klu 不计入
+        begin_klu_idx = self.get_begin_klu().idx
+        end_klu_idx = self.get_end_klu().idx
         for klc in self.klc_lst:
             for klu in klc.lst:
+                if klu.idx < begin_klu_idx or klu.idx > end_klu_idx:
+                    continue
                 if abs(klu.macd.macd) > peak:
                     if self.is_down() and klu.macd.macd < 0:
                         peak = abs(klu.macd.macd)
@@ -257,11 +263,14 @@ class CBi:
     def Cal_MACD_half_obverse(self):
         _s = 1e-7
         begin_klu = self.get_begin_klu()
+        end_klu_idx = self.get_end_klu().idx
         peak_macd = begin_klu.macd.macd
         for klc in self.klc_lst:
             for klu in klc.lst:
                 if klu.idx < begin_klu.idx:
                     continue
+                if klu.idx > end_klu_idx:
+                    break  # 越过笔终点峰元，终止（与 area 口径一致）
                 if klu.macd.macd*peak_macd > 0:
                     _s += abs(klu.macd.macd)
                 else:
@@ -275,11 +284,14 @@ class CBi:
     def Cal_MACD_half_reverse(self):
         _s = 1e-7
         begin_klu = self.get_end_klu()
+        start_klu_idx = self.get_begin_klu().idx
         peak_macd = begin_klu.macd.macd
         for klc in self.klc_lst_re:
             for klu in klc[::-1]:
                 if klu.idx > begin_klu.idx:
                     continue
+                if klu.idx < start_klu_idx:
+                    break  # 越过笔起点峰元，终止（与 area 口径一致）
                 if klu.macd.macd*peak_macd > 0:
                     _s += abs(klu.macd.macd)
                 else:
@@ -295,8 +307,12 @@ class CBi:
         macd红绿柱最大值最小值之差
         """
         _max, _min = float("-inf"), float("inf")
+        begin_klu_idx = self.get_begin_klu().idx
+        end_klu_idx = self.get_end_klu().idx
         for klc in self.klc_lst:
             for klu in klc.lst:
+                if klu.idx < begin_klu_idx or klu.idx > end_klu_idx:
+                    continue
                 macd = klu.macd.macd
                 if macd > _max:
                     _max = macd
@@ -323,14 +339,22 @@ class CBi:
             return (end_klu.high-begin_klu.low)/begin_klu.low
 
     def Cal_MACD_trade_metric(self, metric: str, cal_avg=False) -> float:
-        _s = 0
+        # make_cache 只支持零参方法，这里按 (metric, cal_avg) 手工缓存到同一约定缓存槽
+        cache_key = f"Cal_MACD_trade_metric:{metric}:{cal_avg}"
+        cache = getattr(self, "_memoize_cache", None)
+        if cache is None:
+            cache = self._memoize_cache = {}
+        if cache_key in cache:
+            return cache[cache_key]
+        _s = 0.0
+        _cnt = 0
         for klc in self.klc_lst:
             for klu in klc.lst:
                 metric_res = klu.trade_info.metric[metric]
                 if metric_res is None:
-                    return 0.0
+                    continue  # 缺失该指标的 klu 跳过，而不是整笔静默归零
                 _s += metric_res
-        return _s / self.get_klu_cnt() if cal_avg else _s
-
-    # def set_klc_lst(self, lst):
-    #     self.__klc_lst = lst
+                _cnt += 1
+        res = (_s / _cnt if _cnt else 0.0) if cal_avg else _s
+        cache[cache_key] = res
+        return res

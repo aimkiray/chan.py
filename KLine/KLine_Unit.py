@@ -17,6 +17,11 @@ from .TradeInfo import CTradeInfo
 class CKLine_Unit:
     def __init__(self, kl_dict, autofix=False):
         # _time, _close, _open, _high, _low, _extra_info={}
+        for field in (DATA_FIELD.FIELD_TIME, DATA_FIELD.FIELD_OPEN, DATA_FIELD.FIELD_CLOSE,
+                      DATA_FIELD.FIELD_HIGH, DATA_FIELD.FIELD_LOW):
+            if field not in kl_dict:
+                raise CChanException(f"kl_dict missing required field: {field}, keys={list(kl_dict)}",
+                                     ErrCode.SRC_DATA_FORMAT_ERROR)
         self.kl_type = None
         self.time: CTime = kl_dict[DATA_FIELD.FIELD_TIME]
         self.close = kl_dict[DATA_FIELD.FIELD_CLOSE]
@@ -36,8 +41,10 @@ class CKLine_Unit:
         from KLine.KLine import CKLine
         self.__klc: Optional[CKLine] = None  # 指向KLine
 
-        # self.macd: Optional[CMACD_item] = None
-        # self.boll: Optional[BOLL_Metric] = None
+        # macd/boll 由 set_metric 填充；此处先置 None，
+        # 保证未走 add_single_klu 的裸 KLU 也能被 deepcopy/属性探测安全访问
+        self.macd: Optional[CMACD_item] = None
+        self.boll: Optional[BOLL_Metric] = None
         self.trend: Dict[TREND_TYPE, Dict[int, float]] = {}  # int -> float
 
         self.limit_flag = 0  # 0:普通 -1:跌停，1:涨停
@@ -48,7 +55,7 @@ class CKLine_Unit:
 
     def __deepcopy__(self, memo):
         _dict = {
-            DATA_FIELD.FIELD_TIME: self.time,
+            DATA_FIELD.FIELD_TIME: copy.deepcopy(self.time, memo),  # CTime 为值对象，须深拷贝而非共享引用
             DATA_FIELD.FIELD_CLOSE: self.close,
             DATA_FIELD.FIELD_OPEN: self.open,
             DATA_FIELD.FIELD_HIGH: self.high,
@@ -58,6 +65,7 @@ class CKLine_Unit:
             if metric in self.trade_info.metric:
                 _dict[metric] = self.trade_info.metric[metric]
         obj = CKLine_Unit(_dict)
+        obj.kl_type = self.kl_type  # KL_TYPE 枚举为不可变单例，直接共享
         obj.demark = copy.deepcopy(self.demark, memo)
         obj.trend = copy.deepcopy(self.trend, memo)
         obj.limit_flag = self.limit_flag

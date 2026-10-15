@@ -1,7 +1,8 @@
-from typing import List, Union, overload
+from typing import List, Optional, Union, overload
 
 from Bi.Bi import CBi
 from Bi.BiList import CBiList
+from Common.ChanException import CChanException, ErrCode
 from Common.func_util import revert_bi_dir
 from Seg.Seg import CSeg
 from Seg.SegListComm import CSegListComm
@@ -11,10 +12,11 @@ from .ZS import CZS
 
 
 class CZSList:
-    def __init__(self, zs_config=CZSConfig()):
+    def __init__(self, zs_config: Optional[CZSConfig] = None):
         self.zs_lst: List[CZS] = []
 
-        self.config = zs_config
+        # 不使用 CZSConfig() 作为默认参数，避免可变默认值跨实例共享
+        self.config = zs_config if zs_config is not None else CZSConfig()
         self.free_item_lst = []
 
         self.last_sure_pos = -1
@@ -27,6 +29,9 @@ class CZSList:
         while _seg_idx >= 0:
             seg = seg_list[_seg_idx]
             if seg.is_sure:
+                # 必须回退到最后一个确定段的起点（而非终点）：该段内可能有
+                # 在 seg 尚非 sure 时以 is_sure=False 构造的中枢，重算会把它们
+                # 正确升级为 is_sure=True；保守一拍是语义需要而非冗余
                 self.last_sure_pos = seg.start_bi.idx
                 self.last_seg_idx = seg.idx
                 return
@@ -41,15 +46,23 @@ class CZSList:
             self.free_item_lst = self.free_item_lst[:-1]
         self.free_item_lst.append(item)
         res = self.try_construct_zs(self.free_item_lst, is_sure, zs_algo)  # 可能是一笔中枢
-        if res is not None and res.begin_bi.idx > 0:  # 禁止第一笔就是中枢的起点
-            self.zs_lst.append(res)
-            self.clear_free_lst()
-            self.try_combine()
+        if res is not None:
+            if res.begin_bi.idx > 0:  # 禁止第一笔就是中枢的起点
+                self.zs_lst.append(res)
+                self.clear_free_lst()
+                self.try_combine()
+            else:
+                # 中枢被丢弃后必须把其起点元素移出 free_item_lst；
+                # 否则在 one_bi_zs 模式下 idx==0 元素会永久驻留并反复污染构造
+                self.free_item_lst = [item for item in self.free_item_lst
+                                      if item.idx > res.begin_bi.idx]
 
     def clear_free_lst(self):
         self.free_item_lst = []
 
-    def update(self, bi: CBi, is_sure=True):
+    def update(self, bi: Union[CBi, CSeg], is_sure=True):
+        # 该路径仅由 add_zs_from_bi_range 在确定/普通段构造场景调用，
+        # 因此固定走 "normal" 构造口径（over_seg 路径由 update_overseg_zs 处理）
         if len(self.free_item_lst) == 0 and self.try_add_to_end(bi):
             # zs_combine_mode=peak合并模式下会触发生效，=zs合并一定无效返回
             self.try_combine()  # 新形成的中枢尝试和之前的中枢合并
@@ -103,7 +116,9 @@ class CZSList:
                 self.clear_free_lst()
                 self.add_zs_from_bi_range(bi_lst[seg_lst[-1].end_bi.idx+1:], revert_bi_dir(seg_lst[-1].dir), False)
         elif self.config.zs_algo == "over_seg":
-            assert self.config.one_bi_zs is False
+            # 配置校验不依赖 assert（-O 下会被剥离）；正常经 CZSConfig 构造已被拦截
+            if self.config.one_bi_zs:
+                raise CChanException("zs_algo='over_seg' 不支持 one_bi_zs=True", ErrCode.CONFIG_ERROR)
             self.clear_free_lst()
             begin_bi_idx = self.zs_lst[-1].end_bi.idx+1 if self.zs_lst else 0
             for bi in bi_lst[begin_bi_idx:]:
@@ -125,7 +140,7 @@ class CZSList:
                         self.update_overseg_zs(bi)
                     break
         else:
-            raise Exception(f"unknown zs_algo {self.config.zs_algo}")
+            raise CChanException(f"unknown zs_algo {self.config.zs_algo}", ErrCode.PARA_ERROR)
         self.update_last_pos(seg_lst)
 
     def update_overseg_zs(self, bi: CBi | CSeg):

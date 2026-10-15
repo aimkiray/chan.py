@@ -1,11 +1,16 @@
-from typing import Generic, List, Optional, TypeVar
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Generic, List, Optional, TypeVar
 
 from Bi.Bi import CBi
-from BuySellPoint.BSPointConfig import CPointConfig
 from Common.ChanException import CChanException, ErrCode
 from Common.func_util import has_overlap
 from KLine.KLine_Unit import CKLine_Unit
 from Seg.Seg import CSeg
+
+if TYPE_CHECKING:
+    # 仅用于类型注解；运行期不引入，避免低层 ZS 反向依赖高层 BuySellPoint
+    from BuySellPoint.BSPointConfig import CPointConfig
 
 LINE_TYPE = TypeVar('LINE_TYPE', CBi, "CSeg")
 
@@ -93,7 +98,8 @@ class CZS(Generic[LINE_TYPE]):
         self.clean_cache()
 
     def is_one_bi_zs(self):
-        assert self.end_bi is not None
+        if self.end_bi is None:
+            raise CChanException("zs.end_bi is None", ErrCode.COMMON_ERROR)
         return self.begin_bi.idx == self.end_bi.idx
 
     def update_zs_end(self, item):
@@ -123,6 +129,8 @@ class CZS(Generic[LINE_TYPE]):
             self.do_combine(zs2)
             return True
         elif combine_mode == 'peak':
+            # 注意与 'zs' 模式的口径差异：peak 模式刻意要求严格重叠（equal=False），
+            # 两中枢峰区间仅边缘相触不合并；'zs' 模式边缘相触即合并
             if has_overlap(self.peak_low, self.peak_high, zs2.peak_low, zs2.peak_high):
                 self.do_combine(zs2)
                 return True
@@ -138,6 +146,7 @@ class CZS(Generic[LINE_TYPE]):
 
         self.__low = min([self.low, zs2.low])
         self.__high = max([self.high, zs2.high])
+        self.__mid = (self.__low + self.__high) / 2  # 合并后中枢中点需随区间重算
         self.__peak_low = min([self.peak_low, zs2.peak_low])
         self.__peak_high = max([self.peak_high, zs2.peak_high])
         self.__end = zs2.end
@@ -168,22 +177,26 @@ class CZS(Generic[LINE_TYPE]):
         else:
             out_metric = out_bi.cal_macd_metric(config.macd_algo, is_reverse=True)
 
+        # +1e-7 防除零（与 BSPointList 中 divergence_rate 的计算口径一致）
         if config.divergence_rate > 100:  # 保送
-            return True, out_metric/in_metric
+            return True, out_metric/(in_metric+1e-7)
         else:
-            return out_metric <= config.divergence_rate*in_metric, out_metric/in_metric
+            return out_metric <= config.divergence_rate*in_metric, out_metric/(in_metric+1e-7)
 
     def init_from_zs(self, zs: 'CZS'):
         self.__begin = zs.begin
         self.__end = zs.end
         self.__low = zs.low
         self.__high = zs.high
+        self.__mid = zs.mid
         self.__peak_high = zs.peak_high
         self.__peak_low = zs.peak_low
         self.__begin_bi = zs.begin_bi
         self.__end_bi = zs.end_bi
         self.__bi_in = zs.bi_in
         self.__bi_out = zs.bi_out
+        self.__bi_lst = list(zs.bi_lst)
+        self.__sub_zs_lst = list(zs.sub_zs_lst)
 
     def make_copy(self) -> 'CZS':
         copy = CZS(lst=None, is_sure=self.is_sure)
@@ -193,13 +206,15 @@ class CZS(Generic[LINE_TYPE]):
     def end_bi_break(self, end_bi=None) -> bool:
         if end_bi is None:
             end_bi = self.get_bi_out()
-        assert end_bi is not None
+        if end_bi is None:
+            raise CChanException("end_bi_break: 出中枢笔不存在", ErrCode.COMMON_ERROR)
         return (end_bi.is_down() and end_bi._low() < self.low) or \
             (end_bi.is_up() and end_bi._high() > self.high)
 
     def out_bi_is_peak(self, end_bi_idx: int):
         # 返回 (是否最低点，bi_out与中枢里面尾部最接近它的差距比例)
-        assert len(self.bi_lst) > 0
+        if len(self.bi_lst) == 0:
+            raise CChanException("out_bi_is_peak: bi_lst 为空", ErrCode.COMMON_ERROR)
         if self.bi_out is None:
             return False, None
         peak_rate = float("inf")
@@ -214,11 +229,13 @@ class CZS(Generic[LINE_TYPE]):
         return True, peak_rate
 
     def get_bi_in(self) -> LINE_TYPE:
-        assert self.bi_in is not None
+        if self.bi_in is None:
+            raise CChanException("zs.bi_in is None", ErrCode.COMMON_ERROR)
         return self.bi_in
 
     def get_bi_out(self) -> LINE_TYPE:
-        assert self.__bi_out is not None
+        if self.__bi_out is None:
+            raise CChanException("zs.bi_out is None", ErrCode.COMMON_ERROR)
         return self.__bi_out
 
     def set_bi_in(self, bi):

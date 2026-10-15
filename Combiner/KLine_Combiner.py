@@ -41,10 +41,19 @@ class CKLine_Combiner(Generic[T]):
     def low(self): return self.__low
 
     @property
-    def lst(self): return self.__lst
+    def lst(self):
+        # 有意返回内部列表的"活视图"而非拷贝：klu_iter/绘图等热路径按引用遍历，
+        # 且增量合并(try_add)后已持有引用处可见最新元素。
+        # 约定：外部只读遍历/索引，不允许绕过 try_add 直接增删改元素。
+        return self.__lst
 
     @property
     def dir(self): return self.__dir
+
+    def set_dir(self, _dir):
+        # 仅用于首根KLC方向延迟初始化等"方向尚未确定"场景，
+        # 正常合并方向由 try_add/构造参数决定，请勿随意改写
+        self.__dir = _dir
 
     @property
     def fx(self): return self.__fx
@@ -75,6 +84,7 @@ class CKLine_Combiner(Generic[T]):
         if (self.high < item.high and self.low < item.low):
             return KLINE_DIR.UP
         else:
+            # 防御分支：上方四分支已穷尽 (高,低)x{<,=,>} 全部 9 种组合，理论不可达
             raise CChanException("combine type unknown", ErrCode.COMBINER_ERR)
 
     def set_fx(self, fx: FX_TYPE):
@@ -128,6 +138,8 @@ class CKLine_Combiner(Generic[T]):
         # allow_top_equal = None普通模式
         # allow_top_equal = 1 被包含，顶部相等不合并
         # allow_top_equal = -1 被包含，底部相等不合并
+        # 注意：顶底判定为严格不等式；等值极值（如 _pre/_next 与 self 高点相同）
+        # 会使 fx 保持 FX_TYPE.UNKNOWN（即不认定为分型），属既定语义而非疏漏
         self.set_next(_next)
         self.set_pre(_pre)
         _next.set_pre(self)

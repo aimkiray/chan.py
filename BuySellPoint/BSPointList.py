@@ -3,6 +3,7 @@ from typing import Dict, Generic, Iterable, List, Optional, Tuple, TypeVar
 from Bi.Bi import CBi
 from Bi.BiList import CBiList
 from Common.CEnum import BSP_TYPE
+from Common.ChanException import CChanException, ErrCode
 from Common.func_util import has_overlap
 from Seg.Seg import CSeg
 from Seg.SegListComm import CSegListComm
@@ -31,15 +32,30 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
         if bsp_type not in self.bsp_store_dict:
             self.bsp_store_dict[bsp_type] = ([], [])
         if len(self.bsp_store_dict[bsp_type][bsp.is_buy]) > 0:
-            assert self.bsp_store_dict[bsp_type][bsp.is_buy][-1].bi.idx < bsp.bi.idx, f"{bsp_type}, {bsp.is_buy} {self.bsp_store_dict[bsp_type][bsp.is_buy][-1].bi.idx} {bsp.bi.idx}"
+            # 存储单调性不变量不用 assert（python -O 下会被剥离）
+            if self.bsp_store_dict[bsp_type][bsp.is_buy][-1].bi.idx >= bsp.bi.idx:
+                raise CChanException(
+                    f"bsp store 乱序: {bsp_type}, {bsp.is_buy} "
+                    f"{self.bsp_store_dict[bsp_type][bsp.is_buy][-1].bi.idx} {bsp.bi.idx}",
+                    ErrCode.COMMON_ERROR)
         self.bsp_store_dict[bsp_type][bsp.is_buy].append(bsp)
         self.bsp_store_flat_dict[bsp.bi.idx] = bsp
 
     def add_bsp1(self, bsp: CBS_Point[LINE_TYPE]):
         if len(self.bsp1_list) > 0:
-            assert self.bsp1_list[-1].bi.idx < bsp.bi.idx
+            if self.bsp1_list[-1].bi.idx >= bsp.bi.idx:
+                raise CChanException(
+                    f"bsp1 store 乱序: {self.bsp1_list[-1].bi.idx} {bsp.bi.idx}",
+                    ErrCode.COMMON_ERROR)
         self.bsp1_list.append(bsp)
         self.bsp1_dict[bsp.bi.idx] = bsp
+
+    def _clear_relate_of(self, removed_bsp: CBS_Point[LINE_TYPE]):
+        # 被撤买卖点可能仍被其它点的 relate_bsp1 反向引用；
+        # 断开悬空引用，避免被撤对象继续存活并流入下游特征/ML 样本
+        for other_bsp in self.bsp_iter():
+            if other_bsp.relate_bsp1 is removed_bsp:
+                other_bsp.relate_bsp1 = None
 
     def clear_store_end(self):
         for bsp_list in self.bsp_store_dict.values():
@@ -47,19 +63,26 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
                 while len(bsp_list[is_buy]) > 0:
                     if bsp_list[is_buy][-1].bi.get_end_klu().idx <= self.last_sure_pos:
                         break
-                    del self.bsp_store_flat_dict[bsp_list[is_buy][-1].bi.idx]
-                    # 同时把失效买卖点从Bi删除
-                    bsp_list[is_buy][-1].bi.bsp = None
+                    removed_bsp = bsp_list[is_buy][-1]
+                    del self.bsp_store_flat_dict[removed_bsp.bi.idx]
+                    # 同时把失效买卖点从Bi删除；bi.bsp 可能已被更新的点覆盖，只做同身份清除
+                    if removed_bsp.bi.bsp is removed_bsp:
+                        removed_bsp.bi.bsp = None
                     bsp_list[is_buy].pop()
+                    self._clear_relate_of(removed_bsp)
 
     def clear_bsp1_end(self):
         while len(self.bsp1_list) > 0:
             if self.bsp1_list[-1].bi.get_end_klu().idx <= self.last_sure_pos:
                 break
-            del self.bsp1_dict[self.bsp1_list[-1].bi.idx]
+            removed_bsp = self.bsp1_list[-1]
+            del self.bsp1_dict[removed_bsp.bi.idx]
             self.bsp1_list.pop()
+            self._clear_relate_of(removed_bsp)
 
     def bsp_iter(self) -> Iterable[CBS_Point[LINE_TYPE]]:
+        # 注意：不保证全局有序（按类型桶再按买卖侧遍历）；
+        # 需要时序顺序的消费者请使用 getSortedBspList()/bsp_iter_v2()
         for bsp_list in self.bsp_store_dict.values():
             yield from bsp_list[True]
             yield from bsp_list[False]
@@ -131,10 +154,16 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
     ):
         is_buy = bi.is_down()
         if exist_bsp := self.bsp_store_flat_dict.get(bi.idx):
-            assert exist_bsp.is_buy == is_buy
-            exist_bsp.add_another_bsp_prop(bs_type, relate_bsp1)
-            if feature_dict is not None:
-                exist_bsp.add_feat(feature_dict)
+            if exist_bsp.is_buy != is_buy:
+                raise CChanException(
+                    f"同一笔上买卖点买卖属性冲突: bi_idx={bi.idx}",
+                    ErrCode.COMMON_ERROR)
+            # 合并分支也必须过 target_types：未配置的类型不能并入 .type
+            # 泄漏到 type2str/下游特征；T1/T1P 作为一买结构始终保留
+            if bs_type in self.config.GetBSConfig(is_buy).target_types or bs_type in [BSP_TYPE.T1, BSP_TYPE.T1P]:
+                exist_bsp.add_another_bsp_prop(bs_type, relate_bsp1)
+                if feature_dict is not None:
+                    exist_bsp.add_feat(feature_dict)
             return
         if bs_type not in self.config.GetBSConfig(is_buy).target_types:
             is_target_bsp = False
@@ -154,6 +183,8 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
         else:
             bsp.bi.bsp = None
         if bs_type in [BSP_TYPE.T1, BSP_TYPE.T1P]:
+            # 未通过 is_target_bsp 过滤的一买/类一买也进 bsp1_list（幻影一买）：
+            # 它们是结构事实，供 bsp2/bsp3 的 follow_1 判定与 relate_bsp1 取值使用
             self.add_bsp1(bsp)
 
     def cal_seg_bs1point(self, seg_list: CSegListComm[LINE_TYPE], bi_list: LINE_LIST_TYPE):
@@ -168,7 +199,8 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
         is_target_bsp = (BSP_CONF.min_zs_cnt <= 0 or zs_cnt >= BSP_CONF.min_zs_cnt)
         if len(seg.zs_lst) > 0 and \
            not seg.zs_lst[-1].is_one_bi_zs() and \
-           ((seg.zs_lst[-1].bi_out and seg.zs_lst[-1].bi_out.idx >= seg.end_bi.idx) or seg.zs_lst[-1].bi_lst[-1].idx >= seg.end_bi.idx) \
+           ((seg.zs_lst[-1].bi_out and seg.zs_lst[-1].bi_out.idx >= seg.end_bi.idx) or
+            (len(seg.zs_lst[-1].bi_lst) > 0 and seg.zs_lst[-1].bi_lst[-1].idx >= seg.end_bi.idx)) \
            and seg.end_bi.idx - seg.zs_lst[-1].get_bi_in().idx > 2:
             self.treat_bsp1(seg, BSP_CONF, is_target_bsp)
         else:
@@ -184,12 +216,15 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
             is_target_bsp = False
         feature_dict = {
             'divergence_rate': divergence_rate,
-            'zs_cnt': len(seg.zs_lst),
+            # 与判定口径一致：门槛用的中枢计数是什么口径，特征就记录什么口径
+            'zs_cnt': seg.get_multi_bi_zs_cnt() if BSP_CONF.bsp1_only_multibi_zs else len(seg.zs_lst),
         }
         self.add_bs(bs_type=BSP_TYPE.T1, bi=seg.end_bi, relate_bsp1=None, is_target_bsp=is_target_bsp, feature_dict=feature_dict)
 
     def treat_pz_bsp1(self, seg: CSeg[LINE_TYPE], BSP_CONF: CPointConfig, bi_list: LINE_LIST_TYPE, is_target_bsp):
         last_bi = seg.end_bi
+        if last_bi.idx < 2:
+            return  # 无 idx-2 的比较笔（旧实现负索引环绕会错取全表尾笔）
         pre_bi = bi_list[last_bi.idx-2]
         if last_bi.seg_idx != pre_bi.seg_idx:
             return
@@ -204,8 +239,12 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
         is_diver, divergence_rate = out_metric <= BSP_CONF.divergence_rate*in_metric, out_metric/(in_metric+1e-7)
         if not is_diver:
             is_target_bsp = False
-        if isinstance(bi_list, CBiList):
-            assert isinstance(last_bi, CBi) and isinstance(pre_bi, CBi)
+        if isinstance(bi_list, CBiList) and not (isinstance(last_bi, CBi) and isinstance(pre_bi, CBi)):
+            # CBiList 的元素类型不变量：笔级买卖点列表中应全为 CBi；
+            # -O 下 assert 被剥离会让类型混淆静默通过，显式校验
+            raise CChanException(
+                f"treat_pz_bsp1: CBiList元素类型异常 last_bi={type(last_bi)} pre_bi={type(pre_bi)}",
+                ErrCode.COMMON_ERROR)
         feature_dict = {
             'divergence_rate': divergence_rate,
             'bsp1_bi_amp': last_bi.amp(),
@@ -214,7 +253,8 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
 
     def cal_seg_bs2point(self, seg_list: CSegListComm[LINE_TYPE], bi_list: LINE_LIST_TYPE):
         for seg in seg_list[self.last_sure_seg_idx:]:
-            config = self.config.GetBSConfig(seg.is_down())
+            # 配置侧别须与 treat_bsp2 内部分支一致：多线段看本段方向，单线段兜底看反向
+            config = self.config.GetBSConfig(seg.is_down() if len(seg_list) > 1 else seg.is_up())
             if BSP_TYPE.T2 not in config.target_types and BSP_TYPE.T2S not in config.target_types:
                 continue
             if not self.seg_need_cal(seg):
@@ -237,20 +277,26 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
                 return
             bsp2_bi = bi_list[1]
             break_bi = bi_list[0]
-        if BSP_CONF.bsp2_follow_1 and (not bsp1_bi or bsp1_bi.idx not in self.bsp_store_flat_dict):
+        # follow_1 判定的是"该笔处存在一买/类一买"，应查 bsp1_dict；
+        # flat_dict 含任意类型，会让遗留 T3A/T2S 幻影满足 follow_1
+        if BSP_CONF.bsp2_follow_1 and (not bsp1_bi or bsp1_bi.idx not in self.bsp1_dict):
             return
-        retrace_rate = bsp2_bi.amp()/break_bi.amp()
+        break_amp = break_bi.amp()
+        if break_amp == 0:
+            return  # 突破笔振幅为0（退化数据/不确定虚线段），无法定义回撤率
+        retrace_rate = bsp2_bi.amp()/break_amp
         bsp2_flag = retrace_rate <= BSP_CONF.max_bs2_rate
         if bsp2_flag:
             feature_dict = {
                 'bsp2_retrace_rate': retrace_rate,
-                'bsp2_break_bi_amp': break_bi.amp(),
+                'bsp2_break_bi_amp': break_amp,
                 'bsp2_bi_amp': bsp2_bi.amp(),
             }
             self.add_bs(bs_type=BSP_TYPE.T2, bi=bsp2_bi, relate_bsp1=real_bsp1, feature_dict=feature_dict)  # type: ignore
         elif BSP_CONF.bsp2s_follow_2:
             return
-        if BSP_TYPE.T2S not in self.config.GetBSConfig(seg.is_down()).target_types:
+        # T2S 门槛用与分支一致的配置侧（单线段兜底分支为 seg.is_up() 侧）
+        if BSP_TYPE.T2S not in BSP_CONF.target_types:
             return
         self.treat_bsp2s(seg_list, bi_list, bsp2_bi, break_bi, real_bsp1, BSP_CONF)  # type: ignore
 
@@ -263,11 +309,18 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
         real_bsp1: Optional[CBS_Point],
         BSP_CONF: CPointConfig,
     ):
+        break_amp = break_bi.amp()
+        if break_amp == 0:
+            return  # 突破笔振幅为0，无法定义回撤率
         bias = 2
         _low, _high = None, None
         while bsp2_bi.idx + bias < len(bi_list):  # 计算类二
             bsp2s_bi = bi_list[bsp2_bi.idx + bias]
-            assert bsp2s_bi.seg_idx is not None and bsp2_bi.seg_idx is not None
+            if bsp2s_bi.seg_idx is None or bsp2_bi.seg_idx is None:
+                raise CChanException(
+                    f"类二买卖点计算需要 seg_idx: bsp2s_bi={bsp2s_bi.idx}(seg_idx={bsp2s_bi.seg_idx}) "
+                    f"bsp2_bi={bsp2_bi.idx}(seg_idx={bsp2_bi.seg_idx})",
+                    ErrCode.COMMON_ERROR)
             if BSP_CONF.max_bsp2s_lv is not None and bias/2 > BSP_CONF.max_bsp2s_lv:
                 break
             if bsp2s_bi.seg_idx != bsp2_bi.seg_idx and (bsp2s_bi.seg_idx < len(seg_list)-1 or bsp2s_bi.seg_idx - bsp2_bi.seg_idx >= 2 or seg_list[bsp2_bi.seg_idx].is_sure):
@@ -282,12 +335,12 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
 
             if bsp2s_break_bsp1(bsp2s_bi, break_bi):
                 break
-            retrace_rate = abs(bsp2s_bi.get_end_val()-break_bi.get_end_val())/break_bi.amp()
+            retrace_rate = abs(bsp2s_bi.get_end_val()-break_bi.get_end_val())/break_amp
             if retrace_rate > BSP_CONF.max_bs2_rate:
                 break
             feature_dict = {
                 'bsp2s_retrace_rate': retrace_rate,
-                'bsp2s_break_bi_amp': break_bi.amp(),
+                'bsp2s_break_bi_amp': break_amp,
                 'bsp2s_bi_amp': bsp2s_bi.amp(),
                 'bsp2s_lv': bias/2,
             }
@@ -298,7 +351,8 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
         for seg in seg_list[self.last_sure_seg_idx:]:
             if not self.seg_need_cal(seg):
                 continue
-            config = self.config.GetBSConfig(seg.is_down())
+            # 配置侧别须与内部分支一致：多线段看本段方向，单线段兜底看反向
+            config = self.config.GetBSConfig(seg.is_down() if len(seg_list) > 1 else seg.is_up())
             if BSP_TYPE.T3A not in config.target_types and BSP_TYPE.T3B not in config.target_types:
                 continue
             if len(seg_list) > 1:
@@ -314,7 +368,9 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
                 bsp1_bi, real_bsp1 = None, None
                 bsp1_bi_idx = -1
                 BSP_CONF = self.config.GetBSConfig(seg.is_up())
-            if BSP_CONF.bsp3_follow_1 and (not bsp1_bi or bsp1_bi.idx not in self.bsp_store_flat_dict):
+            # 与 bsp2 同理：follow_1 判定应查 bsp1_dict（含一买/类一买），
+            # 而非含任意类型的 bsp_store_flat_dict
+            if BSP_CONF.bsp3_follow_1 and (not bsp1_bi or bsp1_bi.idx not in self.bsp1_dict):
                 continue
             if next_seg:
                 self.treat_bsp3_after(seg_list, next_seg, BSP_CONF, bi_list, real_bsp1, bsp1_bi_idx, next_seg_idx)
@@ -336,6 +392,7 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
         if BSP_CONF.strict_bsp3 and first_zs.get_bi_in().idx != bsp1_bi_idx+1:
             return
 
+        # T3A 的 zs 上限按 next_seg 自身方向取配置（跨段买卖不对称配置下有意为之）
         config = self.config.GetBSConfig(next_seg.is_down())
         bsp3a_max_zs_cnt = config.bsp3a_max_zs_cnt
         for zs_idx, zs in enumerate(next_seg.get_multi_bi_zs_lst()):
@@ -344,11 +401,15 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
             if zs.bi_out is None or zs.bi_out.idx+1 >= len(bi_list):
                 break
             bsp3_bi = bi_list[zs.bi_out.idx+1]
-            if bsp3_bi.parent_seg is None:
+            parent_seg = bsp3_bi.parent_seg
+            # parent_seg 可能是已被重算弹出的线段残留引用，按位置校验失效后视同 None
+            if parent_seg is not None and not (0 <= parent_seg.idx < len(seg_list) and seg_list[parent_seg.idx] is parent_seg):
+                parent_seg = None
+            if parent_seg is None:
                 if next_seg.idx != len(seg_list)-1:
                     break
-            elif bsp3_bi.parent_seg.idx != next_seg.idx:
-                if len(bsp3_bi.parent_seg.bi_list) >= 3:
+            elif parent_seg.idx != next_seg.idx:
+                if len(parent_seg.bi_list) >= 3:
                     break
             if bsp3_bi.dir == next_seg.dir:
                 break
@@ -356,6 +417,7 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
                 break
             if bsp3_back2zs(bsp3_bi, zs):
                 continue
+            # T3A 独有峰值约束（bsp3_peak）：三买必须突破中枢峰值；T3B 无此规则，非对称属既定语义
             bsp3_peak_zs = bsp3_break_zspeak(bsp3_bi, zs)
             if BSP_CONF.bsp3_peak and not bsp3_peak_zs:
                 continue
@@ -387,7 +449,10 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
         for bsp3_bi in bi_list[bsp1_bi.idx+2::2]:
             if bsp3_bi.idx > end_bi_idx:
                 break
-            assert bsp3_bi.seg_idx is not None
+            if bsp3_bi.seg_idx is None:
+                raise CChanException(
+                    f"三类买卖点计算需要 seg_idx: bsp3_bi={bsp3_bi.idx}",
+                    ErrCode.COMMON_ERROR)
             if bsp3_bi.seg_idx != next_seg_idx and bsp3_bi.seg_idx < len(seg_list)-1:
                 break
             if bsp3_back2zs(bsp3_bi, cmp_zs):  # type: ignore
@@ -397,7 +462,7 @@ class CBSPointList(Generic[LINE_TYPE, LINE_LIST_TYPE]):
                 'bsp3_bi_amp': bsp3_bi.amp(),
             }
             self.add_bs(bs_type=BSP_TYPE.T3B, bi=bsp3_bi, relate_bsp1=real_bsp1, feature_dict=feature_dict)  # type: ignore
-            break
+            break  # T3B 只取首个候选（与 T3A 遍历多个中枢的非对称规则属既定语义）
 
     def getSortedBspList(self) -> List[CBS_Point[LINE_TYPE]]:
         return sorted(self.bsp_iter(), key=lambda bsp: bsp.bi.idx)
