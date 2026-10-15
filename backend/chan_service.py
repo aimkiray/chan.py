@@ -8,6 +8,9 @@ import pickle
 import gzip
 import uuid
 import math
+import contextlib
+import io
+import logging
 from typing import Dict, TypedDict, Optional
 import urllib.request
 import urllib.parse
@@ -37,12 +40,18 @@ from Common.CTime import CTime
 from BuySellPoint.BS_Point import CBS_Point
 from Plot.PlotMeta import CChanPlotMeta
 
+# 全模块统一走 logging（root handler 由 backend/main.py 的 basicConfig 配
+# 置；单独 import 本模块时 WARNING+ 走 lastResort stderr）。存量 `except
+# Exception: pass` 多为可选字段/特征的刻意兜底，保留静默；原先经 print 暴露
+# 的错误与关键进度全部改为 logger 输出并保留 exc_info。
+logger = logging.getLogger(__name__)
+
 class T_SAMPLE_INFO(TypedDict):
     feature: CFeatures
     is_buy: bool
     open_time: CTime
 
-def stragety_feature(last_klu, enable_rolling_lookback=True):
+def strategy_feature(last_klu, enable_rolling_lookback=True):
     # Improved feature engineering for better generalization
     # Avoid absolute price/volume values which lead to overfitting
     
@@ -90,8 +99,13 @@ def stragety_feature(last_klu, enable_rolling_lookback=True):
             "macd_dea": last_klu.macd.DEA,
             "macd_bar": last_klu.macd.macd,
         })
-        
+
     return feat
+
+# Backward-compatible alias for the historical misspelling "stragety_feature";
+# external callers (backend/main.py, vector_backtest.py, strategy_runner.py,
+# tools/daily_direction_snapshot.py) still import the old name.
+stragety_feature = strategy_feature
 
 def build_chan_state_feature(kl_data, last_klu, last_bsp: Optional[CBS_Point] = None):
     feat = {}
@@ -700,30 +714,49 @@ def get_stock_name(code, data_src_type=DATA_SRC.BAO_STOCK):
             else:
                 return code
                 
-        # Fallback to Baostock if not ClickHouse
-        # Suppress login success message
-        import io
-        import sys
-        
-        # Check if already logged in (CBaoStock maintains state but we can't easily check bs internal state without calling login)
-        # But bs.login() is idempotent.
-        
-        old_stdout = sys.stdout
-        sys.stdout = io.StringIO()
-        try:
-            bs.login()
-        except:
-            pass
-        finally:
-            sys.stdout = old_stdout
-        
-        rs = bs.query_stock_basic(code=code)
-        if rs.error_code == '0' and rs.next():
+        # Fallback to Baostock if not ClickHouse.
+        # baostock's SDK drives one process-global socket/session (see
+        # DataAPI.BaoStockAPI.CBaoStock): login + query must run under the
+        # shared _conn_lock so concurrent threads can't interleave on the
+        # socket or kick each other off the session.
+        from DataAPI.BaoStockAPI import CBaoStock
+
+        def _login_and_query_basic():
+            # bs.login() unconditionally prints "login success!"; swallow it
+            # with a scoped redirect_stdout while holding the session lock.
+            # (The old code swapped sys.stdout globally with no locking: two
+            # concurrent callers could leave stdout permanently redirected.)
+            with contextlib.redirect_stdout(io.StringIO()):
+                lg = bs.login()
+            # login() returns a truthy ResultData even on failure; only
+            # error_code == '0' counts as a logged-in session.
+            if lg is None or getattr(lg, "error_code", None) != '0':
+                logger.warning(
+                    "baostock login failed in get_stock_name(%s): %s",
+                    code, getattr(lg, "error_msg", lg))
+                return None
+            rs = bs.query_stock_basic(code=code)
+            if rs is None or getattr(rs, "error_code", None) != '0':
+                logger.warning(
+                    "baostock query_stock_basic(%s) failed: %s",
+                    code, getattr(rs, "error_msg", rs))
+                return None
+            return rs
+
+        with CBaoStock._conn_lock:
+            rs = _login_and_query_basic()
+            # Our raw bs.login() rebuilt the process-global session; keep
+            # CBaoStock's cached flag coherent so a failed login here forces
+            # the next CBaoStock.do_init() to re-login instead of trusting a
+            # dead session.
+            CBaoStock.is_connect = rs is not None
+
+        if rs is not None and rs.next():
             # code, code_name, ipoDate, outDate, type, status
             row = rs.get_row_data()
             return row[1] # code_name
     except Exception as e:
-        print(f"Error fetching stock name: {e}")
+        logger.warning("Error fetching stock name for %s: %s", code, e)
     return code
 
 from DataAPI.CommonStockAPI import CCommonStockApi
@@ -1065,7 +1098,7 @@ def fetch_stock_data(code, level, begin_time, end_time, data_src_type, autype=AU
                     seen.add(s)
                     uniq.append(s)
                 for s in uniq[:20]:
-                    print(s)
+                    logger.warning("%s", s)
         except Exception:
             pass
         return dedup
@@ -1105,7 +1138,7 @@ def get_latest_data_time(code, level, data_src_type, autype: AUTYPE = AUTYPE.QFQ
         if data_list:
             return str(data_list[-1].time)
     except Exception as e:
-        print(f"Error fetching latest time: {e}")
+        logger.warning("Error fetching latest time for %s: %s", code, e)
     return None
 
 
@@ -1407,7 +1440,7 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
     last_snapshot = None
     
     if trigger_step:
-        print(f"Start processing {code} from {begin_time}...")
+        logger.info("Start processing %s from %s...", code, begin_time)
         kl_count = 0
         bsp_count = 0
         rolling_count = 0
@@ -1469,7 +1502,7 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
                     except Exception:
                         pass
                 try:
-                    feat_copy.add_feat(stragety_feature(last_klu, enable_rolling_lookback=enable_rolling_lookback))
+                    feat_copy.add_feat(strategy_feature(last_klu, enable_rolling_lookback=enable_rolling_lookback))
                 except Exception:
                     pass
                 bsp_dict[last_bsp.klu.idx] = {
@@ -1514,7 +1547,7 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
                         except Exception:
                             pass
                     try:
-                        feat_copy.add_feat(stragety_feature(last_klu, enable_rolling_lookback=enable_rolling_lookback))
+                        feat_copy.add_feat(strategy_feature(last_klu, enable_rolling_lookback=enable_rolling_lookback))
                     except Exception:
                         pass
                     bsp_dict[rk] = {
@@ -1526,7 +1559,9 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
                         "sample_kind": sample_kind,
                     }
 
-        print(f"[DEBUG] {code}: Processed {kl_count} K-lines, Found {bsp_count} event BSP samples, Added {rolling_count} rolling samples, Total {len(bsp_dict)}")
+        logger.debug(
+            "%s: Processed %d K-lines, Found %d event BSP samples, Added %d rolling samples, Total %d",
+            code, kl_count, bsp_count, rolling_count, len(bsp_dict))
 
         # Re-calculate to ensure latest state is fully updated for plotting
         if last_snapshot:
@@ -1540,8 +1575,6 @@ def get_chan_data(code, trigger_step=True, bi_strict=True, level=KL_TYPE.K_DAY, 
         last_snapshot = chan
         # bsp_dict is empty because we didn't step through history to collect them
         # This is fine if do_predict is False
-             
-    return chan, bsp_dict, last_snapshot, config
              
     return chan, bsp_dict, last_snapshot, config
 
@@ -4439,7 +4472,14 @@ def json_safe_value(value, inf_replacement: float = 999.0, _depth: int = 0):
         return {str(k): json_safe_value(v, inf_replacement=inf_replacement, _depth=_depth + 1) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [json_safe_value(v, inf_replacement=inf_replacement, _depth=_depth + 1) for v in value]
-    return value
+    # Unknown/custom objects (Decimal, PathLike, user classes...) are NOT
+    # JSON-serializable; returning them verbatim lets them reach the response
+    # layer and explode as a 500 in json.dumps/JSONResponse. Stringify as a
+    # last-resort so the output is always JSON-safe.
+    try:
+        return str(value)
+    except Exception:
+        return repr(value)
 
 def _feature_identity_meta(feature_meta, feature_preset=None, side_filter=None, requested_features=None, feature_selection=None):
     items = [str(x) for x in (feature_meta or []) if str(x)]
@@ -6909,20 +6949,20 @@ def get_or_train_model(_bsp_dict, _chan, model_type="xgboost", profit_threshold:
     feature_meta = build_feature_meta(_bsp_dict)
     X_train, y_train, feature_meta = build_training_data(_bsp_dict, feature_meta, profit_threshold=profit_threshold, auto_profit_quantile=auto_profit_quantile, profit_lookahead=profit_lookahead)
         
-    print(f"Training data size: {len(X_train)}")
-    print(f"Class distribution: {set(y_train)}")
-    
+    logger.info("Training data size: %d", len(X_train))
+    logger.info("Class distribution: %s", set(y_train))
+
     if not X_train:
-        print("Skipping training: No data.")
+        logger.info("Skipping training: No data.")
         return None, feature_meta
-        
+
     if len(set(y_train)) < 2:
-        print(f"Skipping training: Single class detected. Classes: {set(y_train)}")
+        logger.info("Skipping training: Single class detected. Classes: %s", set(y_train))
         # Return a dummy model that always predicts this class
         return SingleClassModel(list(set(y_train))[0]), feature_meta
-        
-    print(f"Training model: {model_type}")
-    
+
+    logger.info("Training model: %s", model_type)
+
     try:
         use_scale_pos_weight = str(model_type or "").strip().lower() in ["xgboost", "lightgbm"]
         model, feature_meta2, _ = train_model_with_feature_selection(
@@ -6935,14 +6975,14 @@ def get_or_train_model(_bsp_dict, _chan, model_type="xgboost", profit_threshold:
         if feature_meta2:
             feature_meta = list(feature_meta2)
     except Exception as e:
-        print(f"Model training failed: {e}")
+        logger.warning("Model training failed: %s", e, exc_info=True)
         return None, feature_meta
     
     return model, feature_meta
 
 def predict_bsp(model, bsp, feature_meta):
     if not model or not bsp:
-        print("Prediction skipped: Model or BSP is None")
+        logger.debug("Prediction skipped: Model or BSP is None")
         return 0.0
         
     feat_vec = [bsp.features.get(k, -9999999) for k in feature_meta]
@@ -6972,19 +7012,14 @@ def predict_bsp(model, bsp, feature_meta):
             
         return 0.0
     except Exception as e:
-        print(f"Prediction failed with exception: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.warning("Prediction failed with exception: %s", e, exc_info=True)
         return 0.0
 
 def download_stock_history(code, frequency='1d'):
     import csv
-    import io
-    import datetime
 
     code = normalize_code(code)
-    bs.login()
-    
+
     freq_map = {
         "1d": "d",
         "5m": "5",
@@ -6994,30 +7029,74 @@ def download_stock_history(code, frequency='1d'):
         "1m": "1",
     }
     bs_freq = freq_map.get(frequency, "d")
-    
+
     # Fields: standard OHLCV + others
     fields = "date,time,code,open,high,low,close,volume,amount,adjustflag,turn,pctChg"
-    
-    rs = bs.query_history_k_data_plus(
-        code=code,
-        fields=fields,
-        start_date='1990-01-01',
-        end_date=datetime.datetime.now().strftime("%Y-%m-%d"),
-        frequency=bs_freq,
-        adjustflag="2" # QFQ
-    )
-    
-    output = io.StringIO()
-    writer = csv.writer(output)
-    
-    # Write header
-    writer.writerow(fields.split(','))
-    
-    while (rs.error_code == '0') & rs.next():
-        writer.writerow(rs.get_row_data())
-        
-    bs.logout()
-    return output.getvalue()
+
+    # baostock's SDK shares one process-global socket/session (see
+    # DataAPI.BaoStockAPI.CBaoStock): the login → query → paginate → logout
+    # sequence must be serialized via the shared _conn_lock so concurrent
+    # downloads / CBaoStock queries can't interleave on the same socket.
+    # _conn_lock is an RLock, so nesting inside main.py's download endpoint
+    # (which takes the same lock) is safe.
+    from DataAPI.BaoStockAPI import CBaoStock
+    with CBaoStock._conn_lock:
+        try:
+            # bs.login()/logout() print status lines to stdout; swallow them
+            # with scoped redirect_stdout while holding the session lock.
+            with contextlib.redirect_stdout(io.StringIO()):
+                lg = bs.login()
+            if lg is None or getattr(lg, "error_code", None) != '0':
+                raise RuntimeError(
+                    f"baostock login failed: {getattr(lg, 'error_msg', lg)}")
+
+            rs = bs.query_history_k_data_plus(
+                code=code,
+                fields=fields,
+                start_date='1990-01-01',
+                end_date=datetime.datetime.now().strftime("%Y-%m-%d"),
+                frequency=bs_freq,
+                adjustflag="2" # QFQ
+            )
+            if rs is None:
+                # baostock bare-returns None on invalid params (e.g. bad date
+                # format) instead of a ResultData
+                raise RuntimeError(
+                    f"baostock query_history_k_data_plus returned None "
+                    f"(invalid params), code={code} freq={bs_freq}")
+            if rs.error_code != '0':
+                raise RuntimeError(
+                    f"baostock query failed for {code}: "
+                    f"error_code={rs.error_code} {rs.error_msg}")
+
+            output = io.StringIO()
+            writer = csv.writer(output)
+
+            # Write header
+            writer.writerow(fields.split(','))
+
+            while rs.error_code == '0' and rs.next():
+                writer.writerow(rs.get_row_data())
+            if rs.error_code != '0':
+                # Pagination hit a server-side error mid-stream; a truncated
+                # CSV must not masquerade as a complete download.
+                raise RuntimeError(
+                    f"baostock pagination failed for {code}: "
+                    f"error_code={rs.error_code} {rs.error_msg}")
+
+            return output.getvalue()
+        finally:
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    bs.logout()
+            except Exception:
+                logger.debug("baostock logout failed", exc_info=True)
+            # This function terminates the shared session; flag it so the
+            # next CBaoStock use re-logins instead of trusting a dead one.
+            try:
+                CBaoStock.is_connect = False
+            except Exception:
+                pass
 
 MODEL_CACHE_VERSION = 1
 
@@ -7805,7 +7884,7 @@ def _process_code_for_pretrain(args):
         
         return code, latest_time, local_samples, feature_keys, {"atr_pct": vol_atr_pct, "high_vol_filtered": False}
     except Exception as e:
-        print(f"Error processing {code}: {e}")
+        logger.warning("Error processing %s: %s", code, e, exc_info=True)
         return code, None, [], set(), {}
 
 def pretrain_and_persist_model(
@@ -7886,8 +7965,8 @@ def pretrain_and_persist_model(
     try:
         # Optimized for server environment: Use ProcessPoolExecutor for parallel data processing
         # This utilizes the multiple cores (e.g. 64 cores) efficiently
-        # Logic: Env Var -> min(60, CPU) -> bound by len(codes)
-        
+        # Logic: Env Var -> min(60, CPU) -> bound by len(codes) -> hard cap
+
         default_workers = min(60, os.cpu_count() or 4)
         env_workers = os.environ.get("MLCHAN_PRETRAIN_WORKERS")
         if env_workers:
@@ -7897,11 +7976,21 @@ def pretrain_and_persist_model(
                 max_workers = default_workers
         else:
             max_workers = default_workers
-            
-        # Ensure at least 1 and not more than tasks
-        max_workers = max(1, min(max_workers, len(codes)))
-        
-        print(f"Starting pretrain data collection with {max_workers} workers for {len(codes)} codes.")
+
+        # Hard cap on worker processes (DoS guard): without it an env/config
+        # typo like MLCHAN_PRETRAIN_WORKERS=5000 would fork-bomb the host.
+        # Consistent with main.py's _LIVE_SCAN_MAX_WORKERS / matrix min(...,32);
+        # raisable only via explicit MLCHAN_PRETRAIN_WORKERS_CAP override.
+        workers_cap = 32
+        try:
+            workers_cap = max(1, int(os.environ.get("MLCHAN_PRETRAIN_WORKERS_CAP") or workers_cap))
+        except (TypeError, ValueError):
+            workers_cap = 32
+
+        # Ensure at least 1, not more than tasks, never above the hard cap
+        max_workers = max(1, min(max_workers, len(codes), workers_cap))
+
+        logger.info("Starting pretrain data collection with %d workers for %d codes.", max_workers, len(codes))
         
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
             autype_name = None
@@ -7948,7 +8037,7 @@ def pretrain_and_persist_model(
                     if r_extra:
                         per_code_vol[r_code] = dict(r_extra)
                 except Exception as e:
-                    print(f"Worker exception for {orig_code}: {e}")
+                    logger.warning("Worker exception for %s: %s", orig_code, e, exc_info=True)
 
         if not samples:
             return None, {

@@ -2,18 +2,23 @@ import sys
 import os
 import json
 import datetime
+import logging
+import re
 import threading
 import uuid
 import gc
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from dotenv import load_dotenv
 
+logger = logging.getLogger("mlchan.backend")
+
 # Load environment variables from .env file
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Response, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -86,7 +91,7 @@ _live_run_running = set()
 _live_run_running_lock = threading.Lock()
 
 _live_train_cache_lock = threading.Lock()
-_live_train_cache = {}
+_live_train_cache = OrderedDict()  # LRU: {cache_key: {"model":..., "feature_meta":..., ...}}
 
 _pretrain_jobs_lock = threading.Lock()
 _pretrain_jobs = {}
@@ -96,7 +101,11 @@ _PRETRAIN_JOBS_TTL_SEC = int(os.environ.get("MLCHAN_PRETRAIN_JOBS_TTL_SEC", str(
 _matrix_jobs_lock = threading.Lock()
 _matrix_jobs = {}
 _MATRIX_JOBS_MAX = int(os.environ.get("MLCHAN_MATRIX_JOBS_MAX", "50") or 50)
+_MATRIX_JOBS_TTL_SEC = int(os.environ.get("MLCHAN_MATRIX_JOBS_TTL_SEC", str(6 * 3600)) or (6 * 3600))
 _MATRIX_MAX_CONFIGS = int(os.environ.get("MLCHAN_MATRIX_MAX_CONFIGS", "240") or 240)
+# Jobs stuck in queued/running longer than this are orphaned (e.g. worker
+# thread died) and may be evicted by purge so they cannot pin admission slots.
+_JOB_STALE_TTL_SEC = int(os.environ.get("MLCHAN_JOB_STALE_TTL_SEC", str(24 * 3600)) or (24 * 3600))
 
 _task_queue_cv = threading.Condition()
 _task_queue = []
@@ -127,13 +136,70 @@ def _env_bool(name: str, default: bool) -> bool:
         return bool(default)
 
 _BACKTEST_MAX_WORKERS = max(1, _env_int("MLCHAN_BACKTEST_MAX_WORKERS", 16))
+# Hard caps so an unauthenticated caller cannot exhaust the process table / RAM.
+_LIVE_SCAN_MAX_WORKERS = max(1, _env_int("MLCHAN_LIVE_SCAN_MAX_WORKERS", 32))
+_LIVE_TRAIN_CACHE_MAX = max(1, _env_int("MLCHAN_LIVE_TRAIN_CACHE_MAX", 8))
+_LIVE_TRAIN_CACHE_TTL_SEC = max(0, _env_int("MLCHAN_LIVE_TRAIN_CACHE_TTL_SEC", 4 * 3600))
+_TASK_QUEUE_MAX = max(1, _env_int("MLCHAN_TASK_QUEUE_MAX", 200))
+_LIVE_TASK_QUEUE_MAX = max(1, _env_int("MLCHAN_LIVE_TASK_QUEUE_MAX", 200))
+_PRETRAIN_ACTIVE_MAX = max(1, _env_int("MLCHAN_PRETRAIN_ACTIVE_MAX", 8))
+_MATRIX_ACTIVE_MAX = max(1, _env_int("MLCHAN_MATRIX_ACTIVE_MAX", 8))
 
-def _resolve_backtest_max_workers(req_max_workers: int, pool_size: int) -> int:
-    mw = int(_BACKTEST_MAX_WORKERS)
+def _err500(e: Exception, code: str = "internal_error") -> str:
+    """Log the real traceback and return a sanitized 500 detail string.
+
+    Raw exception text (paths, driver messages, SQL) must not be echoed to
+    unauthenticated clients; the type name + a stable code is enough for
+    the UI while the log keeps full context for operators.
+    """
+    try:
+        logger.exception("request failed [%s]", code)
+    except Exception:
+        pass
+    return f"{code}:{type(e).__name__}"
+
+def _live_train_cache_get(cache_key):
+    """LRU read: bumps recency; caller still applies the TTL check."""
+    if not cache_key:
+        return None
+    with _live_train_cache_lock:
+        entry = _live_train_cache.get(cache_key)
+        if entry is not None:
+            _live_train_cache.move_to_end(cache_key)
+        return entry
+
+def _live_train_cache_put(cache_key, entry):
+    """Bounded LRU write: evicts expired and oldest entries beyond capacity."""
+    if not cache_key:
+        return
+    now = int(time.time())
+    with _live_train_cache_lock:
+        _live_train_cache[cache_key] = entry
+        _live_train_cache.move_to_end(cache_key)
+        if _LIVE_TRAIN_CACHE_TTL_SEC > 0:
+            for k, v in list(_live_train_cache.items()):
+                try:
+                    trained_at = int((v or {}).get("trained_at_ts") or 0)
+                except Exception:
+                    trained_at = 0
+                if trained_at <= 0 or (now - trained_at) > _LIVE_TRAIN_CACHE_TTL_SEC:
+                    _live_train_cache.pop(k, None)
+        while len(_live_train_cache) > _LIVE_TRAIN_CACHE_MAX:
+            _live_train_cache.popitem(last=False)
+
+def _resolve_backtest_max_workers(req_max_workers, pool_size: int) -> int:
+    """Honor the per-request max_workers but cap it at the env-configured
+    _BACKTEST_MAX_WORKERS and the actual pool size."""
     ps = int(pool_size or 0)
     if ps <= 0:
         ps = 1
-    return max(1, min(int(mw), int(ps)))
+    try:
+        req_mw = int(req_max_workers or 0)
+    except Exception:
+        req_mw = 0
+    cap = max(1, int(_BACKTEST_MAX_WORKERS))
+    mw = int(req_mw) if req_mw > 0 else cap
+    return max(1, min(int(mw), cap, int(ps)))
 
 def _cn_dt_from_ts(ts: int) -> datetime.datetime:
     try:
@@ -323,7 +389,7 @@ def _ensure_live_task_worker_started():
                 if callable(fn):
                     fn()
             except Exception:
-                pass
+                logger.exception("live task failed: kind=%s ref_id=%s", task.get("kind"), task.get("ref_id"))
             finally:
                 with _live_task_queue_cv:
                     _live_task_current.pop(worker_id, None)
@@ -332,9 +398,12 @@ def _ensure_live_task_worker_started():
         t = threading.Thread(target=lambda wid=i: _worker_loop(wid), daemon=True)
         t.start()
 
-def _enqueue_live_task(kind: str, ref_id: str, fn: Callable[[], None]):
+def _enqueue_live_task(kind: str, ref_id: str, fn: Callable[[], None]) -> bool:
     _ensure_live_task_worker_started()
     with _live_task_queue_cv:
+        if len(_live_task_queue) >= _LIVE_TASK_QUEUE_MAX:
+            logger.warning("live task queue full (%s), rejecting kind=%s ref_id=%s", _LIVE_TASK_QUEUE_MAX, kind, ref_id)
+            return False
         _live_task_queue.append({
             "kind": str(kind),
             "ref_id": str(ref_id),
@@ -342,8 +411,12 @@ def _enqueue_live_task(kind: str, ref_id: str, fn: Callable[[], None]):
             "fn": fn,
         })
         _live_task_queue_cv.notify()
+    return True
 
-def _enqueue_live_task_dedup(kind: str, ref_id: str, fn: Callable[[], None]) -> bool:
+def _enqueue_live_task_dedup(kind: str, ref_id: str, fn: Callable[[], None]) -> str:
+    """Enqueue a live task unless an identical (kind, ref_id) task is already
+    queued/running. Returns "ok" | "dup" | "full" so callers can distinguish
+    a duplicate submission (409) from queue saturation (429)."""
     _ensure_live_task_worker_started()
     k = str(kind)
     rid = str(ref_id)
@@ -351,15 +424,18 @@ def _enqueue_live_task_dedup(kind: str, ref_id: str, fn: Callable[[], None]) -> 
         for t in _live_task_queue:
             try:
                 if str(t.get("kind")) == k and str(t.get("ref_id")) == rid:
-                    return False
+                    return "dup"
             except Exception:
                 continue
         for cur in (_live_task_current or {}).values():
             try:
                 if str((cur or {}).get("kind")) == k and str((cur or {}).get("ref_id")) == rid:
-                    return False
+                    return "dup"
             except Exception:
                 continue
+        if len(_live_task_queue) >= _LIVE_TASK_QUEUE_MAX:
+            logger.warning("live task queue full (%s), rejecting kind=%s ref_id=%s", _LIVE_TASK_QUEUE_MAX, k, rid)
+            return "full"
         _live_task_queue.append({
             "kind": k,
             "ref_id": rid,
@@ -367,7 +443,7 @@ def _enqueue_live_task_dedup(kind: str, ref_id: str, fn: Callable[[], None]) -> 
             "fn": fn,
         })
         _live_task_queue_cv.notify()
-    return True
+    return "ok"
 
 def _live_tasks_busy() -> bool:
     with _live_task_queue_cv:
@@ -491,7 +567,7 @@ def _run_live_step_task(run_id: str, sim_id: str, notify_enabled: bool, offset_s
                     if not ok_any:
                         send_text_env(msg)
                 except Exception:
-                    pass
+                    logger.exception("live run notify failed: run_id=%s", run_id)
     except Exception as e:
         next_ts = _next_cn_30m_exec_ts(int(time.time()), int(offset_seconds or 5))
         storage.update_live_run_fields(run_id, {"next_exec_ts": int(next_ts), "error": str(e)})
@@ -500,7 +576,7 @@ def _run_live_step_task(run_id: str, sim_id: str, notify_enabled: bool, offset_s
             with _live_run_running_lock:
                 _live_run_running.discard(str(run_id))
         except Exception:
-            pass
+            logger.exception("live run %s running-flag cleanup failed", run_id)
 
 
 def _start_live_run_scheduler():
@@ -608,11 +684,11 @@ def _start_live_run_scheduler():
                         str(rid),
                         lambda rid=rid, sid=sim_id, ne=notify_enabled, off=int(off): _run_live_step_task(str(rid), str(sid), bool(ne), int(off)),
                     )
-                    if enqueued:
+                    if enqueued == "ok":
                         with _live_run_running_lock:
                             _live_run_running.add(rid)
             except Exception:
-                pass
+                logger.exception("live run scheduler iteration failed")
             time.sleep(1.0)
 
     th = threading.Thread(target=_loop, daemon=True)
@@ -644,6 +720,7 @@ async def _on_startup_live_runs():
                 storage.update_live_run_fields(rid, {"next_exec_ts": int(_next_cn_30m_exec_ts(now_ts, off))})
         _start_live_run_scheduler()
     except Exception:
+        logger.exception("startup live-runs resume failed")
         return
 
 def _ensure_task_worker_started():
@@ -673,7 +750,7 @@ def _ensure_task_worker_started():
                 if callable(fn):
                     fn()
             except Exception:
-                pass
+                logger.exception("task failed: kind=%s ref_id=%s", task.get("kind"), task.get("ref_id"))
             finally:
                 with _task_queue_cv:
                     _task_current.pop(worker_id, None)
@@ -682,9 +759,14 @@ def _ensure_task_worker_started():
         t = threading.Thread(target=lambda wid=i: _worker_loop(wid), daemon=True)
         t.start()
 
-def _enqueue_task(kind: str, ref_id: str, fn: Callable[[], None]):
+def _enqueue_task(kind: str, ref_id: str, fn: Callable[[], None]) -> bool:
+    """Enqueue a background task; returns False when the queue is full so
+    callers can reject the request instead of growing memory unboundedly."""
     _ensure_task_worker_started()
     with _task_queue_cv:
+        if len(_task_queue) >= _TASK_QUEUE_MAX:
+            logger.warning("task queue full (%s), rejecting kind=%s ref_id=%s", _TASK_QUEUE_MAX, kind, ref_id)
+            return False
         _task_queue.append({
             "kind": str(kind),
             "ref_id": str(ref_id),
@@ -692,6 +774,7 @@ def _enqueue_task(kind: str, ref_id: str, fn: Callable[[], None]):
             "fn": fn,
         })
         _task_queue_cv.notify()
+    return True
 
 def _cancel_task_if_queued(kind: str, ref_id: str) -> bool:
     with _task_queue_cv:
@@ -727,7 +810,7 @@ def _set_pretrain_job(job_id: str, **fields):
         if updated is not None:
             storage.upsert_pretrain_job(updated)
     except Exception:
-        pass
+        logger.exception("persist pretrain job %s failed", job_id)
 
 def _set_matrix_job(job_id: str, **fields):
     with _matrix_jobs_lock:
@@ -738,13 +821,38 @@ def _set_matrix_job(job_id: str, **fields):
         job["updated_at"] = _utc_now_str()
 
 def _purge_matrix_jobs():
+    now = _utc_now_naive()
     with _matrix_jobs_lock:
+        # 1) Evict terminal jobs past TTL and orphaned queued/running jobs that
+        #    have not been updated within the stale TTL.
+        for jid, job in list(_matrix_jobs.items()):
+            status = str((job or {}).get("status") or "")
+            dt = _parse_utc(str((job or {}).get("updated_at") or (job or {}).get("created_at") or ""))
+            if dt is None:
+                continue
+            age = (now - dt).total_seconds()
+            if status in ["queued", "running"]:
+                if age > _JOB_STALE_TTL_SEC:
+                    _matrix_jobs.pop(jid, None)
+            elif age > _MATRIX_JOBS_TTL_SEC:
+                _matrix_jobs.pop(jid, None)
         if len(_matrix_jobs) <= int(_MATRIX_JOBS_MAX):
             return
+        # 2) Over capacity: drop oldest terminal jobs first, then the oldest
+        #    remaining entries (not only terminal) so the registry stays bound.
         items = sorted(_matrix_jobs.items(), key=lambda kv: str((kv[1] or {}).get("updated_at") or ""))
         remove_count = max(0, len(items) - int(_MATRIX_JOBS_MAX))
-        for jid, job in items[:remove_count]:
+        removed = 0
+        for jid, job in items:
+            if removed >= remove_count:
+                break
             if str((job or {}).get("status") or "") not in ["queued", "running"]:
+                _matrix_jobs.pop(jid, None)
+                removed += 1
+        if len(_matrix_jobs) > int(_MATRIX_JOBS_MAX):
+            for jid, job in items:
+                if len(_matrix_jobs) <= int(_MATRIX_JOBS_MAX):
+                    break
                 _matrix_jobs.pop(jid, None)
 
 def _matrix_job_overlay(items):
@@ -908,34 +1016,51 @@ def _attach_pretrained_display_name(meta: dict, custom_name: Optional[str]):
 def _purge_pretrain_jobs():
     now = _utc_now_naive()
     with _pretrain_jobs_lock:
-        items = list(_pretrain_jobs.values())
-        terminal = [j for j in items if j.get("status") in ("success", "error")]
-
-        for j in terminal:
+        # 1) Evict terminal jobs past TTL and orphaned queued/running jobs that
+        #    have not been updated within the stale TTL (worker died etc.).
+        for jid, j in list(_pretrain_jobs.items()):
+            status = str((j or {}).get("status") or "")
             dt = _parse_utc(j.get("updated_at") or j.get("created_at") or "")
-            if dt and (now - dt).total_seconds() > _PRETRAIN_JOBS_TTL_SEC:
-                _pretrain_jobs.pop(j.get("job_id"), None)
+            if dt is None:
+                continue
+            age = (now - dt).total_seconds()
+            if status in ("queued", "running"):
+                if age > _JOB_STALE_TTL_SEC:
+                    _pretrain_jobs.pop(jid, None)
+            elif age > _PRETRAIN_JOBS_TTL_SEC:
+                _pretrain_jobs.pop(jid, None)
 
         if len(_pretrain_jobs) <= _PRETRAIN_JOBS_MAX:
             return
 
+        # 2) Over capacity: drop oldest terminal jobs first, then the oldest
+        #    remaining entries (not only terminal) so the registry stays bound.
         items = list(_pretrain_jobs.values())
         terminal = [j for j in items if j.get("status") in ("success", "error")]
         terminal.sort(key=lambda j: (j.get("updated_at") or j.get("created_at") or ""))
         while len(_pretrain_jobs) > _PRETRAIN_JOBS_MAX and terminal:
             j = terminal.pop(0)
             _pretrain_jobs.pop(j.get("job_id"), None)
+        if len(_pretrain_jobs) > _PRETRAIN_JOBS_MAX:
+            rest = sorted(
+                list(_pretrain_jobs.values()),
+                key=lambda j: (j.get("updated_at") or j.get("created_at") or ""),
+            )
+            for j in rest:
+                if len(_pretrain_jobs) <= _PRETRAIN_JOBS_MAX:
+                    break
+                _pretrain_jobs.pop(j.get("job_id"), None)
     try:
         storage.prune_pretrain_jobs(_PRETRAIN_JOBS_MAX, _PRETRAIN_JOBS_TTL_SEC)
     except Exception:
-        pass
+        logger.exception("prune_pretrain_jobs failed")
 
 def _shrink_pretrain_result(result):
     if not isinstance(result, dict):
         return json_safe_value(result)
     keep = [
         "status",
-        "bundle_path",
+        # never echo the server-side absolute bundle path; model_key is the public handle
         "model_key",
         "model_type",
         "frequency",
@@ -953,6 +1078,22 @@ def _shrink_pretrain_result(result):
             if k in result:
                 out[k] = result.get(k)
     return json_safe_value(out)
+
+def _public_pretrain_job(job):
+    """Return a copy of a pretrain job without server-side absolute paths.
+
+    Rows persisted before the bundle_path fix may still carry
+    result["bundle_path"]; scrub it on read so the detail endpoint never
+    echoes it.
+    """
+    if isinstance(job, dict):
+        res = job.get("result")
+        if isinstance(res, dict) and "bundle_path" in res:
+            job = dict(job)
+            res = dict(res)
+            res.pop("bundle_path", None)
+            job["result"] = res
+    return job
 
 def _shrink_accuracy_result(result):
     if not isinstance(result, dict):
@@ -1074,43 +1215,43 @@ app.add_middleware(
 )
 
 class AnalyzeRequest(BaseModel):
-    code: str
-    preset_name: Optional[str] = None
+    code: str = Field(..., min_length=1, max_length=64)
+    preset_name: Optional[str] = Field(None, max_length=120)
     preset_overrides: bool = True
     trigger_step: bool = True
     bi_strict: bool = True
-    frequency: str = "1d"
-    data_src: str = "clickhouse"
-    model: str = "xgboost"
+    frequency: str = Field("1d", max_length=8)
+    data_src: str = Field("clickhouse", max_length=32)
+    model: str = Field("xgboost", max_length=32)
     do_predict: bool = False
-    autype: str = "qfq"
+    autype: str = Field("qfq", max_length=8)
     force_refresh: bool = False
     data_length_mode: str = "default" # "default" or "max"
-    data_length_years: Optional[float] = None
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
+    data_length_years: Optional[float] = Field(None, gt=0, le=50)
+    start_date: Optional[str] = Field(None, max_length=32)
+    end_date: Optional[str] = Field(None, max_length=32)
     use_pretrained: Optional[bool] = None
-    pretrained_model_key: Optional[str] = None
+    pretrained_model_key: Optional[str] = Field(None, max_length=64)
     blend_models: Optional[bool] = None
     enable_rolling_lookback: bool = True # Enable/Disable long-term context features
     rank_transform_enabled: Optional[bool] = None
     only_features: Optional[Any] = None
-    feature_preset: Optional[str] = None
-    side_filter: str = "buy"
-    profit_threshold: Optional[float] = 0.01
-    auto_profit_quantile: float = 0.7
-    profit_lookahead: int = 5
+    feature_preset: Optional[str] = Field(None, max_length=120)
+    side_filter: str = Field("buy", max_length=16)
+    profit_threshold: Optional[float] = Field(0.01, ge=0.0, le=10.0)
+    auto_profit_quantile: float = Field(0.7, gt=0.0, lt=1.0)
+    profit_lookahead: int = Field(5, ge=1, le=500)
     use_atr_label: bool = False
-    atr_period: int = 14
-    atr_mult: float = 1.0
+    atr_period: int = Field(14, ge=1, le=500)
+    atr_mult: float = Field(1.0, gt=0.0, le=1000.0)
     backtest_mode: str = "auto"
-    walk_forward_max_folds: int = 20
-    walk_forward_test_window: Optional[int] = None
-    walk_forward_val_window: Optional[int] = None
-    walk_forward_step: Optional[int] = None
-    trade_cost: float = 0.0
-    topk_frac: float = 0.2
-    quantile_bin_count: int = 5
+    walk_forward_max_folds: int = Field(20, ge=1, le=200)
+    walk_forward_test_window: Optional[int] = Field(None, ge=1, le=100000)
+    walk_forward_val_window: Optional[int] = Field(None, ge=1, le=100000)
+    walk_forward_step: Optional[int] = Field(None, ge=1, le=100000)
+    trade_cost: float = Field(0.0, ge=0.0, le=0.5)
+    topk_frac: float = Field(0.2, gt=0.0, le=1.0)
+    quantile_bin_count: int = Field(5, ge=2, le=100)
     enforce_t1: bool = True
     calibrate_method: str = "none"
     use_scale_pos_weight: bool = False
@@ -1122,33 +1263,33 @@ class AnalyzeRequest(BaseModel):
     lgb_reg_lambda: Optional[float] = None
 
 class ValidateRequest(BaseModel):
-    codes: List[str]
-    preset_name: Optional[str] = None
+    codes: List[str] = Field(..., max_length=500)
+    preset_name: Optional[str] = Field(None, max_length=120)
     preset_overrides: bool = True
-    frequency: str = "1d"
-    data_src: str = "clickhouse"
-    model: str = "xgboost"
-    autype: str = "qfq"
+    frequency: str = Field("1d", max_length=8)
+    data_src: str = Field("clickhouse", max_length=32)
+    model: str = Field("xgboost", max_length=32)
+    autype: str = Field("qfq", max_length=8)
     data_length_mode: str = "default"
-    data_length_years: Optional[float] = None
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
+    data_length_years: Optional[float] = Field(None, gt=0, le=50)
+    start_date: Optional[str] = Field(None, max_length=32)
+    end_date: Optional[str] = Field(None, max_length=32)
     enable_rolling_lookback: bool = True
-    side_filter: str = "buy"
-    profit_threshold: Optional[float] = 0.01
-    auto_profit_quantile: float = 0.7
-    profit_lookahead: int = 5
+    side_filter: str = Field("buy", max_length=16)
+    profit_threshold: Optional[float] = Field(0.01, ge=0.0, le=10.0)
+    auto_profit_quantile: float = Field(0.7, gt=0.0, lt=1.0)
+    profit_lookahead: int = Field(5, ge=1, le=500)
     use_atr_label: bool = False
-    atr_period: int = 14
-    atr_mult: float = 1.0
+    atr_period: int = Field(14, ge=1, le=500)
+    atr_mult: float = Field(1.0, gt=0.0, le=1000.0)
     backtest_mode: str = "auto"
-    walk_forward_max_folds: int = 20
-    walk_forward_test_window: Optional[int] = None
-    walk_forward_val_window: Optional[int] = None
-    walk_forward_step: Optional[int] = None
-    trade_cost: float = 0.0
-    topk_frac: float = 0.2
-    quantile_bin_count: int = 5
+    walk_forward_max_folds: int = Field(20, ge=1, le=200)
+    walk_forward_test_window: Optional[int] = Field(None, ge=1, le=100000)
+    walk_forward_val_window: Optional[int] = Field(None, ge=1, le=100000)
+    walk_forward_step: Optional[int] = Field(None, ge=1, le=100000)
+    trade_cost: float = Field(0.0, ge=0.0, le=0.5)
+    topk_frac: float = Field(0.2, gt=0.0, le=1.0)
+    quantile_bin_count: int = Field(5, ge=2, le=100)
     enforce_t1: bool = True
     calibrate_method: str = "none"
     use_scale_pos_weight: bool = False
@@ -1161,34 +1302,34 @@ class ValidateRequest(BaseModel):
     feature_preset: Optional[str] = None
 
 class PretrainRequest(BaseModel):
-    codes: list[str]
-    preset_name: Optional[str] = None
+    codes: list[str] = Field(..., min_length=1, max_length=5000)
+    preset_name: Optional[str] = Field(None, max_length=120)
     preset_overrides: bool = True
-    frequency: str = "1d"
-    data_src: str = "clickhouse"
-    model: str = "xgboost"
+    frequency: str = Field("1d", max_length=8)
+    data_src: str = Field("clickhouse", max_length=32)
+    model: str = Field("xgboost", max_length=32)
     data_length_mode: str = "max"
-    data_length_years: Optional[float] = None
+    data_length_years: Optional[float] = Field(None, gt=0, le=50)
     force_refresh: bool = False
-    autype: str = "hfq"
-    pool_name: Optional[str] = None
-    profit_threshold: Optional[float] = 0.01
-    auto_profit_quantile: float = 0.7
-    profit_lookahead: Optional[int] = None
-    high_vol_atr_pct_min: Optional[float] = None
+    autype: str = Field("hfq", max_length=8)
+    pool_name: Optional[str] = Field(None, max_length=120)
+    profit_threshold: Optional[float] = Field(0.01, ge=0.0, le=10.0)
+    auto_profit_quantile: float = Field(0.7, gt=0.0, lt=1.0)
+    profit_lookahead: Optional[int] = Field(None, ge=1, le=500)
+    high_vol_atr_pct_min: Optional[float] = Field(None, ge=0.0, le=100.0)
     use_atr_label: bool = False
-    atr_period: int = 14
-    atr_mult: float = 1.0
-    trade_cost: float = 0.0
-    topk_frac: float = 0.2
-    portfolio_min_score: float = 0.6
-    portfolio_top_n: int = 2
-    rank_mode: str = "sample"
-    rolling_sample_mode: Optional[str] = None
-    rolling_stride: Optional[int] = None
-    only_features: Optional[List[str]] = None
-    feature_preset: Optional[str] = None
-    side_filter: str = "buy"
+    atr_period: int = Field(14, ge=1, le=500)
+    atr_mult: float = Field(1.0, gt=0.0, le=1000.0)
+    trade_cost: float = Field(0.0, ge=0.0, le=0.5)
+    topk_frac: float = Field(0.2, gt=0.0, le=1.0)
+    portfolio_min_score: float = Field(0.6, ge=0.0, le=1.0)
+    portfolio_top_n: int = Field(2, ge=1, le=100)
+    rank_mode: str = Field("sample", max_length=32)
+    rolling_sample_mode: Optional[str] = Field(None, max_length=32)
+    rolling_stride: Optional[int] = Field(None, ge=1, le=1000)
+    only_features: Optional[List[str]] = Field(None, max_length=2000)
+    feature_preset: Optional[str] = Field(None, max_length=120)
+    side_filter: str = Field("buy", max_length=16)
     enforce_t1: bool = True
 
 def _default_profit_lookahead_for_frequency(freq: str) -> int:
@@ -1198,42 +1339,42 @@ def _default_profit_lookahead_for_frequency(freq: str) -> int:
     return 5
 
 class UpdatePretrainedModelNameRequest(BaseModel):
-    name: Optional[str] = None
+    name: Optional[str] = Field(None, max_length=120)
 
 class MatrixRunRequest(BaseModel):
-    dates: Optional[List[str]] = None
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-    max_dates: int = 0
-    rolling_modes: List[str] = ["none", "bsp"]
-    side_filters: List[str] = ["buy", "sell", "both"]
-    lookaheads: List[int] = [1, 3]
-    market_mas: List[int] = [20, 60]
+    dates: Optional[List[str]] = Field(None, max_length=400)
+    start_date: Optional[str] = Field(None, max_length=32)
+    end_date: Optional[str] = Field(None, max_length=32)
+    max_dates: int = Field(0, ge=0, le=400)
+    rolling_modes: List[str] = Field(["none", "bsp"], max_length=8)
+    side_filters: List[str] = Field(["buy", "sell", "both"], max_length=8)
+    lookaheads: List[int] = Field([1, 3], max_length=16)
+    market_mas: List[int] = Field([20, 60], max_length=32)
     include_no_market_filter: bool = True
-    frequency: str = "1d"
-    data_length_days: int = 730
-    feature_preset: str = "purify_compact"
-    min_score: float = 0.55
-    trade_cost: float = 0.001
-    max_signal_age_bars: int = 3
-    per_code_sample_cap: int = 500
-    min_total_samples: int = 2000
-    min_train: int = 1000
-    min_val: int = 300
-    min_test: int = 1000
-    backtest_mode: str = "time_split"
-    market_filter_index: str = "sh000001"
-    limit: int = 0
-    n_jobs: int = 8
-    progress_every: int = 200
+    frequency: str = Field("1d", max_length=8)
+    data_length_days: int = Field(730, ge=30, le=36500)
+    feature_preset: str = Field("purify_compact", max_length=120)
+    min_score: float = Field(0.55, ge=0.0, le=1.0)
+    trade_cost: float = Field(0.001, ge=0.0, le=0.5)
+    max_signal_age_bars: int = Field(3, ge=0, le=1000)
+    per_code_sample_cap: int = Field(500, ge=1, le=100000)
+    min_total_samples: int = Field(2000, ge=1, le=10000000)
+    min_train: int = Field(1000, ge=1, le=10000000)
+    min_val: int = Field(300, ge=0, le=10000000)
+    min_test: int = Field(1000, ge=1, le=10000000)
+    backtest_mode: str = Field("time_split", max_length=32)
+    market_filter_index: str = Field("sh000001", max_length=32)
+    limit: int = Field(0, ge=0, le=5000)
+    n_jobs: int = Field(8, ge=1, le=128)
+    progress_every: int = Field(200, ge=1, le=100000)
     no_rank_transform: bool = False
     no_enforce_t1: bool = False
     resume: bool = False
     evaluate_after_predict: bool = False
 
 class MatrixEvaluateRequest(BaseModel):
-    target_date: Optional[str] = None
-    eval_lookahead: Optional[int] = None
+    target_date: Optional[str] = Field(None, max_length=32)
+    eval_lookahead: Optional[int] = Field(None, ge=1, le=500)
 
 def _matrix_csv(values, allowed=None, default=None):
     raw = values if isinstance(values, list) else []
@@ -1341,7 +1482,7 @@ async def list_matrix_experiments(limit: int = 100):
         items = _matrix_job_overlay(list_experiment_matrices(limit=limit))
         return {"items": items, "total": len(items), "root": str(MATRIX_ROOT)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.get("/api/experiments/matrix/jobs/{job_id}")
 async def get_matrix_job(job_id: str):
@@ -1365,7 +1506,7 @@ async def get_matrix_experiment(matrix_id: str):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.post("/api/experiments/matrix")
 async def create_matrix_experiment(req: MatrixRunRequest):
@@ -1375,6 +1516,13 @@ async def create_matrix_experiment(req: MatrixRunRequest):
             raise HTTPException(status_code=400, detail="empty experiment matrix")
         if config_count > int(_MATRIX_MAX_CONFIGS):
             raise HTTPException(status_code=400, detail=f"matrix too large: {config_count} configs > {_MATRIX_MAX_CONFIGS}")
+        _purge_matrix_jobs()
+        with _matrix_jobs_lock:
+            active = sum(1 for j in _matrix_jobs.values() if str((j or {}).get("status") or "") in ["queued", "running"])
+            if active >= _MATRIX_ACTIVE_MAX:
+                raise HTTPException(status_code=429, detail=f"too many active matrix jobs (max {_MATRIX_ACTIVE_MAX})")
+            if len(_matrix_jobs) >= int(_MATRIX_JOBS_MAX):
+                raise HTTPException(status_code=429, detail="matrix job registry full")
         matrix_id = make_matrix_id()
         matrix_dir = resolve_matrix_dir(matrix_id, must_exist=False)
         matrix_dir.mkdir(parents=True, exist_ok=True)
@@ -1416,20 +1564,29 @@ async def create_matrix_experiment(req: MatrixRunRequest):
                 _purge_matrix_jobs()
                 gc.collect()
 
-        _enqueue_task("matrix_run", job_id, run_job)
+        if not _enqueue_task("matrix_run", job_id, run_job):
+            with _matrix_jobs_lock:
+                _matrix_jobs.pop(job_id, None)
+            raise HTTPException(status_code=429, detail="task queue is full")
         return {"job_id": job_id, "matrix_id": matrix_id, "status": "queued", "config_count": config_count}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.post("/api/experiments/matrix/{matrix_id}/evaluate")
 async def evaluate_matrix_experiment(matrix_id: str, req: MatrixEvaluateRequest):
     try:
         resolve_matrix_dir(matrix_id)
+        _purge_matrix_jobs()
         job_id = str(uuid.uuid4())
         now = _utc_now_str()
         with _matrix_jobs_lock:
+            active = sum(1 for j in _matrix_jobs.values() if str((j or {}).get("status") or "") in ["queued", "running"])
+            if active >= _MATRIX_ACTIVE_MAX:
+                raise HTTPException(status_code=429, detail=f"too many active matrix jobs (max {_MATRIX_ACTIVE_MAX})")
+            if len(_matrix_jobs) >= int(_MATRIX_JOBS_MAX):
+                raise HTTPException(status_code=429, detail="matrix job registry full")
             _matrix_jobs[job_id] = {
                 "job_id": job_id,
                 "matrix_id": matrix_id,
@@ -1463,7 +1620,10 @@ async def evaluate_matrix_experiment(matrix_id: str, req: MatrixEvaluateRequest)
                 _purge_matrix_jobs()
                 gc.collect()
 
-        _enqueue_task("matrix_evaluate", job_id, run_job)
+        if not _enqueue_task("matrix_evaluate", job_id, run_job):
+            with _matrix_jobs_lock:
+                _matrix_jobs.pop(job_id, None)
+            raise HTTPException(status_code=429, detail="task queue is full")
         return {"job_id": job_id, "matrix_id": matrix_id, "status": "queued"}
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="matrix not found")
@@ -1472,7 +1632,7 @@ async def evaluate_matrix_experiment(matrix_id: str, req: MatrixEvaluateRequest)
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.post("/api/experiments/matrix/{matrix_id}/report")
 async def rebuild_matrix_experiment_report(matrix_id: str):
@@ -1483,7 +1643,7 @@ async def rebuild_matrix_experiment_report(matrix_id: str):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.post("/api/pretrain_jobs")
 async def create_pretrain_job(req: PretrainRequest):
@@ -1526,7 +1686,13 @@ async def create_pretrain_job(req: PretrainRequest):
     job_id = str(uuid.uuid4())
     now = _utc_now_str()
     job_obj = None
+    _purge_pretrain_jobs()
     with _pretrain_jobs_lock:
+        active = sum(1 for j in _pretrain_jobs.values() if str((j or {}).get("status") or "") in ("queued", "running"))
+        if active >= _PRETRAIN_ACTIVE_MAX:
+            raise HTTPException(status_code=429, detail=f"too many active pretrain jobs (max {_PRETRAIN_ACTIVE_MAX})")
+        if len(_pretrain_jobs) >= int(_PRETRAIN_JOBS_MAX):
+            raise HTTPException(status_code=429, detail="pretrain job registry full")
         job_obj = {
             "job_id": job_id,
             "status": "queued",
@@ -1554,7 +1720,7 @@ async def create_pretrain_job(req: PretrainRequest):
     try:
         storage.upsert_pretrain_job(dict(job_obj))
     except Exception:
-        pass
+        logger.exception("persist new pretrain job %s failed", job_id)
 
     def run_job():
         try:
@@ -1700,7 +1866,14 @@ async def create_pretrain_job(req: PretrainRequest):
             _purge_pretrain_jobs()
             gc.collect()
 
-    _enqueue_task("pretrain_job", job_id, run_job)
+    if not _enqueue_task("pretrain_job", job_id, run_job):
+        with _pretrain_jobs_lock:
+            _pretrain_jobs.pop(job_id, None)
+        try:
+            storage.delete_pretrain_job(job_id)
+        except Exception:
+            logger.exception("rollback delete_pretrain_job %s failed", job_id)
+        raise HTTPException(status_code=429, detail="task queue is full")
     return {"job_id": job_id}
 
 @app.get("/api/pretrain_jobs/{job_id}")
@@ -1708,7 +1881,7 @@ async def get_pretrain_job(job_id: str):
     with _pretrain_jobs_lock:
         job = _pretrain_jobs.get(job_id)
         if job:
-            return job
+            return _public_pretrain_job(job)
     job = None
     try:
         job = storage.get_pretrain_job(job_id)
@@ -1716,7 +1889,7 @@ async def get_pretrain_job(job_id: str):
         job = None
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
-    return job
+    return _public_pretrain_job(job)
 
 @app.get("/api/pretrain_jobs")
 async def list_pretrain_jobs(page: Optional[int] = None, page_size: int = 50, limit: int = 200):
@@ -1760,7 +1933,7 @@ async def delete_pretrain_job(job_id: str):
     return {"status": "success", "job_id": job_id, "deleted_db": deleted_db}
 
 class BatchDeletePretrainJobsRequest(BaseModel):
-    job_ids: List[str] = []
+    job_ids: List[str] = Field([], max_length=500)
 
 @app.post("/api/pretrain_jobs/batch_delete")
 async def batch_delete_pretrain_jobs(req: BatchDeletePretrainJobsRequest):
@@ -1819,6 +1992,8 @@ async def list_pretrained_models(page: Optional[int] = None, page_size: int = 20
         for it in data.get("items") or []:
             meta = dict(it)
             meta["meta"] = {}
+            # never echo the server-side absolute bundle path (same as detail endpoint)
+            meta.pop("bundle_path", None)
             items.append(_attach_pretrained_display_name(meta, it.get("name")))
         return {"items": items}
 
@@ -1836,11 +2011,26 @@ async def list_pretrained_models(page: Optional[int] = None, page_size: int = 20
     for it in data.get("items") or []:
         meta = dict(it)
         meta["meta"] = {}
+        # never echo the server-side absolute bundle path (same as detail endpoint)
+        meta.pop("bundle_path", None)
         items.append(_attach_pretrained_display_name(meta, it.get("name")))
     return {"items": items, "total": int(data.get("total") or 0), "page": p, "page_size": ps}
 
+def _public_deleted_files(info):
+    """Strip server-side absolute paths from delete_pretrained_model_bundle_by_key
+    output; keep basenames in "missing" so the response stays informative."""
+    if not isinstance(info, dict):
+        return info
+    out = dict(info)
+    out.pop("bundle_path", None)
+    out.pop("meta_path", None)
+    miss = out.get("missing")
+    if isinstance(miss, list):
+        out["missing"] = [os.path.basename(str(p)) for p in miss]
+    return out
+
 class BatchDeletePretrainedModelsRequest(BaseModel):
-    keys: List[str] = []
+    keys: List[str] = Field([], max_length=500)
 
 @app.post("/api/pretrained_models/batch_delete")
 async def batch_delete_pretrained_models(req: BatchDeletePretrainedModelsRequest):
@@ -1872,7 +2062,7 @@ async def batch_delete_pretrained_models(req: BatchDeletePretrainedModelsRequest
         if (deleted_files or {}).get("status") == "not_found" and not deleted_db:
             failed.append({"key": k, "reason": "not_found"})
         else:
-            deleted.append({"key": k, "deleted_files": deleted_files, "deleted_db": deleted_db})
+            deleted.append({"key": k, "deleted_files": _public_deleted_files(deleted_files), "deleted_db": deleted_db})
     return {"status": "success", "deleted": deleted, "failed": failed}
 
 @app.get("/api/pretrained_models/{key}")
@@ -1889,7 +2079,8 @@ async def get_pretrained_model_detail(key: str):
                 sample_count = 0
         result = {
             "status": "success",
-            "bundle_path": meta.get("bundle_path"),
+            # never echo the server-side absolute bundle path; expose the key only
+            "model_key": str(meta.get("key") or key),
             "model_type": meta.get("model_type"),
             "frequency": meta.get("frequency"),
             "data_src": meta.get("data_src"),
@@ -1907,7 +2098,7 @@ async def get_pretrained_model_detail(key: str):
             raise HTTPException(status_code=404, detail="model not found")
         result = {
             "status": "success",
-            "bundle_path": db.get("bundle_path"),
+            "model_key": str(db.get("key") or key),
             "model_type": db.get("model_type"),
             "frequency": db.get("frequency"),
             "data_src": db.get("data_src"),
@@ -1968,14 +2159,14 @@ async def delete_pretrained_model(key: str):
     if (deleted_files or {}).get("status") == "not_found" and not deleted_db:
         raise HTTPException(status_code=404, detail="model not found")
 
-    return {"status": "success", "key": str(key or ""), "deleted_files": deleted_files, "deleted_db": deleted_db}
+    return {"status": "success", "key": str(key or ""), "deleted_files": _public_deleted_files(deleted_files), "deleted_db": deleted_db}
 
 @app.get("/api/history")
 async def get_history(code: Optional[str] = None, page: int = 1, page_size: int = 10):
     return storage.get_history(code, page, page_size)
 
 class BatchDeleteHistoryRequest(BaseModel):
-    result_ids: List[int] = []
+    result_ids: List[int] = Field([], max_length=1000)
 
 @app.post("/api/history/batch_delete")
 async def batch_delete_history(req: BatchDeleteHistoryRequest):
@@ -2007,14 +2198,14 @@ async def get_history_detail(result_id: int):
     return result
 
 class CreatePortfolioRequest(BaseModel):
-    name: str
-    description: str = ""
+    name: str = Field(..., min_length=1, max_length=120)
+    description: str = Field("", max_length=2000)
 
 class AddPositionRequest(BaseModel):
-    code: str
-    volume: int
-    price: float
-    name: str = ""
+    code: str = Field(..., min_length=1, max_length=64)
+    volume: int = Field(..., ge=0, le=1000000000)
+    price: float = Field(..., ge=0.0, le=1e9)
+    name: str = Field("", max_length=120)
 
 @app.get("/api/portfolios")
 async def list_portfolios():
@@ -2042,79 +2233,79 @@ async def add_position(portfolio_id: int, req: AddPositionRequest):
     return {"status": "success"}
 
 class VectorBacktestRequest(BaseModel):
-    pool_id: str = "chinext50"
+    pool_id: str = Field("chinext50", max_length=120)
     point_in_time_pool: bool = False
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-    model_key: Optional[str] = None
-    frequency: str = "1d"
-    data_src: str = "clickhouse"
-    autype: str = "qfq"
+    start_date: Optional[str] = Field(None, max_length=32)
+    end_date: Optional[str] = Field(None, max_length=32)
+    model_key: Optional[str] = Field(None, max_length=64)
+    frequency: str = Field("1d", max_length=8)
+    data_src: str = Field("clickhouse", max_length=32)
+    autype: str = Field("qfq", max_length=8)
     enable_rolling_lookback: bool = True
-    portfolio_top_n: int = 2
-    portfolio_top_frac: Optional[float] = None
-    holding_period: int = 5
-    min_signal_score: Optional[float] = None
-    initial_capital: float = 100000.0
-    max_workers: int = _BACKTEST_MAX_WORKERS
-    score_feature: Optional[str] = None
-    score_mode: str = "raw"
+    portfolio_top_n: int = Field(2, ge=1, le=100)
+    portfolio_top_frac: Optional[float] = Field(None, gt=0.0, le=1.0)
+    holding_period: int = Field(5, ge=1, le=365)
+    min_signal_score: Optional[float] = Field(None, ge=0.0, le=1.0)
+    initial_capital: float = Field(100000.0, gt=0.0, le=1e12)
+    max_workers: int = Field(_BACKTEST_MAX_WORKERS, ge=0, le=256)
+    score_feature: Optional[str] = Field(None, max_length=120)
+    score_mode: str = Field("raw", max_length=32)
     score_higher_is_better: bool = True
 
 class WolfpackBacktestRequest(BaseModel):
-    pool_id: str = "index:IDX399673"
-    preset_name: Optional[str] = None
+    pool_id: str = Field("index:IDX399673", max_length=120)
+    preset_name: Optional[str] = Field(None, max_length=120)
     preset_overrides: bool = True
     point_in_time_pool: bool = True
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-    frequency: str = "30m"
-    data_src: str = "clickhouse"
-    autype: str = "qfq"
+    start_date: Optional[str] = Field(None, max_length=32)
+    end_date: Optional[str] = Field(None, max_length=32)
+    frequency: str = Field("30m", max_length=8)
+    data_src: str = Field("clickhouse", max_length=32)
+    autype: str = Field("qfq", max_length=8)
     enable_rolling_lookback: bool = True
-    holding_period: int = 3
-    min_prob: float = 0.25
-    trade_cost: float = 0.0002
-    walk_forward_max_folds: int = 25
-    rolling_sample_mode: str = "every_bar"
-    rolling_stride: int = 1
-    portfolio_top_n: int = 2
+    holding_period: int = Field(3, ge=1, le=365)
+    min_prob: float = Field(0.25, ge=0.0, le=1.0)
+    trade_cost: float = Field(0.0002, ge=0.0, le=0.5)
+    walk_forward_max_folds: int = Field(25, ge=1, le=200)
+    rolling_sample_mode: str = Field("every_bar", max_length=32)
+    rolling_stride: int = Field(1, ge=1, le=1000)
+    portfolio_top_n: int = Field(2, ge=1, le=100)
     index_filter_enabled: bool = True
-    index_code: str = "399006"
-    index_ma_window: int = 20
-    stop_loss: float = -0.03
+    index_code: str = Field("399006", max_length=32)
+    index_ma_window: int = Field(20, ge=1, le=1000)
+    stop_loss: float = Field(-0.03, ge=-1.0, le=1.0)
     enforce_t1: bool = True
-    sell_mode: str = "baseline"
-    t1_decision_time: str = "10:00"
-    t1_gap_strong_threshold: float = 0.03
-    t1_gap_weak_threshold: float = -0.02
-    t1_gap_very_strong_threshold: float = 0.05
+    sell_mode: str = Field("baseline", max_length=32)
+    t1_decision_time: str = Field("10:00", max_length=8)
+    t1_gap_strong_threshold: float = Field(0.03, ge=-1.0, le=1.0)
+    t1_gap_weak_threshold: float = Field(-0.02, ge=-1.0, le=1.0)
+    t1_gap_very_strong_threshold: float = Field(0.05, ge=-1.0, le=1.0)
     risk_filter_enabled: bool = False
-    risk_index_code: Optional[str] = None
-    risk_mode: str = "both"
-    risk_drop_threshold: float = -0.03
-    risk_flat_drop_threshold: float = -0.05
-    risk_atr_window: int = 14
-    risk_atr_pct_threshold: float = 0.04
-    risk_flat_atr_pct_threshold: float = 0.06
-    risk_gap_down_threshold: float = -0.015
+    risk_index_code: Optional[str] = Field(None, max_length=32)
+    risk_mode: str = Field("both", max_length=16)
+    risk_drop_threshold: float = Field(-0.03, ge=-1.0, le=1.0)
+    risk_flat_drop_threshold: float = Field(-0.05, ge=-1.0, le=1.0)
+    risk_atr_window: int = Field(14, ge=2, le=500)
+    risk_atr_pct_threshold: float = Field(0.04, ge=0.0, le=10.0)
+    risk_flat_atr_pct_threshold: float = Field(0.06, ge=0.0, le=10.0)
+    risk_gap_down_threshold: float = Field(-0.015, ge=-1.0, le=1.0)
     risk_intraday_enabled: bool = True
-    risk_intraday_bear_threshold: float = -0.015
-    risk_intraday_bull_threshold: float = -0.03
-    risk_trend_ma_window: int = 20
-    risk_data_fail_mode: str = "reduce"
-    risk_intraday_data_fail_mode: str = "reduce"
-    max_workers: int = _BACKTEST_MAX_WORKERS
-    model: str = "xgboost"
-    pretrained_model_key: Optional[str] = None
-    rank_mode: str = "cross_section"
-    lookback_days: int = 1825
+    risk_intraday_bear_threshold: float = Field(-0.015, ge=-1.0, le=1.0)
+    risk_intraday_bull_threshold: float = Field(-0.03, ge=-1.0, le=1.0)
+    risk_trend_ma_window: int = Field(20, ge=1, le=1000)
+    risk_data_fail_mode: str = Field("reduce", max_length=16)
+    risk_intraday_data_fail_mode: str = Field("reduce", max_length=16)
+    max_workers: int = Field(_BACKTEST_MAX_WORKERS, ge=0, le=256)
+    model: str = Field("xgboost", max_length=32)
+    pretrained_model_key: Optional[str] = Field(None, max_length=64)
+    rank_mode: str = Field("cross_section", max_length=32)
+    lookback_days: int = Field(1825, ge=1, le=7300)
     only_features: Optional[str] = None
-    feature_preset: Optional[str] = None
-    side_filter: str = "buy"
+    feature_preset: Optional[str] = Field(None, max_length=120)
+    side_filter: str = Field("buy", max_length=16)
 
 @app.post("/api/backtest/vector")
-async def run_vector_backtest(req: VectorBacktestRequest):
+def run_vector_backtest(req: VectorBacktestRequest):
     _assert_data_src_enabled(req.data_src)
     # Default to last 3 months if not provided
     import datetime
@@ -2142,8 +2333,11 @@ async def run_vector_backtest(req: VectorBacktestRequest):
     
     tester = VectorBacktester()
     
-    # Determine pool
+    # Determine pool. Failures are surfaced explicitly: silently swapping in
+    # a hardcoded sample pool would produce "successful" backtests on the
+    # wrong data.
     pool_codes = []
+    pool_error = None
     if ":" in str(req.pool_id or ""):
         try:
             from DataAPI.ClickHouseAPI import CClickHouseAPI
@@ -2169,50 +2363,61 @@ async def run_vector_backtest(req: VectorBacktestRequest):
                     limit=5000,
                     as_of_date=str(start),
                 )
-        except Exception:
+        except Exception as e:
+            pool_error = e
             pool_codes = []
     elif req.pool_id in ["chinext50", "chinext10"]:
-        from backend.vector_backtest import get_chinext50_stocks
-        pool_codes = get_chinext50_stocks()
-        if req.pool_id == "chinext10":
-            pool_codes = list(pool_codes or [])[:10]
+        try:
+            from backend.vector_backtest import get_chinext50_stocks
+            pool_codes = get_chinext50_stocks()
+            if req.pool_id == "chinext10":
+                pool_codes = list(pool_codes or [])[:10]
+        except Exception as e:
+            pool_error = e
+            pool_codes = []
     else:
-        # TODO: Support other pools
-        pass
-    
+        raise HTTPException(status_code=400, detail=f"unsupported pool_id: {req.pool_id}")
+
+    if pool_error is not None:
+        logger.warning("pool resolution failed for pool_id=%s: %s", req.pool_id, pool_error)
+        raise HTTPException(status_code=502, detail=f"pool_resolve_failed:{type(pool_error).__name__}")
     if not pool_codes:
-         # Fallback for testing
-         pool_codes = ["sz.300059", "sz.300750"] # Sample ChiNext stocks
-    
+        raise HTTPException(status_code=400, detail=f"pool resolved to zero members: {req.pool_id}")
+
     mw = _resolve_backtest_max_workers(getattr(req, "max_workers", 0), len(pool_codes))
          
     # Run
     # Warning: This is blocking. In production, use background task.
-    result = tester.run(
-        pool_codes,
-        start,
-        end,
-        req.model_key,
-        frequency=req.frequency,
-        data_src=req.data_src,
-        autype=req.autype,
-        enable_rolling_lookback=req.enable_rolling_lookback,
-        portfolio_top_n=req.portfolio_top_n,
-        portfolio_top_frac=req.portfolio_top_frac,
-        holding_period=req.holding_period,
-        min_signal_score=req.min_signal_score,
-        initial_capital=req.initial_capital,
-        max_workers=mw,
-        pool_id=str(req.pool_id or "").strip() or None,
-        pool_point_in_time=bool(getattr(req, "point_in_time_pool", False)),
-        score_feature=req.score_feature,
-        score_mode=req.score_mode,
-        score_higher_is_better=req.score_higher_is_better,
-    )
+    try:
+        result = tester.run(
+            pool_codes,
+            start,
+            end,
+            req.model_key,
+            frequency=req.frequency,
+            data_src=req.data_src,
+            autype=req.autype,
+            enable_rolling_lookback=req.enable_rolling_lookback,
+            portfolio_top_n=req.portfolio_top_n,
+            portfolio_top_frac=req.portfolio_top_frac,
+            holding_period=req.holding_period,
+            min_signal_score=req.min_signal_score,
+            initial_capital=req.initial_capital,
+            max_workers=mw,
+            pool_id=str(req.pool_id or "").strip() or None,
+            pool_point_in_time=bool(getattr(req, "point_in_time_pool", False)),
+            score_feature=req.score_feature,
+            score_mode=req.score_mode,
+            score_higher_is_better=req.score_higher_is_better,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=_err500(e))
     return result
 
 @app.post("/api/backtest/wolfpack")
-async def run_wolfpack_backtest(req: WolfpackBacktestRequest):
+def run_wolfpack_backtest(req: WolfpackBacktestRequest):
     strategy_preset, strategy_preset_audit = _apply_strategy_preset_to_request(req)
     _assert_data_src_enabled(req.data_src)
     import datetime
@@ -2226,24 +2431,29 @@ async def run_wolfpack_backtest(req: WolfpackBacktestRequest):
     from DataAPI.ClickHouseAPI import CClickHouseAPI
     effective_pool_id = str(req.pool_id or "").strip() or None
     pool_codes = []
+    pool_error = None
     def _get_pool_members_with_fallback(pool_id: Optional[str], start_dt: str, end_dt: str) -> List[str]:
+        nonlocal pool_error
         pid = str(pool_id or "").strip()
         if not pid:
             return []
         try:
             codes = CClickHouseAPI.get_pool_members(pid, table="stock_constituent", limit=5000, as_of_date=str(start_dt))
-        except Exception:
+        except Exception as e:
             codes = []
+            pool_error = pool_error or e
         if not codes and end_dt and str(end_dt) != str(start_dt):
             try:
                 codes = CClickHouseAPI.get_pool_members(pid, table="stock_constituent", limit=5000, as_of_date=str(end_dt))
-            except Exception:
+            except Exception as e:
                 codes = []
+                pool_error = pool_error or e
         if not codes:
             try:
                 codes = CClickHouseAPI.get_pool_members(pid, table="stock_constituent", limit=5000, as_of_date=None)
-            except Exception:
+            except Exception as e:
                 codes = []
+                pool_error = pool_error or e
         return list(codes or [])
     if ":" in str(req.pool_id or ""):
         if bool(getattr(req, "point_in_time_pool", True)):
@@ -2254,8 +2464,9 @@ async def run_wolfpack_backtest(req: WolfpackBacktestRequest):
                     str(end),
                     table="stock_constituent",
                 )
-            except Exception:
+            except Exception as e:
                 snap = {}
+                pool_error = pool_error or e
             if snap:
                 seen = {}
                 for _, codes in (snap or {}).items():
@@ -2268,11 +2479,15 @@ async def run_wolfpack_backtest(req: WolfpackBacktestRequest):
             pool_codes = _get_pool_members_with_fallback(req.pool_id, str(start), str(end))
     else:
         pool_codes = _get_pool_members_with_fallback(req.pool_id, str(start), str(end))
-    if not pool_codes:
+    if not pool_codes and not str(req.pool_id or "").strip():
+        # Auto-discovery of the fallback pool is only allowed when the caller
+        # did NOT name a pool. An explicit pool_id that resolves to zero
+        # members must fail below instead of silently swapping pools.
         try:
             pools = CClickHouseAPI.list_stock_pools(table="stock_constituent")
-        except Exception:
+        except Exception as e:
             pools = []
+            pool_error = e
         picked = None
         for p in (pools or []):
             pid = str((p or {}).get("pool_id") or "")
@@ -2290,8 +2505,9 @@ async def run_wolfpack_backtest(req: WolfpackBacktestRequest):
                         str(end),
                         table="stock_constituent",
                     )
-                except Exception:
+                except Exception as e:
                     snap = {}
+                    pool_error = pool_error or e
                 if snap:
                     seen = {}
                     for _, codes in (snap or {}).items():
@@ -2302,83 +2518,92 @@ async def run_wolfpack_backtest(req: WolfpackBacktestRequest):
                     pool_codes = list(seen.keys())
             if not pool_codes:
                 pool_codes = _get_pool_members_with_fallback(picked, str(start), str(end))
-        if not pool_codes:
-            from backend.vector_backtest import get_chinext50_stocks
-            pool_codes = get_chinext50_stocks()
+    # No silent hardcoded sample pool: surface resolution failure/empty pool
+    # explicitly instead of running a "successful" backtest on wrong data.
+    if not pool_codes:
+        if pool_error is not None:
+            logger.warning("wolfpack pool resolution failed for pool_id=%s: %s", req.pool_id, pool_error)
+            raise HTTPException(status_code=502, detail=f"pool_resolve_failed:{type(pool_error).__name__}")
+        raise HTTPException(status_code=400, detail=f"pool resolved to zero members: {req.pool_id}")
 
     mw = _resolve_backtest_max_workers(getattr(req, "max_workers", 0), len(pool_codes))
 
     from backend.wolfpack_backtest import WolfpackBacktester
     tester = WolfpackBacktester()
-    result = tester.run(
-        pool_codes,
-        start,
-        end,
-        frequency=req.frequency,
-        data_src=req.data_src,
-        autype=req.autype,
-        enable_rolling_lookback=req.enable_rolling_lookback,
-        min_prob=req.min_prob,
-        holding_period=req.holding_period,
-        trade_cost=req.trade_cost,
-        walk_forward_max_folds=req.walk_forward_max_folds,
-        rolling_sample_mode=req.rolling_sample_mode,
-        rolling_stride=req.rolling_stride,
-        portfolio_top_n=req.portfolio_top_n,
-        pool_id=effective_pool_id,
-        pool_point_in_time=bool(getattr(req, "point_in_time_pool", True)),
-        index_filter_enabled=req.index_filter_enabled,
-        index_code=req.index_code,
-        index_ma_window=req.index_ma_window,
-        stop_loss=req.stop_loss,
-        enforce_t1=req.enforce_t1,
-        sell_mode=req.sell_mode,
-        t1_decision_time=req.t1_decision_time,
-        t1_gap_strong_threshold=req.t1_gap_strong_threshold,
-        t1_gap_weak_threshold=req.t1_gap_weak_threshold,
-        t1_gap_very_strong_threshold=req.t1_gap_very_strong_threshold,
-        risk_filter_enabled=req.risk_filter_enabled,
-        risk_index_code=req.risk_index_code,
-        risk_mode=req.risk_mode,
-        risk_drop_threshold=req.risk_drop_threshold,
-        risk_flat_drop_threshold=req.risk_flat_drop_threshold,
-        risk_atr_window=req.risk_atr_window,
-        risk_atr_pct_threshold=req.risk_atr_pct_threshold,
-        risk_flat_atr_pct_threshold=req.risk_flat_atr_pct_threshold,
-        risk_gap_down_threshold=req.risk_gap_down_threshold,
-        risk_intraday_enabled=req.risk_intraday_enabled,
-        risk_intraday_bear_threshold=req.risk_intraday_bear_threshold,
-        risk_intraday_bull_threshold=req.risk_intraday_bull_threshold,
-        risk_trend_ma_window=req.risk_trend_ma_window,
-        risk_data_fail_mode=req.risk_data_fail_mode,
-        risk_intraday_data_fail_mode=req.risk_intraday_data_fail_mode,
-        max_workers=mw,
-        model=req.model,
-        pretrained_model_key=req.pretrained_model_key,
-        rank_mode=req.rank_mode,
-        lookback_days=req.lookback_days,
-        only_features=req.only_features,
-        feature_preset=req.feature_preset,
-        side_filter=req.side_filter,
-    )
+    try:
+        result = tester.run(
+            pool_codes,
+            start,
+            end,
+            frequency=req.frequency,
+            data_src=req.data_src,
+            autype=req.autype,
+            enable_rolling_lookback=req.enable_rolling_lookback,
+            min_prob=req.min_prob,
+            holding_period=req.holding_period,
+            trade_cost=req.trade_cost,
+            walk_forward_max_folds=req.walk_forward_max_folds,
+            rolling_sample_mode=req.rolling_sample_mode,
+            rolling_stride=req.rolling_stride,
+            portfolio_top_n=req.portfolio_top_n,
+            pool_id=effective_pool_id,
+            pool_point_in_time=bool(getattr(req, "point_in_time_pool", True)),
+            index_filter_enabled=req.index_filter_enabled,
+            index_code=req.index_code,
+            index_ma_window=req.index_ma_window,
+            stop_loss=req.stop_loss,
+            enforce_t1=req.enforce_t1,
+            sell_mode=req.sell_mode,
+            t1_decision_time=req.t1_decision_time,
+            t1_gap_strong_threshold=req.t1_gap_strong_threshold,
+            t1_gap_weak_threshold=req.t1_gap_weak_threshold,
+            t1_gap_very_strong_threshold=req.t1_gap_very_strong_threshold,
+            risk_filter_enabled=req.risk_filter_enabled,
+            risk_index_code=req.risk_index_code,
+            risk_mode=req.risk_mode,
+            risk_drop_threshold=req.risk_drop_threshold,
+            risk_flat_drop_threshold=req.risk_flat_drop_threshold,
+            risk_atr_window=req.risk_atr_window,
+            risk_atr_pct_threshold=req.risk_atr_pct_threshold,
+            risk_flat_atr_pct_threshold=req.risk_flat_atr_pct_threshold,
+            risk_gap_down_threshold=req.risk_gap_down_threshold,
+            risk_intraday_enabled=req.risk_intraday_enabled,
+            risk_intraday_bear_threshold=req.risk_intraday_bear_threshold,
+            risk_intraday_bull_threshold=req.risk_intraday_bull_threshold,
+            risk_trend_ma_window=req.risk_trend_ma_window,
+            risk_data_fail_mode=req.risk_data_fail_mode,
+            risk_intraday_data_fail_mode=req.risk_intraday_data_fail_mode,
+            max_workers=mw,
+            model=req.model,
+            pretrained_model_key=req.pretrained_model_key,
+            rank_mode=req.rank_mode,
+            lookback_days=req.lookback_days,
+            only_features=req.only_features,
+            feature_preset=req.feature_preset,
+            side_filter=req.side_filter,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=_err500(e))
     if isinstance(result, dict) and strategy_preset_audit:
         result["strategy_preset"] = strategy_preset_audit
     return result
 
 class BacktestPresetUpsertRequest(BaseModel):
-    name: str = ""
+    name: str = Field("", max_length=120)
     paper_config: dict = {}
     paper_params: dict = {}
 
 
 class StrategyPresetEvaluateRequest(BaseModel):
-    preset_name: str
+    preset_name: str = Field(..., min_length=1, max_length=120)
     metrics: Optional[Dict[str, Any]] = None
     profile: Optional[Dict[str, Any]] = None
 
 
 class StrategyPresetSelectRequest(BaseModel):
-    candidate_names: Optional[List[str]] = None
+    candidate_names: Optional[List[str]] = Field(None, max_length=200)
     metrics: Optional[Dict[str, Any]] = None
     metrics_by_preset: Optional[Dict[str, Dict[str, Any]]] = None
     profile: Optional[Dict[str, Any]] = None
@@ -2389,7 +2614,7 @@ async def list_backtest_presets(limit: int = 200):
         items = storage.list_backtest_presets(limit=limit) or []
         return {"items": items}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.post("/api/backtest/presets")
 async def upsert_backtest_preset(req: BacktestPresetUpsertRequest):
@@ -2406,7 +2631,7 @@ async def upsert_backtest_preset(req: BacktestPresetUpsertRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.get("/api/backtest/presets/{preset_id}")
 async def get_backtest_preset(preset_id: int):
@@ -2418,7 +2643,7 @@ async def get_backtest_preset(preset_id: int):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 
 @app.get("/api/strategy_presets")
@@ -2431,7 +2656,7 @@ async def list_strategy_presets(include_disabled: bool = False, status: Optional
             "items": strategy_preset_manager.list_presets(include_disabled=include_disabled, status=status),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 
 @app.get("/api/strategy_presets/{name}")
@@ -2441,7 +2666,7 @@ async def get_strategy_preset(name: str):
     except PresetNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 
 @app.post("/api/strategy_presets/evaluate")
@@ -2453,7 +2678,7 @@ async def evaluate_strategy_preset(req: StrategyPresetEvaluateRequest):
     except PresetNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 
 @app.post("/api/strategy_presets/select")
@@ -2473,11 +2698,12 @@ async def select_strategy_preset(req: StrategyPresetSelectRequest):
     except PresetNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.post("/api/analyze")
-async def analyze_stock(req: AnalyzeRequest):
-    print(f"Received analyze request: code={req.code}, freq={req.frequency}, model={req.model}, force_refresh={req.force_refresh}, data_length_years={req.data_length_years}")
+def analyze_stock(req: AnalyzeRequest):
+    logger.info("analyze request: code=%s freq=%s model=%s force_refresh=%s data_length_years=%s",
+                req.code, req.frequency, req.model, req.force_refresh, req.data_length_years)
     try:
         strategy_preset, strategy_preset_audit = _apply_strategy_preset_to_request(req)
         _assert_data_src_enabled(req.data_src)
@@ -2593,7 +2819,7 @@ async def analyze_stock(req: AnalyzeRequest):
             # Use short lookback for efficiency
             latest_data_time = get_latest_data_time(req.code, level, data_src, autype=autype)
         except Exception as e:
-             print(f"Error fetching latest time: {e}")
+             logger.warning("fetch latest data time failed for %s: %s", req.code, e)
 
         params = {
             "trigger_step": req.trigger_step,
@@ -2670,14 +2896,14 @@ async def analyze_stock(req: AnalyzeRequest):
                 better_params['do_predict'] = True
                 better_result = storage.get_latest_result(req.code, req.frequency, better_params, latest_data_time, begin_time)
                 if better_result:
-                    print(f"Cache hit (upgraded with prediction) for {req.code} {req.frequency} {latest_data_time}")
+                    logger.info("cache hit (upgraded with prediction) for %s %s %s", req.code, req.frequency, latest_data_time)
                     return json.loads(better_result.result_json)
 
             # 2. Normal cache check
             cached_result = storage.get_latest_result(req.code, req.frequency, params, latest_data_time, begin_time)
             
             if cached_result:
-                print(f"Cache hit for {req.code} {req.frequency} {latest_data_time} begin={begin_time}")
+                logger.info("cache hit for %s %s %s begin=%s", req.code, req.frequency, latest_data_time, begin_time)
                 return json.loads(cached_result.result_json)
         
         # 3. Cache Miss or No Time info -> Fetch Full Data
@@ -2693,7 +2919,7 @@ async def analyze_stock(req: AnalyzeRequest):
                 use_online_latest=use_online_latest,
             )
         except Exception as e:
-            print(f"Fetch data error: {e}")
+            logger.warning("fetch data error for %s: %s", req.code, e)
             kl_list = []
             
         if not kl_list:
@@ -2718,9 +2944,7 @@ async def analyze_stock(req: AnalyzeRequest):
                 side_filter=req.side_filter,
             )
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=f"Error loading CChan: {e}")
+            raise HTTPException(status_code=500, detail=_err500(e, "chan_load_failed"))
         
         if not chan or not last_snapshot:
             raise HTTPException(status_code=404, detail=f"Data not found for {req.code}")
@@ -3011,19 +3235,17 @@ async def analyze_stock(req: AnalyzeRequest):
                     end_time=None # End time is implicitly 'now' or latest_data_time
                 )
         except Exception as e:
-            print(f"Failed to save cache: {e}")
+            logger.warning("failed to save analyze cache for %s: %s", req.code, e)
             
         return json_safe_value(result_data)
         
     except HTTPException as e:
         raise e
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.post("/api/validate")
-async def validate_codes(req: ValidateRequest):
+def validate_codes(req: ValidateRequest):
     try:
         strategy_preset, strategy_preset_audit = _apply_strategy_preset_to_request(req)
         _assert_data_src_enabled(req.data_src)
@@ -3217,9 +3439,7 @@ async def validate_codes(req: ValidateRequest):
     except HTTPException as e:
         raise e
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.get("/health")
 def health_check():
@@ -3272,7 +3492,7 @@ def clickhouse_health_check():
         return out
 
 @app.post("/api/pretrain")
-async def pretrain_model(req: PretrainRequest):
+def pretrain_model(req: PretrainRequest):
     try:
         strategy_preset, strategy_preset_audit = _apply_strategy_preset_to_request(req)
         _assert_data_src_enabled(req.data_src)
@@ -3375,9 +3595,7 @@ async def pretrain_model(req: PretrainRequest):
     except HTTPException as e:
         raise e
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.get("/api/indices")
 async def list_indices(limit: int = 2000, keyword: Optional[str] = None):
@@ -3386,9 +3604,7 @@ async def list_indices(limit: int = 2000, keyword: Optional[str] = None):
         items = CClickHouseAPI.list_indices(limit=limit, keyword=keyword)
         return {"items": items}
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.get("/api/stock_pools")
 async def list_stock_pools(limit: int = 2000, keyword: Optional[str] = None):
@@ -3414,9 +3630,7 @@ async def list_stock_pools(limit: int = 2000, keyword: Optional[str] = None):
         lim = max(1, min(5000, lim))
         return {"items": items[:lim]}
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 
 @app.get("/api/stock_pools/{pool_id}/members")
@@ -3433,162 +3647,185 @@ async def get_stock_pool_members(pool_id: str, limit: int = 5000, as_of_date: Op
         codes = sorted(list(dict.fromkeys(codes)))
         return {"pool_id": pool_id, "codes": codes, "as_of_date": as_of_date, "snapshot_date": snapshot_date}
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
+
+_DOWNLOAD_NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
 @app.get("/api/download/{code}")
-async def download_data(code: str, frequency: str = "1d"):
+def download_data(code: str, frequency: str = "1d"):
+    # Whitelist the values that end up in Content-Disposition; anything else
+    # (CRLF, quotes, path separators) is rejected before it can inject headers.
+    safe_code = str(code or "").strip()
+    safe_freq = str(frequency or "1d").strip().lower()
+    if not _DOWNLOAD_NAME_RE.fullmatch(safe_code):
+        raise HTTPException(status_code=400, detail="invalid code")
+    if not _DOWNLOAD_NAME_RE.fullmatch(safe_freq):
+        raise HTTPException(status_code=400, detail="invalid frequency")
     try:
-        csv_content = download_stock_history(code, frequency)
+        # download_stock_history drives the process-global baostock session
+        # (bs.login()...bs.logout()) without any lock. Serialize it against all
+        # CBaoStock queries via the shared _conn_lock so concurrent downloads /
+        # fetches don't interleave on the same socket, then mark the session
+        # stale because the helper ends it with bs.logout().
+        from DataAPI.BaoStockAPI import CBaoStock
+        with CBaoStock._conn_lock:
+            try:
+                csv_content = download_stock_history(safe_code, safe_freq)
+            finally:
+                try:
+                    CBaoStock.is_connect = False
+                except Exception:
+                    pass
         return Response(
             content=csv_content,
             media_type="text/csv",
-            headers={"Content-Disposition": f"attachment; filename={code}_{frequency}.csv"}
+            headers={"Content-Disposition": f"attachment; filename={safe_code}_{safe_freq}.csv"}
         )
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 
 class StrategyRequest(BaseModel):
-    strategy_name: str
-    scope: str = "hs300"
-    pool_id: Optional[str] = None
-    manual_codes: Optional[str] = None
-    codes: Optional[List[str]] = None
-    index_code: str = "399006"
-    model: str = "xgboost"
-    autype: str = "hfq"
-    min_accuracy: float = 0.8
-    min_recent_accuracy: Optional[float] = None
-    recent_accuracy_years: float = 1.0
-    min_profit_factor: Optional[float] = None
-    min_topk_avg_return: Optional[float] = None
-    min_topk_trade_count: int = 0
-    max_topk_drawdown: Optional[float] = None
-    min_signal_score: Optional[float] = None
-    min_bsp_count: int = 0
-    min_test_count: int = 0
-    high_vol_atr_pct_min: Optional[float] = None
+    strategy_name: str = Field(..., min_length=1, max_length=120)
+    scope: str = Field("hs300", max_length=32)
+    pool_id: Optional[str] = Field(None, max_length=120)
+    manual_codes: Optional[str] = Field(None, max_length=20000)
+    codes: Optional[List[str]] = Field(None, max_length=2000)
+    index_code: str = Field("399006", max_length=32)
+    model: str = Field("xgboost", max_length=32)
+    autype: str = Field("hfq", max_length=8)
+    min_accuracy: float = Field(0.8, ge=0.0, le=1.0)
+    min_recent_accuracy: Optional[float] = Field(None, ge=0.0, le=1.0)
+    recent_accuracy_years: float = Field(1.0, gt=0.0, le=50.0)
+    min_profit_factor: Optional[float] = Field(None, ge=0.0, le=1000.0)
+    min_topk_avg_return: Optional[float] = Field(None, ge=-100.0, le=1000.0)
+    min_topk_trade_count: int = Field(0, ge=0, le=1000000)
+    max_topk_drawdown: Optional[float] = Field(None, ge=-1.0, le=1.0)
+    min_signal_score: Optional[float] = Field(None, ge=0.0, le=1.0)
+    min_bsp_count: int = Field(0, ge=0, le=1000000)
+    min_test_count: int = Field(0, ge=0, le=1000000)
+    high_vol_atr_pct_min: Optional[float] = Field(None, ge=0.0, le=100.0)
     use_atr_label: bool = False
-    atr_period: int = 14
-    atr_mult: float = 1.0
-    profit_threshold: Optional[float] = 0.01
-    auto_profit_quantile: float = 0.7
-    profit_lookahead: int = 5
-    trade_cost: float = 0.0
+    atr_period: int = Field(14, ge=1, le=500)
+    atr_mult: float = Field(1.0, gt=0.0, le=1000.0)
+    profit_threshold: Optional[float] = Field(0.01, ge=0.0, le=10.0)
+    auto_profit_quantile: float = Field(0.7, gt=0.0, lt=1.0)
+    profit_lookahead: int = Field(5, ge=1, le=500)
+    trade_cost: float = Field(0.0, ge=0.0, le=0.5)
     enforce_t1: bool = False
-    frequency: str = "1d"
-    data_length_years: float = 1.0
+    frequency: str = Field("1d", max_length=8)
+    data_length_years: float = Field(1.0, gt=0.0, le=50.0)
     chan_config: Optional[Dict[str, Any]] = None
     require_signal: bool = False
-    signal_lookback: int = 5
-    signal_direction: str = "buy"  # buy, sell, both
-    side_filter: str = "buy"
+    signal_lookback: int = Field(5, ge=1, le=250)
+    signal_direction: str = Field("buy", max_length=16)  # buy, sell, both
+    side_filter: str = Field("buy", max_length=16)
     only_features: Optional[Any] = None
-    feature_preset: Optional[str] = None
+    feature_preset: Optional[str] = Field(None, max_length=120)
     enable_rolling_lookback: bool = True # Enable/Disable long-term context features (250-bar lookback)
-    amp_whitelist_days: int = 0
-    amp_whitelist_top_frac: float = 0.3
-    portfolio_top_n: int = 2
-    holding_period: int = 3
+    amp_whitelist_days: int = Field(0, ge=0, le=3650)
+    amp_whitelist_top_frac: float = Field(0.3, gt=0.0, le=1.0)
+    portfolio_top_n: int = Field(2, ge=1, le=100)
+    holding_period: int = Field(3, ge=1, le=365)
 
 class StrategyRunsBatchDeleteRequest(BaseModel):
-    run_ids: List[int] = []
+    run_ids: List[int] = Field([], max_length=1000)
 
 class LiveScanFeaturesRequest(BaseModel):
-    pool_id: str = "index:IDX399673"
-    frequency: str = "30m"
-    data_src: str = "clickhouse"
-    autype: str = "qfq"
-    lookback_days: int = 120
+    pool_id: str = Field("index:IDX399673", max_length=120)
+    frequency: str = Field("30m", max_length=8)
+    data_src: str = Field("clickhouse", max_length=32)
+    autype: str = Field("qfq", max_length=8)
+    lookback_days: int = Field(120, ge=1, le=7300)
     enable_rolling_lookback: bool = True
-    bsp_feature_mode: str = "latest_bsp"
-    rank_mode: str = "cross_section"
-    rolling_sample_mode: str = "every_bar"
-    rolling_stride: int = 1
-    max_workers: int = 0
-    limit: int = 0
+    bsp_feature_mode: str = Field("latest_bsp", max_length=32)
+    rank_mode: str = Field("cross_section", max_length=32)
+    rolling_sample_mode: str = Field("every_bar", max_length=32)
+    rolling_stride: int = Field(1, ge=1, le=1000)
+    max_workers: int = Field(0, ge=0, le=256)
+    limit: int = Field(0, ge=0, le=5000)
 
 class LivePaperTradeStepRequest(BaseModel):
-    sim_id: Optional[str] = None
-    run_id: Optional[str] = None
+    sim_id: Optional[str] = Field(None, max_length=120)
+    run_id: Optional[str] = Field(None, max_length=120)
     ignore_run_status: bool = False
     portfolio_id: Optional[int] = None
-    pool_id: str = "index:IDX399673"
-    frequency: str = "30m"
-    data_src: str = "clickhouse"
-    autype: str = "qfq"
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-    initial_capital: Optional[float] = None
-    lookback_days: int = 365 * 5
+    pool_id: str = Field("index:IDX399673", max_length=120)
+    frequency: str = Field("30m", max_length=8)
+    data_src: str = Field("clickhouse", max_length=32)
+    autype: str = Field("qfq", max_length=8)
+    start_date: Optional[str] = Field(None, max_length=32)
+    end_date: Optional[str] = Field(None, max_length=32)
+    initial_capital: Optional[float] = Field(None, gt=0.0, le=1e12)
+    lookback_days: int = Field(365 * 5, ge=1, le=10950)
     enable_rolling_lookback: bool = True
-    portfolio_top_n: Optional[int] = None
-    top_n: int = 2
-    min_prob: float = 0.25
-    holding_period: int = 3
-    trade_cost: float = 0.0002
-    walk_forward_max_folds: int = 25
-    max_workers: int = 8
-    limit: int = 0
+    portfolio_top_n: Optional[int] = Field(None, ge=1, le=100)
+    top_n: int = Field(2, ge=1, le=100)
+    min_prob: float = Field(0.25, ge=0.0, le=1.0)
+    holding_period: int = Field(3, ge=1, le=365)
+    trade_cost: float = Field(0.0002, ge=0.0, le=0.5)
+    walk_forward_max_folds: int = Field(25, ge=1, le=200)
+    max_workers: int = Field(8, ge=0, le=256)
+    limit: int = Field(0, ge=0, le=5000)
     use_latest_available_day: bool = True
-    pretrained_model_key: Optional[str] = None
-    model: str = "xgboost"
+    pretrained_model_key: Optional[str] = Field(None, max_length=64)
+    model: str = Field("xgboost", max_length=32)
     train_on_fly: bool = False
     require_pretrained_model: Optional[bool] = None
-    rank_mode: str = "cross_section"
+    rank_mode: str = Field("cross_section", max_length=32)
     only_features: Optional[Any] = None
-    feature_preset: Optional[str] = None
-    rolling_sample_mode: str = "bsp"
-    rolling_stride: int = 1
+    feature_preset: Optional[str] = Field(None, max_length=120)
+    rolling_sample_mode: str = Field("bsp", max_length=32)
+    rolling_stride: int = Field(1, ge=1, le=1000)
     risk_filter_enabled: bool = False
-    risk_mode: str = "both"
-    risk_index_code: str = "399006"
-    risk_drop_threshold: float = -0.03
-    risk_flat_drop_threshold: float = -0.05
-    risk_atr_window: int = 14
-    risk_atr_pct_threshold: float = 0.04
-    risk_flat_atr_pct_threshold: float = 0.06
-    risk_gap_down_threshold: float = -0.015
+    risk_mode: str = Field("both", max_length=16)
+    risk_index_code: str = Field("399006", max_length=32)
+    risk_drop_threshold: float = Field(-0.03, ge=-1.0, le=1.0)
+    risk_flat_drop_threshold: float = Field(-0.05, ge=-1.0, le=1.0)
+    risk_atr_window: int = Field(14, ge=2, le=500)
+    risk_atr_pct_threshold: float = Field(0.04, ge=0.0, le=10.0)
+    risk_flat_atr_pct_threshold: float = Field(0.06, ge=0.0, le=10.0)
+    risk_gap_down_threshold: float = Field(-0.015, ge=-1.0, le=1.0)
     risk_intraday_enabled: bool = True
-    risk_intraday_bear_threshold: float = -0.015
-    risk_intraday_bull_threshold: float = -0.03
-    risk_trend_ma_window: int = 20
-    risk_data_fail_mode: str = "reduce"
-    risk_intraday_data_fail_mode: str = "reduce"
+    risk_intraday_bear_threshold: float = Field(-0.015, ge=-1.0, le=1.0)
+    risk_intraday_bull_threshold: float = Field(-0.03, ge=-1.0, le=1.0)
+    risk_trend_ma_window: int = Field(20, ge=1, le=1000)
+    risk_data_fail_mode: str = Field("reduce", max_length=16)
+    risk_intraday_data_fail_mode: str = Field("reduce", max_length=16)
     point_in_time_pool: bool = True
     index_filter_enabled: bool = False
-    index_code: str = "399006"
-    index_ma_window: int = 20
-    stop_loss: Optional[float] = None
-    sell_mode: str = "baseline"
-    t1_decision_time: str = "10:00"
-    t1_gap_strong_threshold: float = 0.03
-    t1_gap_weak_threshold: float = -0.02
-    t1_gap_very_strong_threshold: float = 0.05
+    index_code: str = Field("399006", max_length=32)
+    index_ma_window: int = Field(20, ge=1, le=1000)
+    stop_loss: Optional[float] = Field(None, ge=-1.0, le=1.0)
+    sell_mode: str = Field("baseline", max_length=32)
+    t1_decision_time: str = Field("10:00", max_length=8)
+    t1_gap_strong_threshold: float = Field(0.03, ge=-1.0, le=1.0)
+    t1_gap_weak_threshold: float = Field(-0.02, ge=-1.0, le=1.0)
+    t1_gap_very_strong_threshold: float = Field(0.05, ge=-1.0, le=1.0)
 
 class LiveSimUpsertRequest(BaseModel):
-    sim_id: str
-    name: Optional[str] = None
+    sim_id: str = Field(..., min_length=1, max_length=120)
+    name: Optional[str] = Field(None, max_length=200)
 
 
 class LiveRunCreateRequest(BaseModel):
-    run_id: Optional[str] = None
-    name: str = ""
-    sim_id: str = "default"
+    run_id: Optional[str] = Field(None, max_length=120)
+    name: str = Field("", max_length=200)
+    sim_id: str = Field("default", max_length=120)
     portfolio_id: Optional[int] = None
     params: Dict[str, Any] = Field(default_factory=dict)
-    offset_seconds: int = 5
+    offset_seconds: int = Field(5, ge=0, le=120)
     auto_resume: bool = False
     notify_enabled: bool = False
-    notify_kind: str = ""
-    notify_webhook: str = ""
-    notify_secret: str = ""
+    notify_kind: str = Field("", max_length=32)
+    notify_webhook: str = Field("", max_length=2000)
+    notify_secret: str = Field("", max_length=500)
     sms_enabled: bool = False
-    sms_phone: str = ""
-    sms_token: str = ""
+    sms_phone: str = Field("", max_length=32)
+    sms_token: str = Field("", max_length=2000)
     start: bool = False
 
 
@@ -3649,8 +3886,9 @@ def _mask_secret_value(value):
 def _mask_live_run_secrets(run):
     """Return a copy of a live-run dict with sensitive fields masked.
 
-    Response-side only: applied on GET endpoints so credentials are never
-    echoed back. Storage/write paths are untouched.
+    Response-side only: applied on every endpoint that returns a run row
+    (GET lists/detail AND POST create/start/stop/step_once/strategy-stop)
+    so credentials are never echoed back. Storage/write paths are untouched.
     """
     if not isinstance(run, dict):
         return run
@@ -3669,7 +3907,7 @@ def _mask_live_run_secrets(run):
 
 
 @app.post("/api/live/scan_features")
-async def live_scan_features(req: LiveScanFeaturesRequest):
+def live_scan_features(req: LiveScanFeaturesRequest):
     try:
         import concurrent.futures
         import os
@@ -3680,7 +3918,11 @@ async def live_scan_features(req: LiveScanFeaturesRequest):
 
         _assert_data_src_enabled(req.data_src)
         pool_id = str(req.pool_id or "").strip() or "index:IDX399673"
-        raw_codes = CClickHouseAPI.get_pool_members(pool_id=pool_id, table="stock_constituent", limit=5000)
+        try:
+            raw_codes = CClickHouseAPI.get_pool_members(pool_id=pool_id, table="stock_constituent", limit=5000)
+        except Exception as e:
+            logger.warning("scan_features pool resolution failed for pool_id=%s: %s", pool_id, e)
+            raise HTTPException(status_code=502, detail=f"pool_resolve_failed:{type(e).__name__}")
         codes = []
         for c in raw_codes or []:
             try:
@@ -3693,7 +3935,7 @@ async def live_scan_features(req: LiveScanFeaturesRequest):
 
         freq_raw, level = parse_frequency(req.frequency)
         data_src = parse_data_src(req.data_src)
-        autype = parse_autype("qfq")
+        autype = parse_autype(req.autype)
 
         end = datetime.datetime.now().strftime("%Y-%m-%d")
         begin = (datetime.datetime.now() - datetime.timedelta(days=int(req.lookback_days or 120))).strftime("%Y-%m-%d")
@@ -3701,7 +3943,14 @@ async def live_scan_features(req: LiveScanFeaturesRequest):
         want_rank = str(req.rank_mode or "").strip().lower() == "cross_section"
         rolling_sample_mode = str(req.rolling_sample_mode or "").strip() or "every_bar"
         rolling_stride = int(req.rolling_stride) if req.rolling_stride is not None else 1
-        mw = max(1, min(int(_env_int("MLCHAN_LIVE_MAX_WORKERS", 1)), int(len(codes) if codes else 1)))
+        try:
+            req_mw = int(getattr(req, "max_workers", 0) or 0)
+        except Exception:
+            req_mw = 0
+        # Shared with the paper-trade step default further below: one env var,
+        # one default (8), still capped by pool size and _LIVE_SCAN_MAX_WORKERS.
+        mw_default = int(_env_int("MLCHAN_LIVE_MAX_WORKERS", 8))
+        mw = max(1, min((req_mw if req_mw > 0 else mw_default), int(len(codes) if codes else 1), int(_LIVE_SCAN_MAX_WORKERS)))
 
         def scan_one(code: str):
             kl_list = fetch_stock_data(code, level, begin, end, data_src, autype=autype, use_online_latest=bool(data_src == DATA_SRC.CLICK_HOUSE))
@@ -3871,17 +4120,17 @@ async def live_scan_features(req: LiveScanFeaturesRequest):
             "max_workers": int(mw),
             "items": items,
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.get("/api/live/positions")
 async def live_list_positions(sim_id: Optional[str] = None, portfolio_id: Optional[int] = None):
     try:
         return {"items": storage.list_positions(sim_id=sim_id, portfolio_id=portfolio_id)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.get("/api/live/orders")
 async def live_list_orders(status: Optional[str] = "pending", limit: int = 200, sim_id: Optional[str] = None, portfolio_id: Optional[int] = None):
@@ -3891,7 +4140,7 @@ async def live_list_orders(status: Optional[str] = "pending", limit: int = 200, 
             st = None
         return {"items": storage.list_live_orders(status=st, limit=limit, sim_id=sim_id, portfolio_id=portfolio_id)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.get("/api/live/trades")
 async def live_list_trades(
@@ -3906,14 +4155,14 @@ async def live_list_trades(
             return storage.list_live_trades_paged(page=page, page_size=page_size, sim_id=sim_id, portfolio_id=portfolio_id)
         return {"items": storage.list_live_trades(limit=limit, sim_id=sim_id, portfolio_id=portfolio_id)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.post("/api/live/sims")
 async def live_upsert_sim(req: LiveSimUpsertRequest):
     try:
         return {"item": storage.upsert_live_sim(sim_id=req.sim_id, name=req.name)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 
 @app.get("/api/live/sims")
@@ -3921,7 +4170,7 @@ async def live_list_sims(limit: int = 200):
     try:
         return {"items": storage.list_live_sims(limit=limit)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 
 @app.post("/api/live/runs")
@@ -3945,7 +4194,7 @@ async def live_create_run(req: LiveRunCreateRequest):
             try:
                 storage.update_live_sim_initial_capital(sim_id, float(init_cap), reset_balance=True)
             except Exception:
-                pass
+                logger.exception("update initial_capital failed for sim=%s", sim_id)
         st = "running" if bool(req.start) else "stopped"
         nxt = int(time.time()) if st == "running" else 0
         out = storage.upsert_live_run(
@@ -3978,14 +4227,14 @@ async def live_create_run(req: LiveRunCreateRequest):
                 str(rid),
                 lambda rid=rid, sid=sim_id, ne=notify_enabled, off=int(off): _run_live_step_task(str(rid), str(sid), bool(ne), int(off)),
             )
-            if enqueued:
+            if enqueued == "ok":
                 with _live_run_running_lock:
                     _live_run_running.add(str(rid))
-        return {"item": out}
+        return {"item": _mask_live_run_secrets(out)}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 
 @app.get("/api/live/runs")
@@ -3995,7 +4244,7 @@ async def live_list_runs(status: Optional[str] = None, limit: int = 200, portfol
         items = storage.list_live_runs(status=st, limit=limit, portfolio_id=portfolio_id) or []
         return {"items": [_mask_live_run_secrets(r) for r in items]}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 
 @app.get("/api/live/steps")
@@ -4003,18 +4252,18 @@ async def live_list_steps(sim_id: Optional[str] = None, run_id: Optional[str] = 
     try:
         return storage.list_live_steps_paged(sim_id=sim_id, run_id=run_id, portfolio_id=portfolio_id, page=page, page_size=page_size)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.get("/api/live/steps/stocks")
 async def live_list_step_stocks(sim_id: Optional[str] = None, run_id: Optional[str] = None, portfolio_id: Optional[int] = None, page: int = 1, page_size: int = 10):
     try:
         return storage.list_live_step_stocks_paged(sim_id=sim_id, run_id=run_id, portfolio_id=portfolio_id, page=page, page_size=page_size)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 
 @app.get("/api/live/equity_curve")
-async def live_equity_curve(sim_id: Optional[str] = None, run_id: Optional[str] = None, portfolio_id: Optional[int] = None, limit: int = 2000):
+def live_equity_curve(sim_id: Optional[str] = None, run_id: Optional[str] = None, portfolio_id: Optional[int] = None, limit: int = 2000):
     try:
         sid = str(sim_id or "").strip() or "default"
         tn = 2
@@ -4348,7 +4597,7 @@ async def live_equity_curve(sim_id: Optional[str] = None, run_id: Optional[str] 
                 pts.append({"ts": int(ts), "equity": float(eq_ratio), "code": code, "side": side, "price": float(px)})
         return {"sim_id": sid, "run_id": str(run_id or ""), "portfolio_id": portfolio_id, "top_n": int(tn), "points": pts}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 
 @app.get("/api/live/runs/{run_id}")
@@ -4361,7 +4610,7 @@ async def live_get_run(run_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.get("/api/live/runs/{run_id}/diag")
 async def live_get_run_diag(run_id: str):
@@ -4446,7 +4695,7 @@ async def live_get_run_diag(run_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 
 @app.post("/api/live/runs/{run_id}/start")
@@ -4490,14 +4739,14 @@ async def live_start_run(run_id: str):
                 str(run_id),
                 lambda rid=str(run_id), sid=sim_id, ne=notify_enabled, off=int(off): _run_live_step_task(str(rid), str(sid), bool(ne), int(off)),
             )
-            if enqueued:
+            if enqueued == "ok":
                 with _live_run_running_lock:
                     _live_run_running.add(str(run_id))
-        return {"item": out}
+        return {"item": _mask_live_run_secrets(out)}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 
 @app.post("/api/live/runs/{run_id}/stop")
@@ -4506,11 +4755,11 @@ async def live_stop_run(run_id: str):
         out = storage.update_live_run_fields(run_id, {"status": "stopped", "next_exec_ts": 0, "stopped_at": _utc_now_naive()})
         if not out:
             raise HTTPException(status_code=404, detail="run not found")
-        return {"item": out}
+        return {"item": _mask_live_run_secrets(out)}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.post("/api/live/runs/{run_id}/step_once")
 async def live_step_run_once(run_id: str):
@@ -4547,7 +4796,10 @@ async def live_step_run_once(run_id: str):
             except Exception as e:
                 loop.call_soon_threadsafe(fut.set_exception, e)
 
-        if not _enqueue_live_task_dedup("live_step_direct", sim_id, _fn):
+        eq = _enqueue_live_task_dedup("live_step_direct", sim_id, _fn)
+        if eq == "full":
+            raise HTTPException(status_code=429, detail="live task queue is full")
+        if eq != "ok":
             raise HTTPException(status_code=409, detail="live step busy")
 
         try:
@@ -4562,7 +4814,7 @@ async def live_step_run_once(run_id: str):
         except asyncio.TimeoutError:
             raise HTTPException(status_code=504, detail="live step timeout")
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=_err500(e))
 
         step_ts = int(out.get("ts") or 0) if isinstance(out, dict) else 0
         steps = int(r.get("steps") or 0) + 1
@@ -4633,11 +4885,11 @@ async def live_step_run_once(run_id: str):
             "last_result_json": json.dumps(json_safe_value(out), ensure_ascii=False, allow_nan=False) if isinstance(out, dict) else json.dumps({}, ensure_ascii=False),
             "error": "",
         })
-        return json_safe_value({"item": updated, "result": out})
+        return json_safe_value({"item": _mask_live_run_secrets(updated), "result": out})
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 
 @app.delete("/api/live/runs/{run_id}")
@@ -4650,10 +4902,10 @@ async def live_delete_run(run_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.get("/api/live/positions_report")
-async def live_positions_report(
+def live_positions_report(
     frequency: str = "30m",
     data_src: str = "clickhouse",
     autype: str = "qfq",
@@ -4667,7 +4919,7 @@ async def live_positions_report(
         _assert_data_src_enabled(data_src)
         freq_raw, level = parse_frequency(frequency)
         ds = parse_data_src(data_src)
-        au = parse_autype("qfq")
+        au = parse_autype(autype)
 
         positions_raw = storage.list_positions(sim_id=sim_id, portfolio_id=portfolio_id) or []
         now_dt = datetime.datetime.now()
@@ -4791,9 +5043,7 @@ async def live_positions_report(
             },
         }
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.post("/api/live/positions/reset")
 async def live_reset_positions(sim_id: Optional[str] = None, portfolio_id: Optional[int] = None):
@@ -4801,18 +5051,18 @@ async def live_reset_positions(sim_id: Optional[str] = None, portfolio_id: Optio
         try:
             storage.clear_positions(sim_id=sim_id, portfolio_id=portfolio_id)
         except Exception:
-            pass
+            logger.exception("live positions reset: clear_positions failed sim=%s pf=%s", sim_id, portfolio_id)
         try:
             storage.clear_live_orders(sim_id=sim_id, portfolio_id=portfolio_id)
         except Exception:
-            pass
+            logger.exception("live positions reset: clear_live_orders failed sim=%s pf=%s", sim_id, portfolio_id)
         try:
             storage.clear_live_trades(sim_id=sim_id, portfolio_id=portfolio_id)
         except Exception:
-            pass
+            logger.exception("live positions reset: clear_live_trades failed sim=%s pf=%s", sim_id, portfolio_id)
         return {"status": "success"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.post("/api/live/steps/reset")
 async def live_reset_steps(sim_id: Optional[str] = None, portfolio_id: Optional[int] = None):
@@ -4820,10 +5070,10 @@ async def live_reset_steps(sim_id: Optional[str] = None, portfolio_id: Optional[
         storage.clear_live_steps(sim_id=sim_id, portfolio_id=portfolio_id)
         return {"status": "success"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 class StrategyStopRequest(BaseModel):
-    run_id: str
+    run_id: str = Field(..., min_length=1, max_length=120)
 
 @app.post("/api/strategy/stop")
 async def stop_strategy(req: StrategyStopRequest):
@@ -4834,9 +5084,9 @@ async def stop_strategy(req: StrategyStopRequest):
         out = storage.update_live_run_fields(req.run_id, {"status": "stopped", "next_exec_ts": 0, "stopped_at": _utc_now_naive()})
         if not out:
             return {"status": "error", "message": "Run not found"}
-        return {"status": "success", "item": out}
+        return {"status": "success", "item": _mask_live_run_secrets(out)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 def _scan_feature_worker(code, level, begin, end, data_src, autype, enable_rolling_lookback, rolling_sample_mode, rolling_stride):
     try:
@@ -4936,7 +5186,10 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
         except Exception as e:
             loop.call_soon_threadsafe(fut.set_exception, e)
 
-    if not _enqueue_live_task_dedup("live_step_direct", sim_id, _fn):
+    eq = _enqueue_live_task_dedup("live_step_direct", sim_id, _fn)
+    if eq == "full":
+        raise HTTPException(status_code=429, detail="live task queue is full")
+    if eq != "ok":
         raise HTTPException(status_code=409, detail="live step busy")
 
     try:
@@ -4951,7 +5204,7 @@ async def live_paper_trade_step(req: LivePaperTradeStepRequest):
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="live step timeout")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
     try:
@@ -4982,7 +5235,7 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
         pool_id = str(req.pool_id or "").strip() or "index:IDX399673"
         freq_raw, level = parse_frequency(req.frequency)
         data_src = parse_data_src(req.data_src)
-        autype = parse_autype("qfq")
+        autype = parse_autype(getattr(req, "autype", "qfq"))
 
         end = datetime.datetime.now().strftime("%Y-%m-%d")
         begin = (datetime.datetime.now() - datetime.timedelta(days=int(req.lookback_days or 365 * 5))).strftime("%Y-%m-%d")
@@ -5123,18 +5376,15 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
             except Exception:
                 cache_key = None
 
-            ttl_sec = int(os.environ.get("MLCHAN_LIVE_TRAIN_CACHE_TTL_SEC", str(4 * 3600)) or (4 * 3600))
-            cached = None
-            if cache_key:
-                with _live_train_cache_lock:
-                    cached = _live_train_cache.get(cache_key)
-                if isinstance(cached, dict):
-                    try:
-                        trained_at = int(cached.get("trained_at_ts") or 0)
-                    except Exception:
-                        trained_at = 0
-                    if trained_at <= 0 or (ttl_sec > 0 and int(now_ts) - int(trained_at) > int(ttl_sec)):
-                        cached = None
+            ttl_sec = int(_LIVE_TRAIN_CACHE_TTL_SEC)
+            cached = _live_train_cache_get(cache_key)
+            if isinstance(cached, dict):
+                try:
+                    trained_at = int(cached.get("trained_at_ts") or 0)
+                except Exception:
+                    trained_at = 0
+                if trained_at <= 0 or (ttl_sec > 0 and int(now_ts) - int(trained_at) > int(ttl_sec)):
+                    cached = None
 
             if isinstance(cached, dict) and cached.get("model") is not None and isinstance(cached.get("feature_meta"), list) and cached.get("feature_meta"):
                 model = cached.get("model")
@@ -5222,15 +5472,13 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                         model = trained_model
                         feature_meta = list(trained_meta)
                         model_source = "train_on_fly"
-                        if cache_key:
-                            with _live_train_cache_lock:
-                                _live_train_cache[cache_key] = {
-                                    "trained_at_ts": int(now_ts),
-                                    "model": trained_model,
-                                    "feature_meta": list(trained_meta),
-                                    "acc": acc if isinstance(acc, dict) else None,
-                                    "params": cache_params,
-                                }
+                        _live_train_cache_put(cache_key, {
+                            "trained_at_ts": int(now_ts),
+                            "model": trained_model,
+                            "feature_meta": list(trained_meta),
+                            "acc": acc if isinstance(acc, dict) else None,
+                            "params": cache_params,
+                        })
 
         if model is None or (not feature_meta):
             missing_detail = (
@@ -5890,10 +6138,11 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
             req_mw = int(getattr(req, "max_workers", 0) or 0)
         except Exception:
             req_mw = 0
+        # _LIVE_SCAN_MAX_WORKERS is a hard cap: req may not exceed it (DoS guard)
         if int(req_mw) > 0:
-            mw = max(1, min(int(req_mw), int(len(codes) if codes else 1)))
+            mw = max(1, min(int(req_mw), int(len(codes) if codes else 1), int(_LIVE_SCAN_MAX_WORKERS)))
         else:
-            mw = max(1, min(int(_env_int("MLCHAN_LIVE_MAX_WORKERS", 8)), int(len(codes) if codes else 1)))
+            mw = max(1, min(int(_env_int("MLCHAN_LIVE_MAX_WORKERS", 8)), int(len(codes) if codes else 1), int(_LIVE_SCAN_MAX_WORKERS)))
 
         if int(mw) <= 1 or not codes:
             for code in codes:
@@ -6344,7 +6593,7 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                         error=None,
                     )
                 except Exception:
-                    pass
+                    logger.exception("persist live step record failed (delayed branch) sim=%s", sim_id)
                 return resp
 
         if not market_open:
@@ -6431,7 +6680,7 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                     error=None,
                 )
             except Exception:
-                pass
+                logger.exception("persist live step record failed (closed branch) sim=%s", sim_id)
             return resp
 
         quote_cache = {}
@@ -6590,7 +6839,7 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                 cost_factor = 1.0002
                 try:
                     max_total_vol = int(alloc_per_stock / (px * cost_factor))
-                except:
+                except Exception:
                     max_total_vol = 0
                 
                 if max_total_vol < rules["min_qty"]:
@@ -6693,17 +6942,15 @@ def _live_paper_trade_step_impl(req: LivePaperTradeStepRequest):
                 error=None,
             )
         except Exception:
-            pass
+            logger.exception("persist live step record failed (open branch) sim=%s", sim_id)
         return resp
     except HTTPException:
         raise
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.post("/api/strategy/run")
-async def run_strategy(req: StrategyRequest):
+def run_strategy(req: StrategyRequest):
     try:
         params = req.dict()
         session = storage.Session()
@@ -6718,11 +6965,24 @@ async def run_strategy(req: StrategyRequest):
         run_id = run.id
         session.close()
 
-        _enqueue_task("strategy_run", str(run_id), lambda: strategy_runner.run_strategy_sync(run_id, params))
-        
+        if not _enqueue_task("strategy_run", str(run_id), lambda: strategy_runner.run_strategy_sync(run_id, params)):
+            try:
+                session = storage.Session()
+                r = session.query(StrategyRun).filter(StrategyRun.id == run_id).first()
+                if r:
+                    r.status = "failed"
+                    r.completed_at = _utc_now_naive()
+                    session.commit()
+                session.close()
+            except Exception:
+                logger.exception("mark strategy run %s failed after queue rejection failed", run_id)
+            raise HTTPException(status_code=429, detail="task queue is full")
+
         return {"status": "success", "run_id": run_id}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_err500(e))
 
 @app.get("/api/strategy/runs")
 async def list_strategy_runs(page: int = 1, page_size: int = 20, limit: Optional[int] = None):
@@ -6877,8 +7137,9 @@ async def get_strategy_run(run_id: int):
         if run.result_json:
             try:
                 result = json.loads(run.result_json)
-            except:
-                pass
+            except Exception:
+                logger.warning("strategy run %s result_json is not valid JSON; returning empty results", run.id)
+                result = []
                 
         return {
             "id": run.id,
@@ -6935,7 +7196,9 @@ if os.path.exists(static_dir):
 if __name__ == "__main__":
     import uvicorn
     import argparse
-    
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
     parser = argparse.ArgumentParser(description='MLChan Backend Server')
     parser.add_argument('--port', type=int, default=8001, help='Port to run the server on')
     args = parser.parse_args()
