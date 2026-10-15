@@ -1,8 +1,14 @@
+import os
+
 from Chan import CChan
 from ChanConfig import CChanConfig
 from Common.CEnum import AUTYPE, DATA_SRC, KL_TYPE
+# 注意：CAnimateDriver依赖IPython（trigger_step=True分支才用到），属可选依赖，未列入requirements.txt
 from Plot.AnimatePlotDriver import CAnimateDriver
 from Plot.PlotDriver import CPlotDriver
+
+# 示例输出目录：temp_data_cache/已在.gitignore中，产物不会误入库
+OUTPUT_DIR = "temp_data_cache"
 
 if __name__ == "__main__":
     code = "sz.000001"
@@ -79,8 +85,10 @@ if __name__ == "__main__":
             plot_para=plot_para,
         )
         plot_driver.figure.show()
-        plot_driver.save2img("./test.png")
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        plot_driver.save2img(os.path.join(OUTPUT_DIR, "test.png"))
     else:
+        # 动画演示分支，需额外安装IPython才能运行
         CAnimateDriver(
             chan,
             plot_config=plot_config,

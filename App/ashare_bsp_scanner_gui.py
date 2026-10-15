@@ -28,23 +28,28 @@ from pathlib import Path
 # 将项目根目录加入路径，以便导入 chan.py 核心模块
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from collections import OrderedDict
 from datetime import datetime, timedelta
 
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox, QGroupBox,
-    QMessageBox, QStatusBar, QSplitter, QTableWidget, QTableWidgetItem,
-    QProgressBar, QHeaderView, QTextEdit
-)
-from PyQt6.QtCore import QDate, Qt, QThread, pyqtSignal
+try:
+    from PyQt6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox, QGroupBox,
+        QMessageBox, QStatusBar, QSplitter, QTableWidget, QTableWidgetItem,
+        QProgressBar, QHeaderView, QTextEdit
+    )
+    from PyQt6.QtCore import QDate, Qt, QThread, pyqtSignal
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
-from matplotlib.figure import Figure
-import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
 
-import akshare as ak
-import pandas as pd
+    import akshare as ak
+    import pandas as pd
+except ImportError as e:
+    # 可选GUI依赖缺失时给出可读指引，而不是裸的ModuleNotFoundError traceback
+    sys.exit(f"缺少GUI依赖: {e}\n请先执行: pip install PyQt6 matplotlib akshare pandas")
 
 from Chan import CChan
 from ChanConfig import CChanConfig
@@ -93,7 +98,9 @@ def get_tradable_stocks():
         # 6. 剔除停牌股票（成交量为0或涨跌幅为空）
         df = df[df['成交量'] > 0]
 
-        # 7. 剔除新股（上市不足60天的，这里简化处理，只保留有数据的）
+        # 7. 剔除异常股票（最新价<=0）。
+        #    注意：这里并未真正按上市天数过滤新股（实时行情接口不含上市日期，
+        #    如需"上市不足60天"过滤需另取股票基本信息接口）
         df = df[df['最新价'] > 0]
 
         return df[['代码', '名称', '最新价', '涨跌幅']].reset_index(drop=True)
@@ -114,23 +121,25 @@ class ScanThread(QThread):
         found_signal: (dict) 发现买点时发出，包含股票详情和 CChan 对象
         finished: (int, int) 扫描完成，返回成功数和失败数
         log_signal: (str) 日志消息
+        list_ready: (int) 股票列表获取完成，返回总数
+        list_failed: (str) 股票列表获取失败，返回错误信息
     """
     progress = pyqtSignal(int, int, str)
     found_signal = pyqtSignal(dict)
     finished = pyqtSignal(int, int)
     log_signal = pyqtSignal(str)
+    list_ready = pyqtSignal(int)  # 股票列表获取完成，返回总数
+    list_failed = pyqtSignal(str)  # 股票列表获取失败，返回错误信息
 
-    def __init__(self, stock_list, config, days=365):
+    def __init__(self, config, days=365):
         """
         初始化扫描线程
 
         Args:
-            stock_list: pd.DataFrame, 待扫描的股票列表
             config: CChanConfig, 缠论配置
             days: int, 获取多少天的历史数据，默认365天
         """
         super().__init__()
-        self.stock_list = stock_list
         self.config = config
         self.days = days
         self.is_running = True
@@ -141,21 +150,29 @@ class ScanThread(QThread):
 
     def run(self):
         """
-        线程主函数，遍历股票列表进行缠论分析
+        线程主函数，先拉取股票列表再遍历进行缠论分析
 
         扫描逻辑:
+            0. 后台线程内获取可交易股票列表（网络请求，避免阻塞UI线程）
             1. 跳过无K线数据的股票
             2. 跳过停牌超过15天的股票
             3. 检测最近3天内是否出现买点
             4. 发现买点时通过 found_signal 发出通知
         """
+        self.log_signal.emit("正在获取可交易股票列表...")
+        stock_list = get_tradable_stocks()
+        if stock_list.empty:
+            self.list_failed.emit("获取股票列表失败")
+            return
+        self.list_ready.emit(len(stock_list))
+
         begin_time = (datetime.now() - timedelta(days=self.days)).strftime("%Y-%m-%d")
         end_time = datetime.now().strftime("%Y-%m-%d")
-        total = len(self.stock_list)
+        total = len(stock_list)
         success_count = 0
         fail_count = 0
 
-        for idx, row in self.stock_list.iterrows():
+        for idx, row in stock_list.iterrows():
             if not self.is_running:
                 break
 
@@ -281,15 +298,18 @@ class ChanPlotCanvas(FigureCanvas):
     """
 
     def __init__(self, parent=None, width=12, height=8):
-        self.fig = Figure(figsize=(width, height), dpi=100)
-        super().__init__(self.fig)
+        # FigureCanvas自带.figure属性，不再另存self.fig，避免两处引用不同步
+        super().__init__(Figure(figsize=(width, height), dpi=100))
         self.setParent(parent)
         self.setMinimumHeight(400)
 
     def clear(self):
         """清空画布内容"""
-        self.fig.clear()
+        self.figure.clear()
         self.draw()
+
+
+STOCK_CACHE_LIMIT = 50  # stock_cache最多缓存的CChan对象数
 
 
 class AkshareGUI(QMainWindow):
@@ -312,7 +332,8 @@ class AkshareGUI(QMainWindow):
         self.chan = None  # 当前分析的 CChan 对象
         self.scan_thread = None  # 批量扫描线程
         self.analysis_thread = None  # 单股分析线程
-        self.stock_cache = {}  # 缓存已分析的股票 {code: CChan}
+        # 缓存已分析的股票 {code: CChan}，LRU上限防止内存无限膨胀
+        self.stock_cache = OrderedDict()
         self.init_ui()
 
     def init_ui(self):
@@ -547,7 +568,10 @@ class AkshareGUI(QMainWindow):
         }
 
     def start_scan(self):
-        """开始批量扫描所有可交易股票"""
+        """开始批量扫描所有可交易股票（股票列表在扫描线程内拉取，不阻塞UI）"""
+        if self.scan_thread is not None and self.scan_thread.isRunning():
+            self.statusBar.showMessage('扫描正在进行中...')
+            return
         self.scan_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.progress_bar.setVisible(True)
@@ -555,28 +579,30 @@ class AkshareGUI(QMainWindow):
         self.stock_cache.clear()
 
         self.statusBar.showMessage('正在获取股票列表...')
-        QApplication.processEvents()
 
-        # 获取股票列表
-        stock_list = get_tradable_stocks()
-        if stock_list.empty:
-            QMessageBox.warning(self, "警告", "获取股票列表失败")
-            self.scan_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
-            self.progress_bar.setVisible(False)
-            return
-
-        self.statusBar.showMessage(f'获取到 {len(stock_list)} 只可交易股票，开始扫描...')
-        self.progress_bar.setMaximum(len(stock_list))
-
-        # 启动扫描线程
+        # 启动扫描线程（线程内先拉取股票列表，再逐只扫描）
         config = self.get_chan_config()
-        self.scan_thread = ScanThread(stock_list, config, days=365)
+        self.scan_thread = ScanThread(config, days=365)
         self.scan_thread.progress.connect(self.on_scan_progress)
         self.scan_thread.found_signal.connect(self.on_buy_point_found)
         self.scan_thread.finished.connect(self.on_scan_finished)
         self.scan_thread.log_signal.connect(self.on_log_message)
+        self.scan_thread.list_ready.connect(self.on_stock_list_ready)
+        self.scan_thread.list_failed.connect(self.on_stock_list_failed)
         self.scan_thread.start()
+
+    def on_stock_list_ready(self, total):
+        """股票列表拉取完成"""
+        self.progress_bar.setMaximum(total)
+        self.statusBar.showMessage(f'获取到 {total} 只可交易股票，开始扫描...')
+
+    def on_stock_list_failed(self, msg):
+        """股票列表拉取失败"""
+        QMessageBox.warning(self, "警告", msg)
+        self.scan_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.progress_bar.setVisible(False)
+        self.statusBar.showMessage('获取股票列表失败')
 
     def stop_scan(self):
         """停止扫描"""
@@ -608,8 +634,11 @@ class AkshareGUI(QMainWindow):
         self.stock_table.setItem(row, 3, QTableWidgetItem(f"{data['change']:.2f}%"))
         self.stock_table.setItem(row, 4, QTableWidgetItem(f"{data['bsp_type']} ({data['bsp_time']})"))
 
-        # 缓存 chan 对象
+        # 缓存 chan 对象（LRU：超限淘汰最久未访问项，防止内存无限膨胀）
         self.stock_cache[data['code']] = data['chan']
+        self.stock_cache.move_to_end(data['code'])
+        while len(self.stock_cache) > STOCK_CACHE_LIMIT:
+            self.stock_cache.popitem(last=False)
 
     def on_scan_finished(self, success_count, fail_count):
         """扫描完成"""
@@ -626,11 +655,12 @@ class AkshareGUI(QMainWindow):
         name = self.stock_table.item(row, 1).text()
 
         if code in self.stock_cache:
+            self.stock_cache.move_to_end(code)  # LRU：命中后刷新为最近使用
             self.chan = self.stock_cache[code]
             self.plot_chart()
             self.statusBar.showMessage(f'显示: {code} {name}')
         else:
-            # 重新分析
+            # 缓存未命中/已被LRU淘汰：走统一分析入口（内含并发保护）
             self.analyze_stock(code)
 
     def analyze_single(self):
@@ -642,7 +672,11 @@ class AkshareGUI(QMainWindow):
         self.analyze_stock(code)
 
     def analyze_stock(self, code):
-        """分析指定股票"""
+        """分析指定股票（统一入口：分析按钮与列表点击共用，内含并发保护）"""
+        if self.analysis_thread is not None and self.analysis_thread.isRunning():
+            # 已有分析任务在跑，避免并发多个SingleAnalysisThread互相覆盖引用
+            self.statusBar.showMessage('已有分析任务进行中，请稍候...')
+            return
         self.analyze_btn.setEnabled(False)
         self.statusBar.showMessage(f'正在分析 {code}...')
 
@@ -699,7 +733,6 @@ class AkshareGUI(QMainWindow):
 
             plot_driver = CPlotDriver(self.chan, plot_config=plot_config, plot_para=plot_para)
 
-            self.canvas.fig = plot_driver.figure
             self.canvas.figure = plot_driver.figure
             self.canvas.draw()
             self.toolbar.update()
@@ -715,6 +748,24 @@ class AkshareGUI(QMainWindow):
         self.stock_table.setRowCount(0)
         self.stock_cache.clear()
         self.statusBar.showMessage('列表已清空')
+
+    def closeEvent(self, event):
+        """
+        关闭窗口时先停止后台线程。
+
+        不处理的话，sys.exit(app.exec())返回后ScanThread仍会继续扫描
+        （数千只股票），进程迟迟不能退出。
+        """
+        for thread in (self.scan_thread, self.analysis_thread):
+            if thread is None or not thread.isRunning():
+                continue
+            if hasattr(thread, 'stop'):
+                thread.stop()  # 设置退出标志，让run()循环尽快结束
+            if not thread.wait(3000):
+                # SingleAnalysisThread等不可中断任务超时后强杀（进程退出路径的最后手段）
+                thread.terminate()
+                thread.wait()
+        event.accept()
 
 
 def main():

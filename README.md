@@ -20,7 +20,10 @@ The original upstream `chan.py` README has been preserved as [README.chanpy.md](
 ├── Chan.py, ChanConfig.py      # Core Chan entry points
 ├── Bi/, Seg/, KLine/, ZS/      # Chan structure calculation modules
 ├── BuySellPoint/, Math/        # BSP and indicator logic
+├── Combiner/                   # K-line merge/combine helpers
 ├── DataAPI/                    # Data adapters, including ClickHouse
+├── App/                        # Standalone scanner GUI (ashare_bsp_scanner_gui.py)
+├── Debug/                      # Strategy demo scripts (upstream examples)
 ├── backend/                    # FastAPI service, strategy, backtest, live tools
 │   ├── main.py                 # API entry point
 │   ├── chan_service.py         # ML feature extraction, training, prediction

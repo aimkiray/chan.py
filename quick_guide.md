@@ -237,7 +237,7 @@ chan_new = CChan.chan_load_pickle("chan.pkl")
 
 ### CChanConfig重点关注配置
 CChanConfig里面提供了很多的配置，其中很多人最容易被影响到自己计算结果的主要是这几个，它们的含义最好再仔细阅读一下readme相关解释：
-- bi_strict：是否只用严格笔，默认为 Ture，其中这里的严格笔只考虑顶底分形之间相隔几个合并K线
+- bi_strict：是否只用严格笔，默认为 True，其中这里的严格笔只考虑顶底分形之间相隔几个合并K线
 - bi_fx_check：检查笔顶底分形是否成立的方法
 - bi_end_is_peak: 笔的尾部是否是整笔中最低/最高, 默认为 True
 - divergence_rate：1类买卖点背驰比例，即离开中枢的笔的 MACD 指标相对于进入中枢的笔，默认为 0.9

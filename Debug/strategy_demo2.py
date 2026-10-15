@@ -1,3 +1,10 @@
+import sys
+from pathlib import Path
+
+# Debug/没有__init__.py，直接 python Debug/strategy_demo2.py 运行时
+# sys.path只含本目录，需显式把仓库根加入才能导入Chan等核心模块
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from Chan import CChan
 from ChanConfig import CChanConfig
 from Common.CEnum import AUTYPE, BSP_TYPE, DATA_SRC, FX_TYPE, KL_TYPE

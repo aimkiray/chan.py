@@ -36,4 +36,17 @@ backend/model_cache/
 mlchan_deploy/
 mlchan_deploy_old/
 .trae/
-debug_*
+.review/
+
+# Debug artifacts (debug_*.py helper scripts are intentionally NOT ignored)
+debug_*.log
+debug_output/
+
+# Local data artifacts
+temp_data_cache/
+*.parquet
+ETF_1min_2005_2022/
+ETF基础信息列表.csv
+
+# Generated test artifacts
+test.png

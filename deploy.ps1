@@ -1,6 +1,18 @@
 # Deployment Script
 param (
-    [string]$TargetDir = "./mlchan_deploy"
+    [string]$TargetDir = "./mlchan_deploy",
+    # Port the production server listens on (written into run_prod.bat)
+    [int]$Port = 38383,
+    # URL opened by run_prod.bat. Default: http://127.0.0.1:<Port>
+    # NOTE: the API has no authentication and CORS is wide open -- deploy on a
+    # trusted intranet/localhost only. Set this to e.g. "http://192.168.x.x:38383"
+    # for LAN use; do NOT point it at a public domain without adding auth first.
+    [string]$PublicUrl = "",
+    # Optional pip index mirror (e.g. "https://pypi.tuna.tsinghua.edu.cn/simple").
+    # Empty = use the target pip's own default configuration.
+    [string]$PipIndexUrl = "",
+    # Force rebuilding the venv in the target dir instead of reusing/copying one
+    [switch]$RebuildVenv
 )
 
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -150,27 +162,53 @@ if (Test-Path "requirements.txt") {
 
 # 3.1 Setup Python Environment
 $TargetVenv = Join-Path $AbsTargetDir "venv"
+$PipArgs = @("install", "-r", (Join-Path $RepoRoot "requirements.txt"))
+if ($PipIndexUrl) {
+    $PipArgs += @("-i", $PipIndexUrl)
+}
+if ($RebuildVenv -and (Test-Path $TargetVenv)) {
+    Write-Host "RebuildVenv requested; removing existing target venv..."
+    Remove-Item -LiteralPath $TargetVenv -Recurse -Force
+}
 if (Test-Path $TargetVenv) {
     Write-Host "Using existing venv in target directory..."
     # Optional: Update dependencies if requirements changed, but usually fast if nothing changed
     Write-Host "Checking dependencies..."
     $PipPath = Join-Path $TargetVenv "Scripts\pip"
     if (Test-Path (Join-Path $RepoRoot "requirements.txt")) {
-        & $PipPath install -r (Join-Path $RepoRoot "requirements.txt") -i https://pypi.tuna.tsinghua.edu.cn/simple
+        & $PipPath @PipArgs
     }
 } else {
     $VenvPath = Join-Path $RepoRoot "venv"
-    if (Test-Path $VenvPath) {
+    if ((Test-Path $VenvPath) -and (-not $RebuildVenv)) {
+        # NOTE: a copied venv only works via its own Scripts\python.exe (which
+        # resolves pyvenv.cfg + the base interpreter relative to itself on this
+        # machine). run_prod.bat therefore invokes it directly instead of going
+        # through activate.bat, whose baked-in absolute VIRTUAL_ENV/PATH would
+        # point back at this repository. For a different machine, use -RebuildVenv.
         Write-Host "Copying venv from repository..."
         Copy-Item -LiteralPath $VenvPath -Destination $AbsTargetDir -Recurse
     } else {
-        Write-Host "Venv not found in repository. Creating new venv..."
-        python -m venv $TargetVenv
-        
+        if ($RebuildVenv) {
+            Write-Host "Creating fresh venv in target directory..."
+        } else {
+            Write-Host "Venv not found in repository. Creating new venv..."
+        }
+        $RepoVenvPython = Join-Path $VenvPath "Scripts\python.exe"
+        if (Test-Path $RepoVenvPython) {
+            & $RepoVenvPython -m venv $TargetVenv
+        } else {
+            python -m venv $TargetVenv
+        }
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $TargetVenv "Scripts\python.exe"))) {
+            Write-Error "Failed to create venv in target directory."
+            exit 1
+        }
+
         Write-Host "Installing dependencies..."
         $PipPath = Join-Path $TargetVenv "Scripts\pip"
         if (Test-Path (Join-Path $RepoRoot "requirements.txt")) {
-            & $PipPath install -r (Join-Path $RepoRoot "requirements.txt") -i https://pypi.tuna.tsinghua.edu.cn/simple
+            & $PipPath @PipArgs
         }
     }
 }
@@ -179,6 +217,9 @@ if (Test-Path $TargetVenv) {
 Write-Host "Copying Static Files..."
 $StaticDir = Join-Path $AbsTargetDir "static"
 New-Item -ItemType Directory -Path $StaticDir -Force | Out-Null
+# backend/main.py mounts static/assets unconditionally (StaticFiles raises when
+# the dir is missing), so keep creating it even though Nuxt assets actually live
+# under static/_nuxt/ (served via the catchall). TODO: repoint the mount to _nuxt.
 $AssetsDir = Join-Path $StaticDir "assets"
 New-Item -ItemType Directory -Path $AssetsDir -Force | Out-Null
 
@@ -192,13 +233,20 @@ if (-not (Test-Path $FrontendStaticDir)) {
 Copy-Item -Path (Join-Path $FrontendStaticDir "*") -Destination $StaticDir -Recurse -Force
 
 # 5. Create Run Script for Production
+# Invoke venv\Scripts\python.exe directly: activate.bat bakes in the absolute
+# VIRTUAL_ENV path of wherever the venv was created, which is wrong for a copied
+# venv. Running the interpreter directly also needs no PATH/activation at all.
+if (-not $PublicUrl) {
+    $PublicUrl = "http://127.0.0.1:$Port"
+}
 $RunScriptPath = Join-Path $AbsTargetDir "run_prod.bat"
 $RunContent = @"
 @echo off
-echo Starting MLChan Production Server...
-start "" http://akari.debuff.top:38383
-call venv\Scripts\activate.bat
-python backend/main.py --port 38383
+rem Reminder: the API has no authentication -- run on trusted intranet/localhost only.
+cd /d %~dp0
+echo Starting MLChan Production Server on port $Port ...
+start "" $PublicUrl
+venv\Scripts\python.exe backend\main.py --port $Port
 pause
 "@
 Set-Content -Path $RunScriptPath -Value $RunContent

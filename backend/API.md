@@ -2,6 +2,8 @@
 
 后端基于 FastAPI，默认不需要鉴权（本地研究用途）。除 `/api/download/{code}` 返回 CSV 外，其余接口均为 JSON。
 
+> **覆盖说明**：本文档仅展开常用接口；其余已注册路由（实验矩阵、回测/策略预设、live runner 系列等）见文末[其他接口索引](#其他接口索引未展开)。权威清单以 `backend/main.py` 中的 `@app.*` 路由装饰器为准。
+
 ## 约定
 
 - **Content-Type**: `application/json`
@@ -23,7 +25,7 @@
 
 对单只股票做“缠论结构 + AI 评分”分析，并可选择使用预训练模型/融合等能力。
 
-请求体（`AnalyzeRequest`，字段与默认值见 [backend/main.py](file:///c:/Users/laevatain/Code/mlchan/backend/main.py)）：
+请求体（`AnalyzeRequest`，字段与默认值见 [backend/main.py](./main.py)）：
 
 - `code` (str, required): 股票代码（如 `002701`/`sh.600000`，会自动规范化）
 - `trigger_step` (bool, default `true`): 逐步计算（模拟实盘）
@@ -300,7 +302,7 @@
 
 推荐的实盘/模拟盘跑法：
 
-- 常驻进程：运行 [paper_trade_runner.py](file:///c:/Users/laevatain/Code/mlchan/backend/live/paper_trade_runner.py)，它会按 A 股 30m 决策点定时调用该接口，并输出一行风控/选股摘要到 stdout，可选推送 webhook（见 `.env.example` 的 `MLCHAN_NOTIFY_*`）。
+- 常驻进程：运行 [paper_trade_runner.py](./live/paper_trade_runner.py)，它会按 A 股 30m 决策点定时调用该接口，并输出一行风控/选股摘要到 stdout，可选推送 webhook（见 `.env.example` 的 `MLCHAN_NOTIFY_*`）。
 - 防崩溃降级：当指数数据缺失/接口抖动时，可通过 `risk_data_fail_mode` 与 `risk_intraday_data_fail_mode` 选择降级策略（`pass|reduce|flat`，默认 `reduce`），避免异常导致实盘进程退出。
 
 ### `GET /api/live/positions`
@@ -310,3 +312,63 @@
 ### `POST /api/live/positions/reset`
 
 清空模拟持仓（危险操作）。
+
+## 其他接口索引（未展开）
+
+以下路由已在 `backend/main.py` 注册但本文档未展开字段说明；括号内为该文件中的装饰器行号，便于查阅。
+
+### 实验矩阵（Experiment Matrix）
+
+| 方法 | 路径 | 说明 | 位置 |
+|---|---|---|---|
+| GET | `/api/experiments/matrix` | 列出实验矩阵 | main.py:1479 |
+| POST | `/api/experiments/matrix` | 创建/启动实验矩阵 | main.py:1511 |
+| GET | `/api/experiments/matrix/{matrix_id}` | 矩阵详情 | main.py:1498 |
+| GET | `/api/experiments/matrix/jobs/{job_id}` | 矩阵任务状态 | main.py:1487 |
+| POST | `/api/experiments/matrix/{matrix_id}/evaluate` | 评估矩阵 | main.py:1577 |
+| POST | `/api/experiments/matrix/{matrix_id}/report` | 生成矩阵报告 | main.py:1637 |
+
+### 回测/策略预设
+
+| 方法 | 路径 | 说明 | 位置 |
+|---|---|---|---|
+| GET | `/api/backtest/presets` | 列出回测预设 | main.py:2611 |
+| POST | `/api/backtest/presets` | 新建回测预设 | main.py:2619 |
+| GET | `/api/backtest/presets/{preset_id}` | 预设详情 | main.py:2636 |
+| GET | `/api/strategy_presets` | 列出策略预设 | main.py:2649 |
+| GET | `/api/strategy_presets/{name}` | 预设详情 | main.py:2664 |
+| POST | `/api/strategy_presets/evaluate` | 评估预设 | main.py:2674 |
+| POST | `/api/strategy_presets/select` | 选择预设 | main.py:2686 |
+
+### 其它杂项
+
+| 方法 | 路径 | 说明 | 位置 |
+|---|---|---|---|
+| GET | `/api/indices` | 指数列表 | main.py:3602 |
+| GET | `/api/health/clickhouse` | ClickHouse 连通性检查 | main.py:3451 |
+| POST | `/api/strategy/stop` | 停止策略执行 | main.py:5080 |
+| POST | `/api/strategy/runs/{run_id}/stop` | 停止指定策略运行 | main.py:7115 |
+
+### 实盘 Live（扩展）
+
+| 方法 | 路径 | 说明 | 位置 |
+|---|---|---|---|
+| GET | `/api/live/orders` | 模拟订单列表 | main.py:4137 |
+| GET | `/api/live/trades` | 成交记录 | main.py:4147 |
+| GET/POST | `/api/live/sims` | 模拟盘实例查询/创建 | main.py:4162,4170 |
+| GET/POST | `/api/live/runs` | live runner 查询/创建 | main.py:4178,4242 |
+| GET | `/api/live/runs/{run_id}` | runner 详情 | main.py:4605 |
+| DELETE | `/api/live/runs/{run_id}` | 删除 runner | main.py:4897 |
+| GET | `/api/live/runs/{run_id}/diag` | runner 诊断 | main.py:4617 |
+| POST | `/api/live/runs/{run_id}/start` | 启动 runner | main.py:4703 |
+| POST | `/api/live/runs/{run_id}/stop` | 停止 runner | main.py:4754 |
+| POST | `/api/live/runs/{run_id}/step_once` | 手动单步 | main.py:4766 |
+| GET | `/api/live/steps` | 决策步骤记录 | main.py:4252 |
+| GET | `/api/live/steps/stocks` | 步骤选股明细 | main.py:4259 |
+| GET | `/api/live/equity_curve` | 净值曲线 | main.py:4267 |
+| GET | `/api/live/positions_report` | 持仓报告 | main.py:4909 |
+| POST | `/api/live/steps/reset` | 重置步骤记录 | main.py:5069 |
+
+### 前端静态服务（仅部署形态）
+
+当 `static/` 目录存在时（`deploy.ps1` 部署产物），`GET /` 返回 `index.html`，`GET /{catchall}` 兜底返回静态文件或 SPA 回退（main.py:7189 起）。

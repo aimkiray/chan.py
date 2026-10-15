@@ -58,6 +58,33 @@ CACHE_DIR = "temp_data_cache"
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR)
 
+def _clear_cache_dir():
+    """清空缓存目录中的文件；跳过子目录（如 failed/ 保留区），避免 IsADirectoryError。"""
+    for f in os.listdir(CACHE_DIR):
+        fp = os.path.join(CACHE_DIR, f)
+        if not (os.path.isfile(fp) or os.path.islink(fp)):
+            continue
+        try:
+            os.remove(fp)
+        except OSError as e:
+            logger.warning(f"清理缓存文件失败 {fp}: {e}")
+
+def _keep_failed_file(filepath: str) -> None:
+    """写入失败的缓存文件移入 failed/ 子目录保留，避免瞬时 DB 故障丢数据。"""
+    try:
+        failed_dir = os.path.join(CACHE_DIR, "failed")
+        os.makedirs(failed_dir, exist_ok=True)
+        failed_path = os.path.join(failed_dir, os.path.basename(filepath))
+        if os.path.exists(failed_path):
+            failed_path = os.path.join(
+                failed_dir, f"{int(time.time() * 1000)}_{os.path.basename(filepath)}"
+            )
+        os.replace(filepath, failed_path)
+        logger.warning(f"写入失败，文件已保留供排查/重放: {failed_path}")
+    except Exception as move_err:
+        # 移动失败也绝不删除原文件
+        logger.warning(f"移动失败文件到 failed/ 目录失败，保留原路径 {filepath}: {move_err}")
+
 KLINE_SOURCE = "auto"
 
 # 任务配置
@@ -90,8 +117,8 @@ TASKS = [
 ]
 
 INDEX_TASKS = [
-    {"table": "index_daily", "period": "daily", "adjust": "", "klt": "101"},
-    {"table": "index_30min", "period": "30", "adjust": "", "is_minute": True, "klt": "30"},
+    {"table": "index_daily", "period": "daily", "adjust": "", "klt": "101", "allow_zero_amount": True},
+    {"table": "index_30min", "period": "30", "adjust": "", "is_minute": True, "klt": "30", "allow_zero_amount": True},
 ]
 
 def fetch_stock_list_em():
@@ -853,10 +880,11 @@ def retry(max_retries=3, delay=1, backoff=2):
         return wrapper
     return decorator
 
-def validate_data(df, period):
+def validate_data(df, period, allow_zero_amount: bool = False):
     if df is None or df.empty:
         return False
-    if 'amount' in df.columns:
+    # 指数等无成交额品种 amount 合法全 0，对应任务以 allow_zero_amount 放宽该校验
+    if 'amount' in df.columns and not allow_zero_amount:
         if (df['amount'] == 0).all():
             return False
     time_col = 'date' if 'date' in df.columns else 'datetime'
@@ -6510,7 +6538,7 @@ def download_stock_data(args):
                          del df['datetime']
 
                 # 校验和预处理
-                if not validate_data(df, period):
+                if not validate_data(df, period, allow_zero_amount=task.get('allow_zero_amount', False)):
                     continue
                 
                 # 统一列
@@ -6597,8 +6625,7 @@ def _run_download_pipeline(
 ):
     logger.info("=== 开始数据增量补全任务 (生产者-消费者模式) ===")
 
-    for f in os.listdir(CACHE_DIR):
-        os.remove(os.path.join(CACHE_DIR, f))
+    _clear_cache_dir()
 
     if should_sync_list:
         if code_table == "stock_info":
@@ -6631,7 +6658,8 @@ def _run_download_pipeline(
     writers = []
     NUM_WRITERS = 4
     for _ in range(NUM_WRITERS):
-        p = mp.Process(target=db_writer_worker, args=(file_queue, stop_event))
+        # daemon=True：主进程异常退出时 writer 随之终止，避免孤儿进程永久阻塞在 queue.get
+        p = mp.Process(target=db_writer_worker, args=(file_queue, stop_event), daemon=True)
         p.start()
         writers.append(p)
 
@@ -6658,18 +6686,15 @@ def _run_download_pipeline(
                     elapsed = time.time() - start_time
                     speed = processed_count / max(elapsed, 1e-6)
                     logger.info(f"下载进度: {processed_count}/{total_codes} (速度: {speed:.2f} 只/秒)")
+        logger.info("所有下载任务完成，等待写入完成...")
     except KeyboardInterrupt:
         logger.warning("用户中断，正在停止下载进程...")
+        sys.exit(1)
+    finally:
+        # 无论正常结束/中断/其它异常，都通知 writer 退出并 join，避免孤儿进程
         stop_event.set()
         for p in writers:
             p.join()
-        sys.exit(1)
-
-    logger.info("所有下载任务完成，等待写入完成...")
-    stop_event.set()
-
-    for p in writers:
-        p.join()
 
     logger.info("全部完成！")
 
@@ -6716,10 +6741,8 @@ def db_writer_worker(file_queue, stop_event):
                 
             except Exception as e:
                 logger.error(f"Write failed for {filepath}: {e}")
-                try:
-                    os.remove(filepath)
-                except Exception:
-                    pass
+                # 失败文件不删除，移入 failed/ 保留，避免瞬时 DB 故障造成数据丢失
+                _keep_failed_file(filepath)
                 
     except Exception as e:
         logger.error(f"DB Writer crashed: {e}")
@@ -6809,8 +6832,7 @@ def main(target_adjust: list[str] | None = None, kline_source: str = "auto"):
     logger.info("=== 开始全量数据增量补全任务 (生产者-消费者模式) ===")
     
     # 0. 清理缓存目录
-    for f in os.listdir(CACHE_DIR):
-        os.remove(os.path.join(CACHE_DIR, f))
+    _clear_cache_dir()
         
     # 0.1 同步股票列表 (新增/退市处理)
     sync_stock_list()
@@ -6849,7 +6871,8 @@ def main(target_adjust: list[str] | None = None, kline_source: str = "auto"):
     writers = []
     NUM_WRITERS = 4
     for _ in range(NUM_WRITERS):
-        p = mp.Process(target=db_writer_worker, args=(file_queue, stop_event))
+        # daemon=True：主进程异常退出时 writer 随之终止，避免孤儿进程永久阻塞在 queue.get
+        p = mp.Process(target=db_writer_worker, args=(file_queue, stop_event), daemon=True)
         p.start()
         writers.append(p)
         
@@ -6881,20 +6904,16 @@ def main(target_adjust: list[str] | None = None, kline_source: str = "auto"):
                     elapsed = time.time() - start_time
                     speed = processed_count / elapsed
                     logger.info(f"下载进度: {processed_count}/{total_stocks} (速度: {speed:.2f} 只/秒)")
+        # 所有下载完成
+        logger.info("所有下载任务完成，等待写入完成...")
     except KeyboardInterrupt:
         logger.warning("用户中断，正在停止下载进程...")
-        stop_event.set()
+        sys.exit(1)
+    finally:
+        # 无论正常结束/中断/其它异常，都通知 writer 退出并 join，避免孤儿进程
+        stop_event.set() # 通知 writer 可以退出了 (只要队列空了)
         for p in writers:
             p.join()
-        sys.exit(1)
-
-                
-    # 所有下载完成
-    logger.info("所有下载任务完成，等待写入完成...")
-    stop_event.set() # 通知 writer 可以退出了 (只要队列空了)
-    
-    for p in writers:
-        p.join()
 
     # 只有当任务包含 qfq 时才尝试补全 qfq
     should_backfill_qfq = False
@@ -7182,7 +7201,5 @@ def run_pipeline():
 
 if __name__ == "__main__":
     mp.freeze_support()
-    if len(sys.argv) <= 1:
-        main()
-    else:
-        run_pipeline()
+    # 无参也走 run_pipeline：其"无动作参数"默认路径 = main() + 分红更新，语义唯一来源
+    run_pipeline()

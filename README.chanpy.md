@@ -1,3 +1,5 @@
+> **说明**：本文件为上游 `chan.py` 项目的保留文档（upstream README，对应其**完整版**）。其中引用的部分文件与功能（如 `Script/` 示例、`demo_config.yaml`、`OpenConfig`、策略类/特征/模型等）在本仓库中不存在或不适用；本仓库的使用说明见 [README.md](./README.md) 与 [quick_guide.md](./quick_guide.md)。
+
 <p align="center">
 <img src="./Image/chan.py_image_1.svg" width="300"/>
 </p>
