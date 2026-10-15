@@ -9,9 +9,83 @@ from dotenv import load_dotenv
 from clickhouse_driver import Client
 
 from Common.CEnum import AUTYPE, KL_TYPE, DATA_FIELD
+from Common.ChanException import CChanException, ErrCode
 from Common.CTime import CTime
 from KLine.KLine_Unit import CKLine_Unit
 from .CommonStockAPI import CCommonStockApi
+
+_logger = logging.getLogger(__name__)
+
+# 负缓存 TTL（秒）：表不存在 / min(date) 兜底的负结果长期驻留会让新建表、新装数据
+# 在进程内永久不可见，给负结果加 TTL 到期重查（正结果仍长期缓存）。
+_NEG_CACHE_TTL_ENV = "MLCHAN_CLICKHOUSE_NEG_CACHE_TTL_SEC"
+_NEG_CACHE_TTL_DEFAULT = 60.0
+# 分钟级大跨度查询按自然日分段执行（默认约一个季度/段），单次结果集从"全量物化"
+# 降为"分段物化"，限制单次服务端扫描与网络缓冲峰值；<=0 表示禁用分段。
+_QUERY_SEGMENT_DAYS_ENV = "MLCHAN_CLICKHOUSE_QUERY_SEGMENT_DAYS"
+_QUERY_SEGMENT_DAYS_DEFAULT = 92
+# _resample_intraday_from_lower_data 中 _fill_session 合成缺失分钟平盘 K 线的开关。
+# 默认开启（保持既有行为）；置 0/false 关闭，重采样只聚合真实分钟线。
+_FILL_SESSION_ENV = "MLCHAN_CLICKHOUSE_FILL_SESSION"
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)) or default)
+    except Exception:
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.getenv(name, str(default)) or default))
+    except Exception:
+        return int(default)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _split_query_segments(begin_query: str, end_query: str, is_intraday: bool, seg_days: Optional[int] = None):
+    """把 [begin_query, end_query] 按自然日切成若干段（仅分钟级大跨度生效）。
+
+    返回 [(seg_begin, seg_end), ...]：首段 begin / 末段 end 保留原始串（可能含
+    时分秒，保证边界语义与单发查询完全一致），中间段为整日 00:00:00 ~ 23:59:59。
+    段间按自然日互不重迭，合并结果与单发全量查询等价。
+    非分钟级 / seg_days<=0 / 跨度不足一段时返回单段。
+    """
+    if not is_intraday:
+        return [(begin_query, end_query)]
+    if seg_days is None:
+        seg_days = _env_int(_QUERY_SEGMENT_DAYS_ENV, _QUERY_SEGMENT_DAYS_DEFAULT)
+    if seg_days <= 0:
+        return [(begin_query, end_query)]
+
+    def _to_date(s):
+        try:
+            return datetime.date.fromisoformat(str(s).strip()[:10])
+        except Exception:
+            return None
+
+    b = _to_date(begin_query)
+    e = _to_date(end_query)
+    if b is None or e is None or e < b or (e - b).days <= seg_days:
+        return [(begin_query, end_query)]
+
+    segs = []
+    cur = b
+    while cur <= e:
+        seg_end = min(cur + datetime.timedelta(days=seg_days - 1), e)
+        seg_begin_s = begin_query if cur == b else f"{cur.isoformat()} 00:00:00"
+        seg_end_s = end_query if seg_end == e else f"{seg_end.isoformat()} 23:59:59"
+        segs.append((seg_begin_s, seg_end_s))
+        cur = seg_end + datetime.timedelta(days=1)
+    return segs
+
 
 class _LockedClickHouseClient:
     def __init__(self, client: Client, lock: threading.Lock):
@@ -22,12 +96,33 @@ class _LockedClickHouseClient:
         with self._lock:
             return self._client.execute(*args, **kwargs)
 
+    def execute_iter(self, *args, **kwargs):
+        # 逐块流式读取：锁只覆盖每次 next()（驱动在该调用内做 socket 读），
+        # 不跨 yield 持锁，避免长时间阻塞其它线程。
+        it = self._client.execute_iter(*args, **kwargs)
+        while True:
+            with self._lock:
+                try:
+                    row = next(it)
+                except StopIteration:
+                    return
+            yield row
+
     def disconnect(self):
         with self._lock:
             return self._client.disconnect()
 
     def __getattr__(self, name: str):
-        return getattr(self._client, name)
+        # 旁路锁修复：callable 属性（如 execute_iter 以外的方法）此前经由
+        # __getattr__ 直接返回裸 client 方法，调用时不持锁。这里把 callable
+        # 包一层锁；非 callable 属性（如 last_query 状态）原样返回。
+        attr = getattr(self._client, name)
+        if callable(attr):
+            def _locked(*args, **kwargs):
+                with self._lock:
+                    return attr(*args, **kwargs)
+            return _locked
+        return attr
 
 class CClickHouseAPI(CCommonStockApi):
     _client = None
@@ -70,6 +165,10 @@ class CClickHouseAPI(CCommonStockApi):
 
             raw_client = None
             probe_client = None
+            # probe+正式双连接：先用短超时 probe_client 探活（MLCHAN_CLICKHOUSE_INIT_TIMEOUT，
+            # 缺省 = connect_timeout），CH 不可达时快速失败并走 retry_sec 节流重试，
+            # 避免正式连接的长 send_receive_timeout（默认 300s）卡在握手期；
+            # 探活成功后再以完整超时参数建正式 raw_client。
             driver_loggers = [
                 logging.getLogger("clickhouse_driver"),
                 logging.getLogger("clickhouse_driver.connection"),
@@ -124,7 +223,7 @@ class CClickHouseAPI(CCommonStockApi):
                 except Exception:
                     log_interval = 60.0
                 if cls._last_init_log_ts <= 0 or cls._last_init_error_ts - cls._last_init_log_ts >= max(0.0, log_interval):
-                    print(
+                    _logger.warning(
                         f"ClickHouse unavailable at {host}:{port}/{database}: {cls._last_init_error}. "
                         "Backend will keep running and retry on later DB requests. "
                         "clickhouse_driver requires the native TCP port, usually 9000; HTTP port 8123 will not work here."
@@ -144,12 +243,17 @@ class CClickHouseAPI(CCommonStockApi):
 
     @classmethod
     def do_close(cls):
-        if cls._client:
-            try:
-                cls._client.disconnect()
-            except Exception:
-                pass
+        # 与 do_init 共用 _init_lock：此前 do_close 无锁，可能与 do_init 并发
+        # （close 刚清完又被 init 重连 / init 建连期间被 close 置 None 泄漏连接）。
+        with cls._init_lock:
+            client = cls._client
             cls._client = None
+        if client is None:
+            return
+        try:
+            client.disconnect()
+        except Exception:
+            pass
 
     @classmethod
     def get_client(cls) -> Optional[Client]:
@@ -176,8 +280,10 @@ class CClickHouseAPI(CCommonStockApi):
             rows = client.execute(query, params)
             return [r[0] for r in rows]
         except Exception as e:
-            print(f"ClickHouse columns query failed: {e}")
-            return []
+            # 返回 None（区别于 []）：[] 表示"表存在但无该列/表不存在"，
+            # None 表示"元数据查询本身失败"。调用方如需区分 DB 故障可判 None。
+            _logger.warning(f"ClickHouse columns query failed for {table}: {type(e).__name__}: {e}")
+            return None
 
     @classmethod
     def _table_exists(cls, table: str, database: Optional[str] = None) -> bool:
@@ -188,7 +294,11 @@ class CClickHouseAPI(CCommonStockApi):
         cache_key = (database or "", table)
         cached = cls._table_exists_cache.get(cache_key)
         if cached is not None:
-            return bool(cached)
+            # 负缓存 TTL：False 结果到期重查，避免建表后进程内长期判不存在；
+            # True 结果不随 TTL 失效。
+            exists_val, cached_ts = cached
+            if exists_val or (time.monotonic() - cached_ts) < _env_float(_NEG_CACHE_TTL_ENV, _NEG_CACHE_TTL_DEFAULT):
+                return bool(exists_val)
 
         db_expr = "currentDatabase()" if database is None else "%(db)s"
         query = f"""
@@ -203,12 +313,13 @@ class CClickHouseAPI(CCommonStockApi):
         try:
             rows = client.execute(query, params)
             exists = bool(rows and rows[0] and int(rows[0][0]) > 0)
-        except Exception:
+        except Exception as e:
+            _logger.warning(f"ClickHouse table_exists query failed for {table}: {type(e).__name__}: {e}")
             exists = False
 
         if len(cls._table_exists_cache) > 1024:
             cls._table_exists_cache.clear()
-        cls._table_exists_cache[cache_key] = exists
+        cls._table_exists_cache[cache_key] = (exists, time.monotonic())
         return exists
 
     @classmethod
@@ -286,15 +397,20 @@ class CClickHouseAPI(CCommonStockApi):
     @classmethod
     def _get_min_daily_date(cls, normalized_code: str) -> datetime.date:
         cached = cls._min_daily_date_cache.get(normalized_code)
-        if isinstance(cached, datetime.date):
+        if isinstance(cached, tuple):
+            dt, cached_ts, is_fallback = cached
+            if (not is_fallback) or (time.monotonic() - cached_ts) < _env_float(_NEG_CACHE_TTL_ENV, _NEG_CACHE_TTL_DEFAULT):
+                return dt
+        elif isinstance(cached, datetime.date):
             return cached
 
         client = cls.get_client()
         if not client:
-            dt = datetime.date(1990, 1, 1)
-            cls._min_daily_date_cache[normalized_code] = dt
-            return dt
+            _logger.warning("ClickHouse min(date) probe skipped: client unavailable")
+            cls._min_daily_date_cache[normalized_code] = (datetime.date(1990, 1, 1), time.monotonic(), True)
+            return datetime.date(1990, 1, 1)
 
+        is_fallback = False
         try:
             rows = client.execute(
                 "SELECT min(date) FROM stock_daily WHERE code = %(code)s",
@@ -304,12 +420,17 @@ class CClickHouseAPI(CCommonStockApi):
             dt = cls._parse_ymd(raw) or (raw if isinstance(raw, datetime.date) else None)
             if dt is None:
                 dt = datetime.date(1990, 1, 1)
-        except Exception:
+                is_fallback = True
+        except Exception as e:
+            _logger.warning(f"ClickHouse min(date) query failed for {normalized_code}: {type(e).__name__}: {e}")
             dt = datetime.date(1990, 1, 1)
+            is_fallback = True
 
+        # 负缓存 TTL：仅兜底值（无连接/查询失败/表空）标 is_fallback 并到期重查；
+        # 真实 min(date) 不随 TTL 失效。
         if len(cls._min_daily_date_cache) > 4096:
             cls._min_daily_date_cache.clear()
-        cls._min_daily_date_cache[normalized_code] = dt
+        cls._min_daily_date_cache[normalized_code] = (dt, time.monotonic(), is_fallback)
         return dt
 
     @classmethod
@@ -364,7 +485,7 @@ class CClickHouseAPI(CCommonStockApi):
             try:
                 rows = client.execute(query)
             except Exception as e:
-                print(f"ClickHouse list pools failed: {e}")
+                _logger.warning(f"ClickHouse list pools failed: {e}")
                 return []
 
             items = []
@@ -430,7 +551,7 @@ class CClickHouseAPI(CCommonStockApi):
         try:
             rows = client.execute(query)
         except Exception as e:
-            print(f"ClickHouse list pools failed: {e}")
+            _logger.warning(f"ClickHouse list pools failed: {e}")
             return []
 
         items = []
@@ -516,7 +637,7 @@ class CClickHouseAPI(CCommonStockApi):
             try:
                 rows = client.execute(query, params)
             except Exception as e:
-                print(f"ClickHouse get pool members failed: {e}")
+                _logger.warning(f"ClickHouse get pool members failed: {e}")
                 return []
             return [str(r[0]) for r in rows]
 
@@ -578,7 +699,7 @@ class CClickHouseAPI(CCommonStockApi):
             else:
                 rows = client.execute(query, {"pool_id": pool_id, "limit": int(limit)})
         except Exception as e:
-            print(f"ClickHouse get pool members failed: {e}")
+            _logger.warning(f"ClickHouse get pool members failed: {e}")
             return []
 
         return [str(r[0]) for r in rows]
@@ -644,7 +765,8 @@ class CClickHouseAPI(CCommonStockApi):
             """
             try:
                 rows = client.execute(query, params)
-            except Exception:
+            except Exception as e:
+                _logger.warning(f"ClickHouse get pool snapshot members failed: {type(e).__name__}: {e}")
                 return {}
 
             by_dt: Dict[str, List[str]] = {}
@@ -692,7 +814,8 @@ class CClickHouseAPI(CCommonStockApi):
         """
         try:
             rows = client.execute(query, params)
-        except Exception:
+        except Exception as e:
+            _logger.warning(f"ClickHouse get pool snapshot members failed: {type(e).__name__}: {e}")
             return {}
 
         by_dt: Dict[str, List[str]] = {}
@@ -710,9 +833,52 @@ class CClickHouseAPI(CCommonStockApi):
             by_dt[k] = list(dict.fromkeys([str(x) for x in v if str(x).strip()]))
         return by_dt
 
+    def __setattr__(self, name, value):
+        # _client 是进程级类属性单例（do_init/do_close/get_client 统一管理）。
+        # 实例侧写 self._client 会遮蔽类属性：do_close 只清类属性，实例仍持失效
+        # 客户端继续查询且异常被吞成空数据 —— 历史上 _ensure_connection 就犯过。
+        # 这里直接禁掉实例写，保持"唯一存储在类属性"的一致性约定。
+        if name == "_client":
+            raise AttributeError(
+                "CClickHouseAPI._client is a class-level singleton managed by "
+                "do_init/do_close; do not assign on instances"
+            )
+        super().__setattr__(name, value)
+
+    def _warn_once(self, msg: str):
+        # 与 TdxAPI._warn_once 同约定：记录进 self.warnings（Chan.py 会汇入
+        # data_warnings 透传到 API 响应），同时落日志；两者都按消息去重，
+        # 避免同一告警在日志里每轮迭代重打一遍。
+        if msg not in self.warnings:
+            self.warnings.append(msg)
+            _logger.warning(msg)
+
     def _ensure_connection(self):
-        client = self.get_client()
-        self._client = client
+        # 只触发类级惰性建连（do_init 内部有 retry 节流），不往实例写 _client。
+        # 历史实现写 self._client 造成实例属性遮蔽类属性，do_close 后实例仍持
+        # 失效 client —— 现统一为只读类属性（self._client 解析到 CClickHouseAPI._client）。
+        self.get_client()
+
+    @classmethod
+    def _new_light_instance(cls, code, k_type, begin_date, end_date, autype, asset_type="STOCK"):
+        """绕过 __init__ 构造的轻量实例，供 _resample_intraday_from_lower 复用查询逻辑。
+
+        正规构造会经基类 _ensure_basic_info 调 SetBasciInfo → info 表查询（每次重采样
+        一次 N+1）。重采样只需要 get_kl_data 的取数逻辑，name/is_stock 用不到，
+        故直接跳过构造期 DB 访问（_basic_info_ready=True 防惰性触发）。
+        """
+        inst = object.__new__(cls)
+        inst.code = code
+        inst.name = None
+        inst.is_stock = None
+        inst.k_type = k_type
+        inst.begin_date = begin_date
+        inst.end_date = end_date
+        inst.autype = autype
+        inst.asset_type = asset_type
+        inst.warnings = []
+        inst._basic_info_ready = True  # SetBasciInfo 已跳过，勿再惰性触发
+        return inst
 
     @classmethod
     def _parse_ymd(cls, value) -> Optional[datetime.date]:
@@ -743,8 +909,8 @@ class CClickHouseAPI(CCommonStockApi):
     def _get_qfq_factors_by_date(self, normalized_code: str, begin_date: str, end_date: str):
         self._ensure_connection()
         if not self._client:
-            result = ([], {})
-            return result
+            self._warn_once(f"clickhouse_qfq_unavailable:{normalized_code}:client not initialized, prices NOT adjusted")
+            return ([], {})
         begin_dt = self._parse_ymd(begin_date) or datetime.date(1990, 1, 1)
         end_dt = self._parse_ymd(end_date) or datetime.date.today()
         begin_lookback_dt = begin_dt - datetime.timedelta(days=120)
@@ -755,7 +921,10 @@ class CClickHouseAPI(CCommonStockApi):
         if cached is not None:
             return cached
 
-        div_cols = self._get_table_columns("stock_dividend")
+        # _get_table_columns 返回 None 表示元数据查询失败（区别于表无该列的 []）
+        div_cols = self._get_table_columns("stock_dividend") or []
+        if not div_cols:
+            _logger.warning("ClickHouse stock_dividend schema probe returned no columns")
         div_cols_lower = {c.lower(): c for c in div_cols}
         div_code_col = self._pick_column(div_cols_lower, ["code", "stock_code", "symbol", "ts_code", "sec_code"])
         div_date_col = self._pick_column(div_cols_lower, ["ex_dividend_date", "ex_date", "exdate", "ex_dt", "exdividend_date"])
@@ -785,7 +954,11 @@ class CClickHouseAPI(CCommonStockApi):
                     div_query,
                     {"code": normalized_code, "begin": begin_lookback, "end": end_key},
                 )
-            except Exception:
+            except Exception as e:
+                # 失败≠无分红：静默置空会使复权因子缺失而返回未复权价
+                self._warn_once(
+                    f"clickhouse_dividend_query_failed:{normalized_code}:{type(e).__name__}:{e}; QFQ factors may be incomplete"
+                )
                 dividend_rows = []
 
         daily_query = """
@@ -796,15 +969,23 @@ class CClickHouseAPI(CCommonStockApi):
               AND date <= %(end)s
             ORDER BY date ASC
         """
+        daily_failed = False
         try:
             daily_rows = self._client.execute(
                 daily_query, {"code": normalized_code, "begin": begin_lookback, "end": end_key}
             )
-        except Exception:
+        except Exception as e:
+            self._warn_once(
+                f"clickhouse_factor_daily_query_failed:{normalized_code}:{type(e).__name__}:{e}; prices NOT adjusted"
+            )
             daily_rows = []
+            daily_failed = True
 
         if not daily_rows:
             result = ([], {})
+            if daily_failed:
+                # 查询失败的空结果不入缓存，避免瞬时故障被记成"长期无数据"
+                return result
             if len(self._qfq_factor_cache) > 256:
                 self._qfq_factor_cache.clear()
             self._qfq_factor_cache[cache_key] = result
@@ -961,8 +1142,8 @@ class CClickHouseAPI(CCommonStockApi):
     def _get_hfq_factors_by_date(self, normalized_code: str, begin_date: str, end_date: str):
         self._ensure_connection()
         if not self._client:
-            result = ([], {})
-            return result
+            self._warn_once(f"clickhouse_hfq_unavailable:{normalized_code}:client not initialized, prices NOT adjusted")
+            return ([], {})
         begin_dt = self._parse_ymd(begin_date) or datetime.date(1990, 1, 1)
         end_dt = self._parse_ymd(end_date) or datetime.date.today()
         begin_lookback_dt = self._get_min_daily_date(normalized_code)
@@ -973,7 +1154,10 @@ class CClickHouseAPI(CCommonStockApi):
         if cached is not None:
             return cached
 
-        div_cols = self._get_table_columns("stock_dividend")
+        # _get_table_columns 返回 None 表示元数据查询失败（区别于表无该列的 []）
+        div_cols = self._get_table_columns("stock_dividend") or []
+        if not div_cols:
+            _logger.warning("ClickHouse stock_dividend schema probe returned no columns")
         div_cols_lower = {c.lower(): c for c in div_cols}
         div_code_col = self._pick_column(div_cols_lower, ["code", "stock_code", "symbol", "ts_code", "sec_code"])
         div_date_col = self._pick_column(div_cols_lower, ["ex_dividend_date", "ex_date", "exdate", "ex_dt", "exdividend_date"])
@@ -1003,7 +1187,11 @@ class CClickHouseAPI(CCommonStockApi):
                     div_query,
                     {"code": normalized_code, "begin": begin_lookback, "end": end_key},
                 )
-            except Exception:
+            except Exception as e:
+                # 失败≠无分红：静默置空会使复权因子缺失而返回未复权价
+                self._warn_once(
+                    f"clickhouse_dividend_query_failed:{normalized_code}:{type(e).__name__}:{e}; HFQ factors may be incomplete"
+                )
                 dividend_rows = []
 
         daily_query = """
@@ -1014,15 +1202,23 @@ class CClickHouseAPI(CCommonStockApi):
               AND date <= %(end)s
             ORDER BY date ASC
         """
+        daily_failed = False
         try:
             daily_rows = self._client.execute(
                 daily_query, {"code": normalized_code, "begin": begin_lookback, "end": end_key}
             )
-        except Exception:
+        except Exception as e:
+            self._warn_once(
+                f"clickhouse_factor_daily_query_failed:{normalized_code}:{type(e).__name__}:{e}; prices NOT adjusted"
+            )
             daily_rows = []
+            daily_failed = True
 
         if not daily_rows:
             result = ([], {})
+            if daily_failed:
+                # 查询失败的空结果不入缓存，避免瞬时故障被记成"长期无数据"
+                return result
             if len(self._hfq_factor_cache) > 256:
                 self._hfq_factor_cache.clear()
             self._hfq_factor_cache[cache_key] = result
@@ -1198,16 +1394,18 @@ class CClickHouseAPI(CCommonStockApi):
 
             if cur_key is None or key != cur_key:
                 if cur_key is not None and agg_last_date is not None:
+                    # round(...,4) 而非 2：ETF/基金最小变动价为 0.001，round2 会丢末位精度；
+                    # 复权价本身为浮点，保留 4 位仅去除浮点尾差。纯 2 位小数标的结果不变。
                     data_list.append(
                         CKLine_Unit(
                             {
                                 DATA_FIELD.FIELD_TIME: CTime(
                                     agg_last_date.year, agg_last_date.month, agg_last_date.day, 0, 0, auto=False
                                 ),
-                                DATA_FIELD.FIELD_OPEN: float(round(agg_open, 2)),
-                                DATA_FIELD.FIELD_HIGH: float(round(agg_high, 2)),
-                                DATA_FIELD.FIELD_LOW: float(round(agg_low, 2)),
-                                DATA_FIELD.FIELD_CLOSE: float(round(agg_close, 2)),
+                                DATA_FIELD.FIELD_OPEN: float(round(agg_open, 4)),
+                                DATA_FIELD.FIELD_HIGH: float(round(agg_high, 4)),
+                                DATA_FIELD.FIELD_LOW: float(round(agg_low, 4)),
+                                DATA_FIELD.FIELD_CLOSE: float(round(agg_close, 4)),
                                 DATA_FIELD.FIELD_VOLUME: float(agg_vol),
                                 DATA_FIELD.FIELD_TURNOVER: float(agg_amt),
                             }
@@ -1238,10 +1436,10 @@ class CClickHouseAPI(CCommonStockApi):
                         DATA_FIELD.FIELD_TIME: CTime(
                             agg_last_date.year, agg_last_date.month, agg_last_date.day, 0, 0, auto=False
                         ),
-                        DATA_FIELD.FIELD_OPEN: float(round(agg_open, 2)),
-                        DATA_FIELD.FIELD_HIGH: float(round(agg_high, 2)),
-                        DATA_FIELD.FIELD_LOW: float(round(agg_low, 2)),
-                        DATA_FIELD.FIELD_CLOSE: float(round(agg_close, 2)),
+                        DATA_FIELD.FIELD_OPEN: float(round(agg_open, 4)),
+                        DATA_FIELD.FIELD_HIGH: float(round(agg_high, 4)),
+                        DATA_FIELD.FIELD_LOW: float(round(agg_low, 4)),
+                        DATA_FIELD.FIELD_CLOSE: float(round(agg_close, 4)),
                         DATA_FIELD.FIELD_VOLUME: float(agg_vol),
                         DATA_FIELD.FIELD_TURNOVER: float(agg_amt),
                     }
@@ -1274,6 +1472,7 @@ class CClickHouseAPI(CCommonStockApi):
     def _get_trading_dates(self, normalized_code: str, begin_date: str, end_date: str):
         self._ensure_connection()
         if not self._client:
+            self._warn_once(f"clickhouse_trading_dates_unavailable:{normalized_code}:client not initialized")
             return []
         begin_dt = self._parse_ymd(begin_date) or datetime.date(1990, 1, 1)
         end_dt = self._parse_ymd(end_date) or datetime.date.today()
@@ -1282,7 +1481,7 @@ class CClickHouseAPI(CCommonStockApi):
         route = self._resolve_asset_route(normalized_code)
         table = str(route.get("daily_table") or "stock_daily")
 
-        cols = self._get_table_columns(table)
+        cols = self._get_table_columns(table) or []
         cols_lower = {c.lower(): c for c in cols}
         date_col = self._pick_column(cols_lower, ["date", "trade_date", "dt"])
         code_col = self._pick_column(cols_lower, list(route.get("code_candidates") or ["code", "ts_code", "symbol"]))
@@ -1300,7 +1499,10 @@ class CClickHouseAPI(CCommonStockApi):
                 """,
                 {"code": normalized_code, "begin": begin_dt.strftime("%Y-%m-%d"), "end": end_dt.strftime("%Y-%m-%d")},
             )
-        except Exception:
+        except Exception as e:
+            self._warn_once(
+                f"clickhouse_trading_dates_query_failed:{normalized_code}:{type(e).__name__}:{e}"
+            )
             rows = []
         out = []
         for (d,) in rows:
@@ -1388,6 +1590,8 @@ class CClickHouseAPI(CCommonStockApi):
                 return anchor + datetime.timedelta(minutes=b)
             return None
 
+        fill_synth_count = 0  # _fill_session 凭空合成的分钟条数（仅统计，供打标/告警）
+
         if used_lower_k_type == KL_TYPE.K_1M:
             by_dt = {}
             for klu in lower_data:
@@ -1397,6 +1601,7 @@ class CClickHouseAPI(CCommonStockApi):
                 by_dt[dt] = klu
 
             def _fill_session(day: datetime.date, start_h: int, start_m: int, end_h: int, end_m: int):
+                nonlocal fill_synth_count
                 start = datetime.datetime(day.year, day.month, day.day, start_h, start_m)
                 end = datetime.datetime(day.year, day.month, day.day, end_h, end_m)
                 first = None
@@ -1430,7 +1635,7 @@ class CClickHouseAPI(CCommonStockApi):
                         cur += datetime.timedelta(minutes=1)
                         continue
                     t = CTime(cur.year, cur.month, cur.day, cur.hour, cur.minute, auto=False)
-                    by_dt[cur] = CKLine_Unit(
+                    synth_klu = CKLine_Unit(
                         {
                             DATA_FIELD.FIELD_TIME: t,
                             DATA_FIELD.FIELD_OPEN: float(px),
@@ -1441,13 +1646,32 @@ class CClickHouseAPI(CCommonStockApi):
                             DATA_FIELD.FIELD_TURNOVER: 0.0,
                         }
                     )
+                    # 合成条标记：该 KLU 非真实成交（0 成交量平盘补齐），下游可经
+                    # getattr(klu, "is_synthetic", False) 或聚合产出条上的
+                    # has_synthetic_minutes / trade_info.metric["synthetic_minutes"] 分辨。
+                    synth_klu.is_synthetic = True
+                    by_dt[cur] = synth_klu
+                    fill_synth_count += 1
                     last_close = px
                     cur += datetime.timedelta(minutes=1)
 
-            days = sorted(list({dt.date() for dt in by_dt.keys()}))
-            for day in days:
-                _fill_session(day, 9, 30, 11, 30)
-                _fill_session(day, 13, 0, 15, 0)
+            # 配置开关：MLCHAN_CLICKHOUSE_FILL_SESSION=0 时不再凭空补分钟，
+            # 聚合桶只含真实分钟线（聚合逻辑对缺口天然兼容）。
+            if _env_flag(_FILL_SESSION_ENV, True):
+                days = sorted(list({dt.date() for dt in by_dt.keys()}))
+                for day in days:
+                    _fill_session(day, 9, 30, 11, 30)
+                    _fill_session(day, 13, 0, 15, 0)
+                if fill_synth_count:
+                    self._warn_once(
+                        f"clickhouse_fill_session:{self.code}:{target_k_type.name}:"
+                        f"synthetic_1min_bars={fill_synth_count} (0-volume flat bars injected for missing minutes)"
+                    )
+            elif by_dt:
+                self._warn_once(
+                    f"clickhouse_fill_session_disabled:{self.code}:{target_k_type.name}:"
+                    "missing minutes are NOT synthesized (MLCHAN_CLICKHOUSE_FILL_SESSION=0)"
+                )
             lower_data = [by_dt[dt] for dt in sorted(by_dt.keys())]
 
         grouped = {}
@@ -1499,6 +1723,7 @@ class CClickHouseAPI(CCommonStockApi):
             lows = []
             vol_sum = 0.0
             amt_sum = 0.0
+            synth_cnt = 0
             for klu in rows:
                 try:
                     h = float(getattr(klu, "high", 0.0) or 0.0)
@@ -1516,6 +1741,8 @@ class CClickHouseAPI(CCommonStockApi):
                 lows.append(min(l, cc))
                 vol_sum += _trade_metric(klu, DATA_FIELD.FIELD_VOLUME)
                 amt_sum += _trade_metric(klu, DATA_FIELD.FIELD_TURNOVER)
+                if getattr(klu, "is_synthetic", False):
+                    synth_cnt += 1
             if not highs or not lows:
                 continue
             h = float(max(highs + [o, c]))
@@ -1536,22 +1763,30 @@ class CClickHouseAPI(CCommonStockApi):
                 c = float(c) * factor
 
             t = CTime(bdt.year, bdt.month, bdt.day, bdt.hour, bdt.minute, auto=False)
-            out.append(
-                CKLine_Unit(
-                    {
-                        DATA_FIELD.FIELD_TIME: t,
-                        DATA_FIELD.FIELD_OPEN: float(round(o, 2)),
-                        DATA_FIELD.FIELD_HIGH: float(round(h, 2)),
-                        DATA_FIELD.FIELD_LOW: float(round(l, 2)),
-                        DATA_FIELD.FIELD_CLOSE: float(round(c, 2)),
-                        DATA_FIELD.FIELD_VOLUME: float(vol_sum),
-                        DATA_FIELD.FIELD_TURNOVER: float(amt_sum),
-                    }
-                )
+            out_klu = CKLine_Unit(
+                {
+                    DATA_FIELD.FIELD_TIME: t,
+                    DATA_FIELD.FIELD_OPEN: float(round(o, 4)),
+                    DATA_FIELD.FIELD_HIGH: float(round(h, 4)),
+                    DATA_FIELD.FIELD_LOW: float(round(l, 4)),
+                    DATA_FIELD.FIELD_CLOSE: float(round(c, 4)),
+                    DATA_FIELD.FIELD_VOLUME: float(vol_sum),
+                    DATA_FIELD.FIELD_TURNOVER: float(amt_sum),
+                }
             )
+            if synth_cnt:
+                # 桶内掺有 _fill_session 合成分钟：标记到产出条，下游可分辨真伪
+                out_klu.has_synthetic_minutes = True
+                out_klu.trade_info.metric["synthetic_minutes"] = float(synth_cnt)
+            out.append(out_klu)
         return out
 
     def _resample_intraday_from_lower(self, target_k_type: KL_TYPE, begin_date: str, end_date: str):
+        """返回 (resampled_rows, used_lower_k_type)；无产出/不支持级别返回 ([], None)。
+
+        used_lower_k_type 记录实际取到数据的低级别（K_1M/K_5M 依次回退），供调用方
+        的 clickhouse_resample 警告如实标注来源级别。
+        """
         interval_map = {
             KL_TYPE.K_5M: 5,
             KL_TYPE.K_15M: 15,
@@ -1560,13 +1795,17 @@ class CClickHouseAPI(CCommonStockApi):
         }
         interval_min = interval_map.get(target_k_type)
         if interval_min is None:
-            return []
+            return [], None
 
         candidates = [KL_TYPE.K_1M, KL_TYPE.K_5M]
         lower_data = []
         used_lower_k_type = None
         for lower_k_type in candidates:
-            lower_api = CClickHouseAPI(
+            # 轻量实例：正规构造会触发 SetBasciInfo → info 表查询（每次重采样 N+1）；
+            # 这里只需要 get_kl_data 的取数路径。连接是类级单例，无需也不允许
+            # 再向实例写 _client（原 lower_api._client = self._client 为死赋值，
+            # 会立刻被 _ensure_connection 的类属性覆盖，且现已被 __setattr__ 禁写）。
+            lower_api = CClickHouseAPI._new_light_instance(
                 code=self.code,
                 k_type=lower_k_type,
                 begin_date=begin_date,
@@ -1575,17 +1814,23 @@ class CClickHouseAPI(CCommonStockApi):
                 asset_type=self.asset_type,
             )
             try:
-                lower_api._client = self._client
-            except Exception:
-                pass
-            tmp = list(lower_api.get_kl_data() or [])
+                tmp = list(lower_api.get_kl_data() or [])
+            except Exception as e:
+                # 某个低级别查询失败（如 1min 表故障）时尝试下一个候选级别，
+                # 但把失败原因记入 warnings 而不是静默吞掉。
+                self._warn_once(
+                    f"clickhouse_resample_lower_failed:{self.code}:{lower_k_type.name}:{type(e).__name__}:{e}"
+                )
+                tmp = []
+            if lower_api.warnings:
+                self.warnings.extend(lower_api.warnings)
             if tmp:
                 lower_data = tmp
                 used_lower_k_type = lower_k_type
                 break
 
         if not lower_data or used_lower_k_type is None:
-            return []
+            return [], None
 
         return self._resample_intraday_from_lower_data(
             target_k_type=target_k_type,
@@ -1593,13 +1838,18 @@ class CClickHouseAPI(CCommonStockApi):
             used_lower_k_type=used_lower_k_type,
             begin_date=begin_date,
             end_date=end_date,
-        )
+        ), used_lower_k_type
 
     def get_kl_data(self) -> Iterable[CKLine_Unit]:
         self._ensure_connection()
         if not self._client:
-            print("ClickHouse client not initialized")
-            return []
+            # 不再静默 return []：调用方无法区分"无数据"与"DB 故障"。
+            # 抛 SRC_DATA_NOT_FOUND，Chan.py 可据此 auto_skip_illegal_sub_lv 跳过子级别。
+            err = self._last_init_error or "unknown init failure"
+            raise CChanException(
+                f"ClickHouse client not initialized: {err}",
+                ErrCode.SRC_DATA_NOT_FOUND,
+            )
 
         normalized_code = self.code.lower().replace(".", "")
         route = self._resolve_asset_route(normalized_code)
@@ -1657,7 +1907,10 @@ class CClickHouseAPI(CCommonStockApi):
             use_precomputed_qfq = False
 
         if not table:
-            raise Exception(f"Unsupported k_type for ClickHouse: {query_k_type}")
+            raise CChanException(
+                f"Unsupported k_type for ClickHouse: {query_k_type}",
+                ErrCode.PARA_ERROR,
+            )
 
         base_table = table_map.get(query_k_type)
 
@@ -1676,11 +1929,15 @@ class CClickHouseAPI(CCommonStockApi):
             'begin': begin_query,
             'end': end_query
         }
-        
-        # print(f"DEBUG: Querying {table} with params: {params}")
 
         def pick_cols_for_table(table_name: str):
             cols = self._get_table_columns(table_name)
+            if cols is None:
+                # _get_table_columns 的 None 表示元数据查询故障（区别于表缺失的 []），
+                # 属 DB 故障，抛错而非静默空数据
+                msg = f"ClickHouse schema probe failed for table {table_name} ({normalized_code})"
+                self._warn_once(msg)
+                raise CChanException(msg, ErrCode.SRC_DATA_NOT_FOUND)
             if not cols:
                 return None
             cols_lower = {c.lower(): c for c in cols}
@@ -1725,24 +1982,44 @@ class CClickHouseAPI(CCommonStockApi):
             q = f"""
                 SELECT {time_col}, {open_col}, {high_col}, {low_col}, {close_col}, {vol_expr}, {amt_expr}
                 FROM {table_name}
-                WHERE {code_col} = %(code)s 
-                AND {time_col} >= %(begin)s 
+                WHERE {code_col} = %(code)s
+                AND {time_col} >= %(begin)s
                 AND {time_col} <= %(end)s
                 ORDER BY {time_col} ASC
             """
+            client = self.get_client()
+            if not client:
+                raise CChanException(
+                    f"ClickHouse client not initialized: {self._last_init_error or 'unknown init failure'}",
+                    ErrCode.SRC_DATA_NOT_FOUND,
+                )
+            # 分段查询：分钟级大跨度（1min×多年可达数十万行）一次 execute 全量物化
+            # 服务端/网络缓冲峰值高；按自然日分段执行（默认 92 天/段，
+            # MLCHAN_CLICKHOUSE_QUERY_SEGMENT_DAYS 可调，<=0 禁用），段间按天互不重迭，
+            # 合并结果与单发等价 —— 下游仍需要 list（rows[0]/rows[-1] 与多趟遍历），
+            # 故不能整体改生成器，只能限制单段规模。
+            segments = _split_query_segments(begin_query, end_query, is_intraday)
             try:
-                client = self._client or self.get_client()
-                if not client:
-                    return None
-                self._client = client
-                return client.execute(q, params)
+                if len(segments) == 1:
+                    return client.execute(q, params)
+                all_rows = []
+                for seg_begin, seg_end in segments:
+                    seg_rows = client.execute(q, dict(params, begin=seg_begin, end=seg_end))
+                    if seg_rows:
+                        all_rows.extend(seg_rows)
+                return all_rows
             except Exception as e:
-                print(f"Query failed: {e}")
-                return None
+                # 失败≠无数据：抛 CChanException（SRC_DATA_NOT_FOUND），
+                # Chan.py 迭代期可据此 auto_skip_illegal_sub_lv
+                msg = f"ClickHouse query failed on {table_name} for {normalized_code}: {type(e).__name__}: {e}"
+                self._warn_once(msg)
+                raise CChanException(msg, ErrCode.SRC_DATA_NOT_FOUND) from e
 
         rows = run_query(table)
-        
+
         if rows is None:
+            # 表不存在 / 缺必需列：合法空结果，但记录 warning 以便排查
+            self._warn_once(f"clickhouse_table_unusable:{table}:{normalized_code}:{query_k_type.name}")
             return []
 
         if use_precomputed_qfq and base_table and base_table != table:
@@ -1788,7 +2065,8 @@ class CClickHouseAPI(CCommonStockApi):
                     for a, b in segs:
                         seg_begin = a.strftime("%Y-%m-%d")
                         seg_end = b.strftime("%Y-%m-%d")
-                        patched_extra.extend(self._resample_intraday_from_lower(query_k_type, begin_date=seg_begin, end_date=seg_end))
+                        seg_rows, _seg_from = self._resample_intraday_from_lower(query_k_type, begin_date=seg_begin, end_date=seg_end)
+                        patched_extra.extend(seg_rows)
                     if patched_extra:
                         try:
                             self.warnings.append(
@@ -1796,15 +2074,19 @@ class CClickHouseAPI(CCommonStockApi):
                             )
                         except Exception:
                             pass
-            except Exception:
+            except Exception as e:
+                self._warn_once(
+                    f"clickhouse_patch_gap_failed:{normalized_code}:{query_k_type.name}:{type(e).__name__}:{e}"
+                )
                 patched_extra = []
 
         if (not rows) and query_k_type in (KL_TYPE.K_30M, KL_TYPE.K_60M):
-            resampled = self._resample_intraday_from_lower(query_k_type, begin_date=begin_date, end_date=end_date)
+            resampled, resample_from = self._resample_intraday_from_lower(query_k_type, begin_date=begin_date, end_date=end_date)
             if resampled:
                 try:
                     self.warnings.append(
-                        f"clickhouse_resample:{normalized_code}:{query_k_type.name}:from:{KL_TYPE.K_5M.name}:{begin_date}~{end_date}"
+                        f"clickhouse_resample:{normalized_code}:{query_k_type.name}:"
+                        f"from:{(resample_from or KL_TYPE.K_1M).name}:{begin_date}~{end_date}"
                     )
                 except Exception:
                     pass
@@ -1911,10 +2193,10 @@ class CClickHouseAPI(CCommonStockApi):
                 CKLine_Unit(
                     {
                         DATA_FIELD.FIELD_TIME: kl_time,
-                        DATA_FIELD.FIELD_OPEN: float(round(_open, 2)),
-                        DATA_FIELD.FIELD_HIGH: float(round(_high, 2)),
-                        DATA_FIELD.FIELD_LOW: float(round(_low, 2)),
-                        DATA_FIELD.FIELD_CLOSE: float(round(_close, 2)),
+                        DATA_FIELD.FIELD_OPEN: float(round(_open, 4)),
+                        DATA_FIELD.FIELD_HIGH: float(round(_high, 4)),
+                        DATA_FIELD.FIELD_LOW: float(round(_low, 4)),
+                        DATA_FIELD.FIELD_CLOSE: float(round(_close, 4)),
                         DATA_FIELD.FIELD_VOLUME: float(_vol),
                         DATA_FIELD.FIELD_TURNOVER: float(_amt),
                     }
@@ -1942,8 +2224,9 @@ class CClickHouseAPI(CCommonStockApi):
     def SetBasciInfo(self):
         self._ensure_connection()
         if not self._client:
+            _logger.debug("ClickHouse SetBasciInfo skipped: client not initialized")
             return
-            
+
         normalized_code = self.code.lower().replace(".", "")
         route = self._resolve_asset_route(normalized_code)
         asset = str(route.get("asset") or "STOCK")
@@ -1966,7 +2249,8 @@ class CClickHouseAPI(CCommonStockApi):
                 )
                 if rows and rows[0] and rows[0][0]:
                     return str(rows[0][0])
-            except Exception:
+            except Exception as e:
+                _logger.warning(f"ClickHouse basic info query failed on {table}: {type(e).__name__}: {e}")
                 return None
             return None
 
@@ -1993,7 +2277,7 @@ class CClickHouseAPI(CCommonStockApi):
         if not cls._table_exists(daily_table):
             return []
 
-        cols = cls._get_table_columns(daily_table)
+        cols = cls._get_table_columns(daily_table) or []
         cols_lower = {c.lower(): c for c in cols}
         code_col_name = cls._pick_column(cols_lower, list(route.get("code_candidates") or ["code", "ts_code", "symbol"]))
         if not code_col_name:
@@ -2006,7 +2290,7 @@ class CClickHouseAPI(CCommonStockApi):
         info_code_col = None
         info_name_col = None
         if info_table:
-            info_cols = cls._get_table_columns(info_table)
+            info_cols = cls._get_table_columns(info_table) or []
             info_lower = {c.lower(): c for c in info_cols}
             info_code_col = cls._pick_column(info_lower, list(route.get("code_candidates") or ["code", "ts_code", "symbol"]))
             info_name_col = cls._pick_column(info_lower, list(route.get("name_candidates") or ["name"]))
@@ -2049,7 +2333,7 @@ class CClickHouseAPI(CCommonStockApi):
                 rows = client.execute(query, params)
                 return [{"code": str(r[0]), "name": str(r[0])} for r in rows]
         except Exception as e:
-            print(f"List {route.get('asset', asset_type)} assets failed: {e}")
+            _logger.warning(f"List {route.get('asset', asset_type)} assets failed: {e}")
             return []
 
     @classmethod

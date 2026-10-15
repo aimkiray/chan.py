@@ -1,12 +1,48 @@
 import akshare as ak
 import pandas as pd
 import datetime
+import requests
+from typing import Optional
 from Common.CEnum import AUTYPE, DATA_FIELD, KL_TYPE
 from Common.ChanException import CChanException, ErrCode
 from Common.CTime import CTime
 from Common.func_util import str2float, kltype_lt_day
 from KLine.KLine_Unit import CKLine_Unit
 from .CommonStockAPI import CCommonStockApi
+
+# SH funds/ETF/LOF: 50x,51x,52x,56x,58x; SZ funds/ETF/LOF: 15x,16x,18x.
+# (Previously only 51/52/56/58/15 — missed 50xxxx SH funds and 16xxxx SZ LOFs.)
+_ETF_PREFIXES = ('15', '16', '18', '50', '51', '52', '56', '58')
+
+# eastmoney push2 single-symbol quote timeout (seconds)
+_REALTIME_QUOTE_TIMEOUT = 8
+
+# timeout passed to akshare endpoints that accept one (stock_zh_a_hist)
+_AK_HTTP_TIMEOUT = 30
+
+
+def _is_etf_symbol(symbol: str) -> bool:
+    return str(symbol or "").strip().startswith(_ETF_PREFIXES)
+
+
+def _to_float(v):
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        if pd.isna(v):
+            return None
+        return float(v)
+    s = str(v)
+    if not s or s == "nan" or s == "None":
+        return None
+    try:
+        f = float(s)
+        if pd.isna(f):
+            return None
+        return float(f)
+    except Exception:
+        return None
+
 
 def create_item_dict(data, column_name):
     for i in range(len(data)):
@@ -59,10 +95,7 @@ class CAkShare(CCommonStockApi):
         # AkShare uses 6-digit code. Need to strip sh/sz prefix if present
         symbol = self.code.split('.')[-1]
         is_index = self._is_index(symbol)
-        
-        # Simple heuristic to detect ETF (Start with 51, 52, 56, 58 for SH, 15 for SZ)
-        # This is not perfect but covers most ETFs.
-        is_etf = symbol.startswith(('51', '52', '56', '58', '15'))
+        is_etf = _is_etf_symbol(symbol)
         
         period = self.__convert_type()
         adjust = "qfq" if self.autype == AUTYPE.QFQ else "hfq" if self.autype == AUTYPE.HFQ else ""
@@ -92,9 +125,17 @@ class CAkShare(CCommonStockApi):
                         start_date=start_dt or f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]} 09:30:00",
                         end_date=end_dt or f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]} 15:00:00",
                     )
-                    adjust = ""
+                    # index_zh_a_hist_min_em has no adjust param (index bars are never adjusted)
                 elif is_etf:
-                    df = ak.fund_etf_hist_min_em(symbol=symbol, period=period, adjust=adjust)
+                    # start/end were previously omitted → akshare pulled FULL minute history
+                    # (defaults '1979-09-01'..'2222-01-01') with no local date filtering.
+                    df = ak.fund_etf_hist_min_em(
+                        symbol=symbol,
+                        start_date=start_dt or f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]} 09:30:00",
+                        end_date=end_dt or f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]} 15:00:00",
+                        period=period,
+                        adjust=adjust,
+                    )
                 else:
                     df = ak.stock_zh_a_hist_min_em(
                         symbol=symbol,
@@ -127,7 +168,13 @@ class CAkShare(CCommonStockApi):
                 elif is_etf:
                     df = ak.fund_etf_hist_em(symbol=symbol, period=p, start_date=start_date, end_date=end_date, adjust=adjust)
                 else:
-                    df = ak.stock_zh_a_hist(symbol=symbol, period=p, start_date=start_date, end_date=end_date, adjust=adjust)
+                    # stock_zh_a_hist is the only akshare endpoint used here that accepts
+                    # `timeout`; the others (fund_etf_hist_em/index_zh_a_hist/*_min_em)
+                    # have no timeout parameter in akshare 1.17.98.
+                    df = ak.stock_zh_a_hist(
+                        symbol=symbol, period=p, start_date=start_date, end_date=end_date,
+                        adjust=adjust, timeout=_AK_HTTP_TIMEOUT,
+                    )
                 
                 rename_map = {
                     "日期": DATA_FIELD.FIELD_TIME,
@@ -189,28 +236,10 @@ class CAkShare(CCommonStockApi):
                 except Exception:
                     continue
 
-                def to_float(v):
-                    if v is None:
-                        return None
-                    if isinstance(v, (int, float)):
-                        if pd.isna(v):
-                            return None
-                        return float(v)
-                    s = str(v)
-                    if not s or s == "nan" or s == "None":
-                        return None
-                    try:
-                        f = float(s)
-                        if pd.isna(f):
-                            return None
-                        return float(f)
-                    except Exception:
-                        return None
-
-                o = to_float(row.get(DATA_FIELD.FIELD_OPEN))
-                h = to_float(row.get(DATA_FIELD.FIELD_HIGH))
-                l = to_float(row.get(DATA_FIELD.FIELD_LOW))
-                c = to_float(row.get(DATA_FIELD.FIELD_CLOSE))
+                o = _to_float(row.get(DATA_FIELD.FIELD_OPEN))
+                h = _to_float(row.get(DATA_FIELD.FIELD_HIGH))
+                l = _to_float(row.get(DATA_FIELD.FIELD_LOW))
+                c = _to_float(row.get(DATA_FIELD.FIELD_CLOSE))
                 if c is None or c <= 0:
                     continue
                 if o is None or o <= 0:
@@ -222,8 +251,8 @@ class CAkShare(CCommonStockApi):
                 h = max(h, o, c)
                 l = min(l, o, c)
 
-                vol = to_float(row.get(DATA_FIELD.FIELD_VOLUME)) or 0.0
-                amt = to_float(row.get(DATA_FIELD.FIELD_TURNOVER)) or 0.0
+                vol = _to_float(row.get(DATA_FIELD.FIELD_VOLUME)) or 0.0
+                amt = _to_float(row.get(DATA_FIELD.FIELD_TURNOVER)) or 0.0
 
                 item = {
                     DATA_FIELD.FIELD_TIME: t,
@@ -235,7 +264,7 @@ class CAkShare(CCommonStockApi):
                     DATA_FIELD.FIELD_TURNOVER: float(amt),
                 }
                 if not kltype_lt_day(self.k_type):
-                    tr = to_float(row.get(DATA_FIELD.FIELD_TURNRATE))
+                    tr = _to_float(row.get(DATA_FIELD.FIELD_TURNRATE))
                     if tr is not None:
                         item[DATA_FIELD.FIELD_TURNRATE] = float(tr)
 
@@ -255,55 +284,90 @@ class CAkShare(CCommonStockApi):
             
             if should_fetch_tick and self.k_type == KL_TYPE.K_DAY:
                 try:
-                    # Use stock_zh_a_spot_em for real-time data
-                    # Note: This fetches all stocks, which might be slow but reliable
-                    spot_df = ak.stock_zh_a_spot_em()
-                    # Filter by code
-                    # AkShare code in spot is 6 digits
-                    spot_row = spot_df[spot_df['代码'] == symbol]
-                    
-                    if not spot_row.empty:
-                        # Columns: 序号, 代码, 名称, 最新价, 涨跌幅, 涨跌额, 成交量, 成交额, 振幅, 最高, 最低, 今开, 昨收, 量比, 换手率, 市盈率-动态, 市净率
-                        # Map to our columns
-                        # Time is not in spot_df, use now
-                        row_data = spot_row.iloc[0]
-                        current_price = row_data['最新价']
-                        
+                    # Single-symbol quote via eastmoney push2. Replaces
+                    # ak.stock_zh_a_spot_em(), which (a) pulls a ~5k-row full-market
+                    # snapshot just to patch one daily bar, (b) exposes no timeout in
+                    # akshare 1.17.98, and (c) silently maps e.g. sh.000001 to
+                    # 平安银行 (spot_df['代码']=='000001' is a stock, not the index).
+                    quote = self._fetch_realtime_quote(symbol)
+                    if quote is not None:
+                        current_price = quote["close"]
+
                         if current_price and str(current_price) != 'nan':
                             tick_time = now.strftime("%Y-%m-%d %H:%M:%S")
-                            
+
                             # Double check time to avoid dup
                             tick_dt = datetime.datetime.strptime(tick_time, "%Y-%m-%d %H:%M:%S")
-                            
+
                             if last_date is None or tick_dt.date() > last_date.date():
                                 data = [
                                     tick_time,
-                                    str(row_data['今开']), # Open
-                                    str(row_data['最高']), # High
-                                    str(row_data['最低']), # Low
-                                    str(current_price),  # Close
-                                    str(row_data['成交量']), # Volume
-                                    str(row_data['成交额'])  # Turnover
+                                    str(quote["open"]),    # Open
+                                    str(quote["high"]),    # High
+                                    str(quote["low"]),     # Low
+                                    str(current_price),    # Close
+                                    str(quote["volume"]),  # Volume
+                                    str(quote["amount"]),  # Turnover
                                 ]
-                                
+
                                 # If values are nan/None, use current_price
                                 for i in range(1, 5):
                                     if data[i] == 'nan' or data[i] == 'None':
                                         data[i] = str(current_price)
-                                        
+
                                 yield CKLine_Unit(create_item_dict(data, columns))
-                             
+
                 except Exception as ex:
                     print(f"AkShare Real-time Tick Error: {ex}")
 
-        except Exception as e:
-            print(f"AkShare Error: {e}")
-            raise e
+        except Exception:
+            raise
+
+    def _fetch_realtime_quote(self, symbol: str) -> Optional[dict]:
+        """Single-symbol realtime quote from eastmoney push2 `qt/stock/get`.
+
+        Returns dict(open/high/low/close/volume/amount) or None when the endpoint
+        resolves a different symbol (f57 echo check) — refuses silently-wrong data.
+        Index quotes are served under the same secid scheme (sh.000001 -> 1.000001).
+        """
+        c = str(self.code or "").strip().lower()
+        if c.startswith("sh"):
+            market_id = 1
+        elif c.startswith(("sz", "bj")):
+            # eastmoney push2 serves SZ and (best-effort) BJ quotes under market 0
+            market_id = 0
+        else:
+            market_id = 1 if symbol[:1] in ("5", "6", "9") else 0
+        params = {
+            "fltt": "2",
+            "invt": "2",
+            "fields": "f43,f44,f45,f46,f47,f48,f57",
+            "secid": f"{market_id}.{symbol}",
+        }
+        r = requests.get(
+            "https://push2.eastmoney.com/api/qt/stock/get",
+            params=params,
+            timeout=_REALTIME_QUOTE_TIMEOUT,
+        )
+        payload = (r.json() or {}).get("data") or {}
+        if str(payload.get("f57") or "") != symbol:
+            return None
+        return {
+            "open": payload.get("f46"),
+            "high": payload.get("f44"),
+            "low": payload.get("f45"),
+            "close": payload.get("f43"),
+            "volume": payload.get("f47"),
+            "amount": payload.get("f48"),
+        }
 
     def SetBasciInfo(self):
-        # AkShare basic info is separate, we might skip or implement if needed
+        # AkShare has no dedicated basic-info call here; infer asset kind locally so
+        # is_stock stays consistent with _is_index (and ETFs are not stocks either,
+        # matching TDX/BaoStock semantics where only equities are is_stock=True).
         self.name = self.code
-        self.is_stock = not self._is_index(self.code.split('.')[-1])
+        symbol = self.code.split('.')[-1]
+        self.is_stock = not (self._is_index(symbol) or _is_etf_symbol(symbol))
 
     @classmethod
     def do_init(cls):
@@ -324,4 +388,13 @@ class CAkShare(CCommonStockApi):
             KL_TYPE.K_30M: '30',
             KL_TYPE.K_60M: '60',
         }
-        return _dict.get(self.k_type, 'd')
+        period = _dict.get(self.k_type)
+        if period is None:
+            # Previously defaulted to 'd': e.g. K_QUARTER/K_3M silently degraded to
+            # daily bars. Fail loudly instead (consistent with other sources).
+            raise CChanException(
+                f"AkShare does not support k_type={self.k_type}; "
+                f"supported: {sorted(k.name for k in _dict)}",
+                ErrCode.SRC_DATA_TYPE_ERR,
+            )
+        return period

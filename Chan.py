@@ -102,62 +102,65 @@ class CChan:
     def get_load_stock_iter(self, stockapi_cls, lv):
         stockapi_instance = stockapi_cls(code=self.code, k_type=lv, begin_date=self.begin_time, end_date=self.end_time, autype=self.autype)
         
-        # We need to capture warnings after iteration. 
+        # We need to capture warnings after iteration.
         # Since this is a generator, we wrap it.
         def wrapped_iter():
             first_item = True
-            for klu in self.load_stock_data(stockapi_instance, lv):
-                if first_item:
-                    first_item = False
-                    # Check for data gap (Requested vs Actual)
-                    try:
-                        if self.begin_time:
-                            # Try to parse self.begin_time
-                            begin_dt = None
-                            # Clean up string first (remove potential quotes)
-                            begin_str = str(self.begin_time).strip("'\"")
-                            
-                            # Common formats
-                            formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y%m%d", "%Y/%m/%d"]
-                            # Try to handle formats with microseconds if present
-                            if "." in begin_str and "-" in begin_str:
-                                formats.insert(0, "%Y-%m-%d %H:%M:%S.%f")
-                                
-                            for fmt in formats:
-                                try:
-                                    begin_dt = datetime.datetime.strptime(begin_str, fmt)
-                                    break
-                                except ValueError:
-                                    continue
-                            
-                            if begin_dt:
-                                # klu.time is CTime, convert to datetime（保留时分秒，避免带时间的 begin_time 被偏保守地截断到天）
-                                klu_dt = datetime.datetime(klu.time.year, klu.time.month, klu.time.day,
-                                                           klu.time.hour, klu.time.minute, klu.time.second)
+            try:
+                for klu in self.load_stock_data(stockapi_instance, lv):
+                    if first_item:
+                        first_item = False
+                        # Check for data gap (Requested vs Actual)
+                        try:
+                            if self.begin_time:
+                                # Try to parse self.begin_time
+                                begin_dt = None
+                                # Clean up string first (remove potential quotes)
+                                begin_str = str(self.begin_time).strip("'\"")
 
-                                # Calculate gap in days
-                                delta_days = (klu_dt - begin_dt).days
-                                
-                                # Debug print
-                                # print(f"[DEBUG] Check Gap: Raw={self.begin_time} Parsed={begin_dt}, Actual={klu_dt}, Gap={delta_days} days")
+                                # Common formats
+                                formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y%m%d", "%Y/%m/%d"]
+                                # Try to handle formats with microseconds if present
+                                if "." in begin_str and "-" in begin_str:
+                                    formats.insert(0, "%Y-%m-%d %H:%M:%S.%f")
 
-                                # If gap is significant (e.g., > 10 days), add warning
-                                # 10 days allows for long holidays (e.g. CNY)
-                                if delta_days > 10:
-                                    msg = f"Data Range Warning: Requested start {begin_str[:10]}, but actual data starts from {klu.time}. (Gap: {delta_days} days). This may be due to data source limitations."
-                                    # Avoid duplicate warnings if possible
-                                    if not any(msg in w for w in self.data_warnings):
-                                        self.data_warnings.append(msg)
-                    except Exception as e:
-                        # Don't fail the analysis just because check failed
-                        _logger.warning(f"[Warning Check Error] {e}")
+                                for fmt in formats:
+                                    try:
+                                        begin_dt = datetime.datetime.strptime(begin_str, fmt)
+                                        break
+                                    except ValueError:
+                                        continue
 
-                yield klu
+                                if begin_dt:
+                                    # klu.time is CTime, convert to datetime（保留时分秒，避免带时间的 begin_time 被偏保守地截断到天）
+                                    klu_dt = datetime.datetime(klu.time.year, klu.time.month, klu.time.day,
+                                                               klu.time.hour, klu.time.minute, klu.time.second)
 
-            # Check for warnings after data is exhausted
-            if getattr(stockapi_instance, 'warnings', None):
-                self.data_warnings.extend(stockapi_instance.warnings)
-            
+                                    # Calculate gap in days
+                                    delta_days = (klu_dt - begin_dt).days
+
+                                    # Debug print
+                                    # print(f"[DEBUG] Check Gap: Raw={self.begin_time} Parsed={begin_dt}, Actual={klu_dt}, Gap={delta_days} days")
+
+                                    # If gap is significant (e.g., > 10 days), add warning
+                                    # 10 days allows for long holidays (e.g. CNY)
+                                    if delta_days > 10:
+                                        msg = f"Data Range Warning: Requested start {begin_str[:10]}, but actual data starts from {klu.time}. (Gap: {delta_days} days). This may be due to data source limitations."
+                                        # Avoid duplicate warnings if possible
+                                        if not any(msg in w for w in self.data_warnings):
+                                            self.data_warnings.append(msg)
+                        except Exception as e:
+                            # Don't fail the analysis just because check failed
+                            _logger.warning(f"[Warning Check Error] {e}")
+
+                    yield klu
+            finally:
+                # 告警不只在正常耗尽时汇入：迭代中途抛错、级别被 _drop_lv 摘除或
+                # 消费方中断导致生成器提前 close 时，同样要把已产生的 warnings
+                # 并入 data_warnings（finally 对单条生成器至多执行一次，不会重复追加）
+                if getattr(stockapi_instance, 'warnings', None):
+                    self.data_warnings.extend(stockapi_instance.warnings)
+
         return wrapped_iter()
 
     def add_lv_iter(self, lv_idx, klu_iter):
@@ -381,11 +384,55 @@ class CChan:
         else:
             kline_unit.set_idx(self[lv_idx][-1][-1].idx + 1)
 
+    @staticmethod
+    def _klu_parent_cover_end(parent_klu: Optional[CKLine_Unit]) -> Optional[CTime]:
+        """父级K线覆盖周期的排他右端：次级别 klu.time >= 右端即归属下一根父K（断流入缓存）。
+
+        日级及以上父级的 klu.time 只是"期戳"而非区间端点：
+        - auto=False 时 ts=当日 00:00、auto=True 时 ts=当日 23:59（CTime.set_timestamp）；
+        - K_WEEK/K_MON/K_QUARTER/K_YEAR 期戳落在周期内哪天还随数据源口径而变
+          （首交易日/末交易日均可，如 TDX 周线戳在周末日、BaoStock 周线戳在周最后交易日）。
+        直接拿期戳做绝对 ts 比较会把本周期内的次级别K线错判给下一根父K（auto=False
+        日级父下当日 09:30+ 的分钟线全部右移：首父K空挂、末日次级别整批丢弃，
+        kl_data_check 还会误炸 KL_TIME_INCONSISTENT；K_WEEK 首日戳对任何源恒错）。
+        故统一按 kl_type 推算下一周期首日 00:00（auto=False）作为排他右端：
+        - K_DAY     → 次日
+        - K_WEEK    → 期戳所在 ISO 周（周一~周日）的下周一
+        - K_MON     → 次月 1 日
+        - K_QUARTER → 次季首月 1 日
+        - K_YEAR    → 次年 1 月 1 日
+
+        日级以下父级（klu.time 即 bar 结束时刻，含端点归属本父级）及无父级时返回
+        None，调用方沿用 `klu.time > parent.time` 判定，分钟级组合不产生任何偏移。
+        """
+        if parent_klu is None or parent_klu.kl_type.value < KL_TYPE.K_DAY.value:
+            return None
+        t = parent_klu.time
+        base = datetime.date(t.year, t.month, t.day)
+        kl_type = parent_klu.kl_type
+        if kl_type == KL_TYPE.K_DAY:
+            end = base + datetime.timedelta(days=1)
+        elif kl_type == KL_TYPE.K_WEEK:
+            end = base + datetime.timedelta(days=7 - base.weekday())
+        elif kl_type == KL_TYPE.K_MON:
+            y, m = (base.year + 1, 1) if base.month == 12 else (base.year, base.month + 1)
+            end = datetime.date(y, m, 1)
+        elif kl_type == KL_TYPE.K_QUARTER:
+            qm = (base.month - 1) // 3 * 3 + 4  # 次季首月；跨年（qm=13）归次年 1 月
+            y, m = (base.year + 1, 1) if qm > 12 else (base.year, qm)
+            end = datetime.date(y, m, 1)
+        else:  # KL_TYPE.K_YEAR
+            end = datetime.date(base.year + 1, 1, 1)
+        return CTime(end.year, end.month, end.day, 0, 0, auto=False)
+
     def load_iterator(self, lv_idx, parent_klu, step):
         # K线时间天级别以下描述的是结束时间，如60M线，每天第一根是10点30的
         # 天以上是当天日期
         cur_lv = self.lv_list[lv_idx]
         pre_klu = self[lv_idx][-1][-1] if len(self[lv_idx]) > 0 and len(self[lv_idx][-1]) > 0 else None
+        # 每根父K一个 load_iterator 栈帧，归属边界只需算一次；
+        # 日级及以上为按 kl_type 推算的周期排他右端，日级以下为 None（走端点含属判定）
+        parent_cover_end = self._klu_parent_cover_end(parent_klu)
         while True:
             if self.klu_cache[lv_idx]:
                 kline_unit = self.klu_cache[lv_idx]
@@ -401,7 +448,11 @@ class CChan:
                 except StopIteration:
                     break
 
-            if parent_klu and kline_unit.time > parent_klu.time:
+            if parent_cover_end is not None:
+                beyond_parent = kline_unit.time >= parent_cover_end
+            else:
+                beyond_parent = parent_klu is not None and kline_unit.time > parent_klu.time
+            if beyond_parent:
                 self.klu_cache[lv_idx] = kline_unit
                 break
             kline_unit.set_pre_klu(pre_klu)
