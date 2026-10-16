@@ -168,14 +168,13 @@ class CZS(Generic[LINE_TYPE]):
     def is_inside(self, seg: CSeg):
         return seg.start_bi.idx <= self.begin_bi.idx <= seg.end_bi.idx
 
-    def is_divergence(self, config: CPointConfig, out_bi=None):
-        if not self.end_bi_break(out_bi):  # 最后一笔必须突破中枢
+    def is_divergence(self, config: CPointConfig, in_bi: list, out_bi: list):
+        if len(out_bi) == 0:
+            raise CChanException("is_divergence: out_bi 为空", ErrCode.COMMON_ERROR)
+        if not self.end_bi_break(out_bi[-1]):  # 最后一笔必须突破中枢
             return False, None
-        in_metric = self.get_bi_in().cal_macd_metric(config.macd_algo, is_reverse=False)
-        if out_bi is None:
-            out_metric = self.get_bi_out().cal_macd_metric(config.macd_algo, is_reverse=True)
-        else:
-            out_metric = out_bi.cal_macd_metric(config.macd_algo, is_reverse=True)
+        in_metric = construct_virtual_bi(in_bi).cal_macd_metric(config.macd_algo, is_reverse=False)
+        out_metric = construct_virtual_bi(out_bi).cal_macd_metric(config.macd_algo, is_reverse=True)
 
         # +1e-7 防除零（与 BSPointList 中 divergence_rate 的计算口径一致）
         if config.divergence_rate > 100:  # 保送
@@ -249,3 +248,19 @@ class CZS(Generic[LINE_TYPE]):
     def set_bi_lst(self, bi_lst):
         self.__bi_lst = bi_lst
         self.clean_cache()
+
+
+def construct_virtual_bi(bi_lst: List[LINE_TYPE]) -> LINE_TYPE:
+    # 把相邻多笔虚拟合成一笔（首begin~末end），供 cal_macd_metric 取整体幅度区间；
+    # 虚拟对象 idx=-1/is_sure=False，不参与索引定位
+    if len(bi_lst) == 0:
+        raise CChanException("construct_virtual_bi: 输入列表为空", ErrCode.COMMON_ERROR)
+    if len(bi_lst) == 1:
+        return bi_lst[0]
+    if isinstance(bi_lst[0], CBi):
+        if not isinstance(bi_lst[-1], CBi):
+            raise CChanException("construct_virtual_bi: 首尾元素类型不一致", ErrCode.COMMON_ERROR)
+        return CBi(bi_lst[0].begin_klc, bi_lst[-1].end_klc, idx=-1, is_sure=False)
+    if not (isinstance(bi_lst[0], CSeg) and isinstance(bi_lst[-1], CSeg)):
+        raise CChanException("construct_virtual_bi: 元素必须是清一色 CBi 或 CSeg", ErrCode.COMMON_ERROR)
+    return CSeg(idx=-1, start_bi=bi_lst[0].start_bi, end_bi=bi_lst[-1].end_bi, is_sure=False)

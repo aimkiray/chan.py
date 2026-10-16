@@ -142,12 +142,30 @@ class CSegListComm(Generic[SUB_LINE_TYPE]):
             return
 
     def collect_left_seg(self, bi_lst: CBiList):
-        if len(bi_lst) == 0:
-            return  # 存量线段+空笔表无可归集（否则下方取 bi_lst[-1] 会 IndexError）
-        if len(self) == 0:
-            self.collect_first_seg(bi_lst)
-        else:
+        # 迭代替代上游尾递归（移植 Vespa314 main f774965+7f99c82+7ed36c8）：
+        # 未确认尾段的末笔被新笔越过 2 笔以上时边界已失效，丢弃尾段后重算左段归集，
+        # 否则增量更新会滞留陈旧暂态段。丢段后 self.lst 可能变空，
+        # 须回到 collect_first_seg 分支，故循环整体而非只循环 collect_segs
+        drop_cnt = 0
+        # 丢段后 collect_segs 对相同 (self.lst, bi_lst) 状态是确定性的，可能重建
+        # 同一 unsure 尾段形成 丢段->重建->再丢段 的 ping-pong 死循环（上游递归版
+        # ~1000 层后 RecursionError，迭代版则永久挂起）。正常输入丢段次数为个位数，
+        # 宽松上限只兜病态输入，把挂起收敛为显式异常
+        max_drop = max(1024, 8*len(bi_lst))
+        while True:
+            if len(bi_lst) == 0:
+                return  # 存量线段+空笔表无可归集（否则下方取 bi_lst[-1] 会 IndexError）
+            if len(self) == 0:
+                self.collect_first_seg(bi_lst)
+                return
             self.collect_segs(bi_lst)
+            if len(bi_lst) > 0 and len(self.lst) > 0 and bi_lst[-1].idx - self.lst[-1].bi_list[-1].idx > 2 and not self.lst[-1].is_sure:
+                self.lst = self.lst[:-1]
+                drop_cnt += 1
+                if drop_cnt > max_drop:
+                    raise CChanException("collect_left_seg 丢段重归集不收敛", ErrCode.COMMON_ERROR)
+                continue
+            return
 
     def collect_left_as_seg(self, bi_lst: CBiList):
         if len(bi_lst) == 0:

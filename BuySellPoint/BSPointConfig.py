@@ -17,6 +17,7 @@ class CPointConfig:
     # attribute names declared in __init__; only these may be overridden via set()
     ALLOWED_FIELDS = frozenset([
         "divergence_rate",
+        "multi_bi_divergence",
         "min_zs_cnt",
         "bsp1_only_multibi_zs",
         "max_bs2_rate",
@@ -35,6 +36,7 @@ class CPointConfig:
 
     def __init__(self,
                  divergence_rate,
+                 multi_bi_divergence,
                  min_zs_cnt,
                  bsp1_only_multibi_zs,
                  max_bs2_rate,
@@ -50,6 +52,7 @@ class CPointConfig:
                  bsp3a_max_zs_cnt,
                  ):
         self.divergence_rate = divergence_rate
+        self.multi_bi_divergence = multi_bi_divergence
         self.min_zs_cnt = min_zs_cnt
         self.bsp1_only_multibi_zs = bsp1_only_multibi_zs
         self.max_bs2_rate = max_bs2_rate

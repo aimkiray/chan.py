@@ -104,6 +104,7 @@ class CChanConfig:
     def set_bsp_config(self, conf):
         para_dict = {
             "divergence_rate": float("inf"),
+            "multi_bi_divergence": False,
             "min_zs_cnt": 1,
             "bsp1_only_multibi_zs": True,
             "max_bs2_rate": 0.9999,
@@ -154,6 +155,13 @@ class CChanConfig:
 
 class ConfigWithCheck:
     def __init__(self, conf):
+        # multi_bi_divergence 亦可经 -buy/-sell/-seg/-segbuy/-segsell 后缀键
+        # 路由进买卖/段级配置（见 set_bsp_config 的后缀分发），顶层键查不到
+        # 后缀键会绕过本守卫，故凡 multi_bi_divergence 前缀的键一律纳入检查
+        mbd_on = any(v for k, v in conf.items()
+                     if k == 'multi_bi_divergence' or k.startswith('multi_bi_divergence-'))
+        if mbd_on and conf.get('zs_algo', '') != 'normal':
+            raise CChanException("multi_bi_divergence only support zs_algo=normal", ErrCode.PARA_ERROR)
         # 拷贝一份再消费：get()/items() 会从 dict 中删键，不能污染调用方传入的配置
         self.conf = dict(conf)
 
