@@ -135,6 +135,10 @@ class CClickHouseAPI(CCommonStockApi):
     _last_init_error = ""
     _last_init_error_ts = 0.0
     _last_init_log_ts = 0.0
+    # 列表型查询（stock_pools/pool_members/list_assets 等）最近一次故障，
+    # 供 datasource_degraded_reason 区分"数据源挂"与"真无数据"。
+    _last_list_error = ""
+    _last_list_error_ts = 0.0
 
     def __init__(self, code, k_type, begin_date, end_date, autype, asset_type="STOCK"):
         super(CClickHouseAPI, self).__init__(code, k_type, begin_date, end_date, autype, asset_type)
@@ -261,6 +265,32 @@ class CClickHouseAPI(CCommonStockApi):
         return cls._client
 
     @classmethod
+    def _note_list_error(cls, err):
+        """记录一次列表/元数据查询故障（供列表端点降级标记用，不影响返回值契约）。"""
+        try:
+            cls._last_list_error = str(err)
+            cls._last_list_error_ts = time.monotonic()
+        except Exception:
+            pass
+
+    @classmethod
+    def datasource_degraded_reason(cls, since_ts: Optional[float] = None) -> Optional[str]:
+        """列表端点的降级探测：返回 None 表示数据源正常，否则返回原因串。
+
+        覆盖两类故障：(1) get_client()=None —— ClickHouse 连接不可用；
+        (2) since_ts 之后记录到的 _note_list_error —— 查询/元数据执行失败
+        （client 对象仍在但服务端已死等 mid-flight 故障）。
+        since_ts 传请求开始时刻（time.monotonic()），只采纳本次调用窗口内
+        记录的错误，避免上一请求的陈旧故障被打到本次成功响应上。
+        """
+        if cls.get_client() is None:
+            detail = cls._last_init_error or "client init failed"
+            return f"clickhouse_unavailable:{detail}"
+        if since_ts is not None and cls._last_list_error and cls._last_list_error_ts >= since_ts:
+            return f"clickhouse_query_failed:{cls._last_list_error}"
+        return None
+
+    @classmethod
     def _get_table_columns(cls, table: str, database: Optional[str] = None):
         client = cls.get_client()
         if not client:
@@ -283,6 +313,7 @@ class CClickHouseAPI(CCommonStockApi):
             # 返回 None（区别于 []）：[] 表示"表存在但无该列/表不存在"，
             # None 表示"元数据查询本身失败"。调用方如需区分 DB 故障可判 None。
             _logger.warning(f"ClickHouse columns query failed for {table}: {type(e).__name__}: {e}")
+            cls._note_list_error(f"columns query failed: {table}: {type(e).__name__}: {e}")
             return None
 
     @classmethod
@@ -315,6 +346,7 @@ class CClickHouseAPI(CCommonStockApi):
             exists = bool(rows and rows[0] and int(rows[0][0]) > 0)
         except Exception as e:
             _logger.warning(f"ClickHouse table_exists query failed for {table}: {type(e).__name__}: {e}")
+            cls._note_list_error(f"table_exists query failed: {table}: {type(e).__name__}: {e}")
             exists = False
 
         if len(cls._table_exists_cache) > 1024:
@@ -437,6 +469,7 @@ class CClickHouseAPI(CCommonStockApi):
     def list_stock_pools(cls, table: str = "stock_constituent"):
         client = cls.get_client()
         if not client:
+            cls._note_list_error("clickhouse client unavailable")
             return []
         cols = cls._get_table_columns(table)
         if not cols:
@@ -486,6 +519,7 @@ class CClickHouseAPI(CCommonStockApi):
                 rows = client.execute(query)
             except Exception as e:
                 _logger.warning(f"ClickHouse list pools failed: {e}")
+                cls._note_list_error(f"list pools query failed: {type(e).__name__}: {e}")
                 return []
 
             items = []
@@ -552,6 +586,7 @@ class CClickHouseAPI(CCommonStockApi):
             rows = client.execute(query)
         except Exception as e:
             _logger.warning(f"ClickHouse list pools failed: {e}")
+            cls._note_list_error(f"list pools query failed: {type(e).__name__}: {e}")
             return []
 
         items = []
@@ -574,6 +609,7 @@ class CClickHouseAPI(CCommonStockApi):
     ):
         client = cls.get_client()
         if not client:
+            cls._note_list_error("clickhouse client unavailable")
             return []
         cols = cls._get_table_columns(table)
         if not cols:
@@ -638,6 +674,7 @@ class CClickHouseAPI(CCommonStockApi):
                 rows = client.execute(query, params)
             except Exception as e:
                 _logger.warning(f"ClickHouse get pool members failed: {e}")
+                cls._note_list_error(f"pool members query failed: {type(e).__name__}: {e}")
                 return []
             return [str(r[0]) for r in rows]
 
@@ -700,6 +737,7 @@ class CClickHouseAPI(CCommonStockApi):
                 rows = client.execute(query, {"pool_id": pool_id, "limit": int(limit)})
         except Exception as e:
             _logger.warning(f"ClickHouse get pool members failed: {e}")
+            cls._note_list_error(f"pool members query failed: {type(e).__name__}: {e}")
             return []
 
         return [str(r[0]) for r in rows]
@@ -715,6 +753,7 @@ class CClickHouseAPI(CCommonStockApi):
     ) -> Dict[str, List[str]]:
         client = cls.get_client()
         if not client:
+            cls._note_list_error("clickhouse client unavailable")
             return {}
         cols = cls._get_table_columns(table)
         if not cols:
@@ -767,6 +806,7 @@ class CClickHouseAPI(CCommonStockApi):
                 rows = client.execute(query, params)
             except Exception as e:
                 _logger.warning(f"ClickHouse get pool snapshot members failed: {type(e).__name__}: {e}")
+                cls._note_list_error(f"pool snapshot members query failed: {type(e).__name__}: {e}")
                 return {}
 
             by_dt: Dict[str, List[str]] = {}
@@ -816,6 +856,7 @@ class CClickHouseAPI(CCommonStockApi):
             rows = client.execute(query, params)
         except Exception as e:
             _logger.warning(f"ClickHouse get pool snapshot members failed: {type(e).__name__}: {e}")
+            cls._note_list_error(f"pool snapshot members query failed: {type(e).__name__}: {e}")
             return {}
 
         by_dt: Dict[str, List[str]] = {}
@@ -2270,6 +2311,7 @@ class CClickHouseAPI(CCommonStockApi):
     def _list_assets(cls, asset_type: str, limit: int = 2000, keyword: str = None):
         client = cls.get_client()
         if not client:
+            cls._note_list_error("clickhouse client unavailable")
             return []
 
         route = cls._asset_route_from_type(asset_type)
@@ -2334,6 +2376,7 @@ class CClickHouseAPI(CCommonStockApi):
                 return [{"code": str(r[0]), "name": str(r[0])} for r in rows]
         except Exception as e:
             _logger.warning(f"List {route.get('asset', asset_type)} assets failed: {e}")
+            cls._note_list_error(f"list assets query failed: {type(e).__name__}: {e}")
             return []
 
     @classmethod

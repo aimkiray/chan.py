@@ -25,6 +25,23 @@ def _is_etf_symbol(symbol: str) -> bool:
     return str(symbol or "").strip().startswith(_ETF_PREFIXES)
 
 
+def _bound_date(raw):
+    """把 begin/end_date 解析为 date；容忍 'YYYY-MM-DD[ HH:MM[:SS]]'、'YYYY/MM/DD'、
+    'YYYYMMDD' 等输入，解析失败返回 None（调用方按"无边界"处理，不误伤 tick 逻辑）。"""
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+        try:
+            return datetime.datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    try:
+        return datetime.date.fromisoformat(s[:10])
+    except Exception:
+        return None
+
+
 def _to_float(v):
     if v is None:
         return None
@@ -281,7 +298,19 @@ class CAkShare(CCommonStockApi):
                      # Check if last_date is today
                     if last_date.date() < now.date():
                         should_fetch_tick = True
-            
+
+            # 实时 tick 的日期恒为"今天"，追加前须确认落在请求的
+            # [begin_date, end_date] 内——此前工作日无条件追加，end_date=昨日时
+            # 仍注入今日伪 K 线（分钟级联合加载时表现为无子线的孤儿父 K）。
+            if should_fetch_tick:
+                tick_day = now.date()
+                end_d = _bound_date(self.end_date)
+                if end_d is not None and tick_day > end_d:
+                    should_fetch_tick = False
+                begin_d = _bound_date(self.begin_date)
+                if should_fetch_tick and begin_d is not None and tick_day < begin_d:
+                    should_fetch_tick = False
+
             if should_fetch_tick and self.k_type == KL_TYPE.K_DAY:
                 try:
                     # Single-symbol quote via eastmoney push2. Replaces

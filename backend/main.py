@@ -3599,12 +3599,27 @@ def pretrain_model(req: PretrainRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=_err500(e))
 
+def _ch_list_response(payload: dict, since_ts: float) -> dict:
+    """列表型端点的降级标记（D3）：ClickHouse 不可用或本次调用窗口内查询
+    失败时，在 200 响应上附加 degraded/reason —— 让前端能区分"真无数据"
+    与"数据源故障"，同时保持响应结构向后兼容（旧前端忽略新字段）。"""
+    try:
+        reason = CClickHouseAPI.datasource_degraded_reason(since_ts=since_ts)
+    except Exception:
+        reason = None
+    if reason:
+        payload["degraded"] = True
+        payload["reason"] = reason
+    return payload
+
+
 @app.get("/api/indices")
 async def list_indices(limit: int = 2000, keyword: Optional[str] = None):
     try:
         from DataAPI.ClickHouseAPI import CClickHouseAPI
+        req_start = time.monotonic()
         items = CClickHouseAPI.list_indices(limit=limit, keyword=keyword)
-        return {"items": items}
+        return _ch_list_response({"items": items}, req_start)
     except Exception as e:
         raise HTTPException(status_code=500, detail=_err500(e))
 
@@ -3612,6 +3627,7 @@ async def list_indices(limit: int = 2000, keyword: Optional[str] = None):
 async def list_stock_pools(limit: int = 2000, keyword: Optional[str] = None):
     try:
         from DataAPI.ClickHouseAPI import CClickHouseAPI
+        req_start = time.monotonic()
         items = CClickHouseAPI.list_stock_pools(table="stock_constituent") or []
         kw = str(keyword or "").strip().lower()
         if kw:
@@ -3630,7 +3646,7 @@ async def list_stock_pools(limit: int = 2000, keyword: Optional[str] = None):
         except Exception:
             lim = 2000
         lim = max(1, min(5000, lim))
-        return {"items": items[:lim]}
+        return _ch_list_response({"items": items[:lim]}, req_start)
     except Exception as e:
         raise HTTPException(status_code=500, detail=_err500(e))
 
@@ -3639,6 +3655,7 @@ async def list_stock_pools(limit: int = 2000, keyword: Optional[str] = None):
 async def get_stock_pool_members(pool_id: str, limit: int = 5000, as_of_date: Optional[str] = None, snapshot_date: Optional[str] = None):
     try:
         from DataAPI.ClickHouseAPI import CClickHouseAPI
+        req_start = time.monotonic()
         raw_codes = CClickHouseAPI.get_pool_members(pool_id=pool_id, table="stock_constituent", limit=limit, as_of_date=as_of_date, snapshot_date=snapshot_date)
         codes = []
         for c in raw_codes:
@@ -3647,7 +3664,8 @@ async def get_stock_pool_members(pool_id: str, limit: int = 5000, as_of_date: Op
             except Exception:
                 codes.append(str(c))
         codes = sorted(list(dict.fromkeys(codes)))
-        return {"pool_id": pool_id, "codes": codes, "as_of_date": as_of_date, "snapshot_date": snapshot_date}
+        payload = {"pool_id": pool_id, "codes": codes, "as_of_date": as_of_date, "snapshot_date": snapshot_date}
+        return _ch_list_response(payload, req_start)
     except Exception as e:
         raise HTTPException(status_code=500, detail=_err500(e))
 

@@ -697,6 +697,46 @@ def _adjust_tail_by_clickhouse_factors(code: str, tail_list, autype: AUTYPE):
     finally:
         CClickHouseAPI.do_close()
 
+# 名称本地可得的离线/本地数据源：它们的 SetBasciInfo 全部是本地推导
+# （CSV 无名称字段回退 code、CCXT/TDX/AkShare 直接以 code 为名），
+# 不需要、也不应触发 baostock 在线登录。
+_LOCAL_NAME_DATA_SRCS = (
+    DATA_SRC.CSV,
+    DATA_SRC.CCXT,
+    DATA_SRC.AK_SHARE,
+    DATA_SRC.AKSHARE,
+    DATA_SRC.TDX,
+)
+
+
+def _local_stock_name(code, data_src_type):
+    """本地数据源的名称解析：实例化源自身的 StockAPI 读 ``api.name``
+    （各源 SetBasciInfo 均为本地推导、无网络），取不到回退 code。
+
+    刻意不调用 ``do_init()``——TDX/CCXT 的 do_init 会建 socket/exchange，
+    名称推导用不到连接。
+    """
+    _src_map = {
+        DATA_SRC.CSV: ("DataAPI.csvAPI", "CSV_API"),
+        DATA_SRC.CCXT: ("DataAPI.ccxt", "CCXT"),
+        DATA_SRC.AK_SHARE: ("DataAPI.AkShareAPI", "CAkShare"),
+        DATA_SRC.AKSHARE: ("DataAPI.AkShareAPI", "CAkShare"),
+        DATA_SRC.TDX: ("DataAPI.TdxAPI", "CTdxStockApi"),
+    }
+    try:
+        entry = _src_map.get(data_src_type)
+        if entry is None:
+            return code
+        import importlib
+        cls = getattr(importlib.import_module(entry[0]), entry[1])
+        api = cls(code=code, k_type=KL_TYPE.K_DAY, begin_date=None, end_date=None, autype=AUTYPE.QFQ)
+        name = getattr(api, "name", None)
+        return str(name) if name else code
+    except Exception as e:
+        logger.warning("local stock name lookup failed for %s (src=%s): %s", code, data_src_type, e)
+        return code
+
+
 def get_stock_name(code, data_src_type=DATA_SRC.BAO_STOCK):
     """
     Get stock name from Data Source
@@ -713,7 +753,13 @@ def get_stock_name(code, data_src_type=DATA_SRC.BAO_STOCK):
                 return api.name
             else:
                 return code
-                
+
+        # 离线/本地源直接走本地名称解析：此前所有非 ClickHouse 源都会落到
+        # 下面的 baostock 在线登录——bs.login() 离线时每次 ~2x10s 超时重试，
+        # 实测是 data_src=csv analyze ~21s 耗时的大头。
+        if data_src_type in _LOCAL_NAME_DATA_SRCS:
+            return _local_stock_name(code, data_src_type)
+
         # Fallback to Baostock if not ClickHouse.
         # baostock's SDK drives one process-global socket/session (see
         # DataAPI.BaoStockAPI.CBaoStock): login + query must run under the
